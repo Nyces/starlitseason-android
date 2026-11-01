@@ -64,6 +64,9 @@ FRAGMENT_SHADER = """
     uniform float shadow_strength;
     uniform bool unlit;
     uniform float alpha_cut;
+    uniform bool use_screen;
+    uniform vec3 screen_lo;
+    uniform vec3 screen_hi;
     in vec3 v_nrm;
     in vec3 v_nrm_view;
     in vec3 v_pos;
@@ -138,6 +141,16 @@ FRAGMENT_SHADER = """
         } else if (has_emissive) {
             // 无光照的发光材质：只用发光项（Emissive_Additive 系列）
             base = to_linear(texture(emissive_tex, v_uv).rgb) * emissive_boost;
+        }
+        // 心形大屏等运行时画面：游戏里由渲染目标覆盖，离线预览用中性渐变占位
+        if (use_screen) {
+            vec3 span = max(screen_hi - screen_lo, vec3(1e-4));
+            vec3 t = clamp((v_pos - screen_lo) / span, 0.0, 1.0);
+            vec3 top = vec3(0.99, 0.97, 0.96);
+            vec3 bottom = vec3(0.45, 0.40, 0.45);
+            float vignette = 1.0 - 0.22 * pow(abs(t.x - 0.5) * 2.0, 2.0);
+            base = to_linear(mix(bottom, top, t.z) * vignette);
+            alpha = 1.0;
         }
         // 输出线性 HDR，曝光与 sRGB 编码交给后处理
         color = vec4(base, alpha);
@@ -351,6 +364,7 @@ class SceneItem:
     emissive_boost: float = 1.0
     blend_mode: str = "opaque"          # opaque / masked / additive / translucent / modulate
     unlit: bool = False
+    screen: bool = False                # 大屏占位：按世界坐标自上而下渐变
     outline: bool = False
     outline_color: tuple[float, float, float] = (0.16, 0.10, 0.09)
     outline_width: float = 0.0008
@@ -494,6 +508,19 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
         _set(program, "rim_intensity", float(item.rim_intensity))
         _set(program, "unlit", bool(item.unlit))
         _set(program, "alpha_cut", 0.33 if item.blend_mode == "masked" else 0.0)
+        if item.screen:
+            lo_local = item.positions.min(axis=0)
+            hi_local = item.positions.max(axis=0)
+            corners = np.array([[x, y, z, 1.0]
+                                for x in (lo_local[0], hi_local[0])
+                                for y in (lo_local[1], hi_local[1])
+                                for z in (lo_local[2], hi_local[2])], dtype=np.float32)
+            world = corners @ model.T
+            _set(program, "use_screen", True)
+            _set(program, "screen_lo", tuple(world[:, :3].min(axis=0).tolist()))
+            _set(program, "screen_hi", tuple(world[:, :3].max(axis=0).tolist()))
+        else:
+            _set(program, "use_screen", False)
         if item.texture is not None:
             texture = _upload_texture(ctx, item.texture)
             texture.use(0)

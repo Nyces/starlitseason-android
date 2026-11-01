@@ -237,6 +237,7 @@ class ToonMaterial:
     emissive_boost: float = 1.0
     blend_mode: str = "opaque"
     unlit: bool = False
+    screen: bool = False
     outline: bool = False
     outline_color: tuple[float, float, float] = (0.16, 0.10, 0.09)
     outline_width: float = 0.0008
@@ -251,7 +252,7 @@ class ToonMaterial:
                          sphere_boost=self.sphere_boost, rim_scale=self.rim_scale,
                          shadow_map=self.shadow_map,
                          emissive=self.emissive, emissive_boost=self.emissive_boost,
-                         blend_mode=self.blend_mode, unlit=self.unlit,
+                         blend_mode=self.blend_mode, unlit=self.unlit, screen=self.screen,
                          outline=self.outline, outline_color=self.outline_color,
                          outline_width=self.outline_width)
 
@@ -606,77 +607,100 @@ def _placement_matrix(location, rotation, scale):
     return matrix
 
 
+def _is_heart_screen(mesh: str) -> bool:
+    """心形大屏的屏面（SM_Stg101_Ef_V_HeartMonitor）。
+
+    这个网格在 cooked 资产里没有材质槽，游戏里由运行时的渲染目标覆盖，
+    离线预览时用中性渐变占位，避免整块屏变成默认灰。
+    """
+    return "heartmonitor" in (mesh or "").lower()
+
+
+def _stage_items(store, map_path: str, no_texture: bool, limit: int = 0,
+                 verbose: bool = True):
+    """装载关卡里放置的静态网格，返回 (items, 跳过的 actor 数)。"""
+    from .ue4.level import parse_level
+    from .ue4.staticmesh import parse_static_mesh
+
+    package = store.package(map_path)
+    if package is None:
+        raise SystemExit(f"未找到地图: {map_path}")
+    placed = parse_level(package)
+    if verbose:
+        print(f"关卡 {map_path}：静态网格 actor {len(placed)} 个")
+
+    mesh_cache: dict[str, object] = {}
+    material_cache: dict[str, object] = {}
+    items = []
+    skipped = 0
+    for index, entry in enumerate(placed):
+        if limit and len(items) >= limit:
+            break
+        if entry.mesh not in mesh_cache:
+            mesh_package = store.package(entry.mesh)
+            if mesh_package is None:
+                mesh_cache[entry.mesh] = None
+            else:
+                export = mesh_package.find_export("StaticMesh")
+                try:
+                    mesh_cache[entry.mesh] = (parse_static_mesh(
+                        mesh_package.export_bytes(export), mesh_package)
+                        if export else None)
+                except Exception as exc:  # noqa: BLE001
+                    if verbose:
+                        print(f"  [warn] 网格解析失败 {entry.mesh}: {exc}")
+                    mesh_cache[entry.mesh] = None
+        mesh = mesh_cache[entry.mesh]
+        if mesh is None:
+            skipped += 1
+            continue
+
+        toon = ToonMaterial()
+        placement = _placement_matrix(entry.location, entry.rotation, entry.scale)
+        sections = mesh.sections or [None]
+        for section in sections:
+            if section is None:
+                indices, slot_index = mesh.indices, 0
+            else:
+                start = section.first_index
+                count = section.num_triangles * 3
+                indices, slot_index = mesh.indices[start:start + count], section.material_index
+            if len(indices) == 0:
+                continue
+            material = None
+            if entry.materials and slot_index < len(entry.materials):
+                material = entry.materials[slot_index]
+            if not material and slot_index < len(mesh.material_slots):
+                material = mesh.material_slots[slot_index]
+            if not no_texture:
+                if _is_heart_screen(entry.mesh):
+                    toon = ToonMaterial(unlit=True, screen=True)
+                elif material:
+                    if material in material_cache:
+                        toon = material_cache[material]
+                    else:
+                        resolved = _toon_params(store, material)
+                        if (resolved.texture is None and not resolved.outline
+                                and not resolved.unlit):
+                            resolved.texture = _material_texture(store, material)[1]
+                        material_cache[material] = resolved
+                        toon = resolved
+            items.append(toon.item(mesh.positions, indices, mesh.uvs, placement))
+        if verbose and (index + 1) % 20 == 0:
+            print(f"  ... 已装载 {index + 1}/{len(placed)}")
+    return items, skipped
+
+
 def cmd_scene(args) -> int:
     paks = _open_all(args)
     try:
         import numpy as np
 
         from .ue4.content import ContentStore
-        from .ue4.level import parse_level
-        from .ue4.staticmesh import parse_static_mesh
         from .render import render_scene
 
         store = ContentStore(paks)
-        package = store.package(args.map)
-        if package is None:
-            raise SystemExit(f"未找到地图: {args.map}")
-        placed = parse_level(package)
-        print(f"关卡 {args.map}：静态网格 actor {len(placed)} 个")
-
-        mesh_cache: dict[str, object] = {}
-        material_cache: dict[str, object] = {}
-        items = []
-        skipped = 0
-        for index, entry in enumerate(placed):
-            if args.limit and len(items) >= args.limit:
-                break
-            if entry.mesh not in mesh_cache:
-                mesh_package = store.package(entry.mesh)
-                if mesh_package is None:
-                    mesh_cache[entry.mesh] = None
-                else:
-                    export = mesh_package.find_export("StaticMesh")
-                    try:
-                        mesh_cache[entry.mesh] = (parse_static_mesh(
-                            mesh_package.export_bytes(export), mesh_package)
-                            if export else None)
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"  [warn] 网格解析失败 {entry.mesh}: {exc}")
-                        mesh_cache[entry.mesh] = None
-            mesh = mesh_cache[entry.mesh]
-            if mesh is None:
-                skipped += 1
-                continue
-
-            toon = ToonMaterial()
-            placement = _placement_matrix(entry.location, entry.rotation, entry.scale)
-            sections = mesh.sections or [None]
-            for section in sections:
-                if section is None:
-                    indices, slot_index = mesh.indices, 0
-                else:
-                    start = section.first_index
-                    count = section.num_triangles * 3
-                    indices, slot_index = mesh.indices[start:start + count], section.material_index
-                if len(indices) == 0:
-                    continue
-                material = None
-                if entry.materials and slot_index < len(entry.materials):
-                    material = entry.materials[slot_index]
-                if not material and slot_index < len(mesh.material_slots):
-                    material = mesh.material_slots[slot_index]
-                if not args.no_texture and material:
-                    if material not in material_cache:
-                        resolved = _toon_params(store, material)
-                        if (resolved.texture is None and not resolved.outline
-                                and not resolved.unlit):
-                            resolved.texture = _material_texture(store, material)[1]
-                        material_cache[material] = resolved
-                    toon = material_cache[material]
-                items.append(toon.item(mesh.positions, indices, mesh.uvs, placement))
-            if (index + 1) % 20 == 0:
-                print(f"  ... 已装载 {index + 1}/{len(placed)}")
-
+        items, skipped = _stage_items(store, args.map, args.no_texture, args.limit)
         if not items:
             raise SystemExit("没有可渲染的静态网格")
 
@@ -706,6 +730,70 @@ def cmd_scene(args) -> int:
         render_scene(items, args.out, args.size, eye, target, args.exposure, args.fov,
                      light=_vec3(args.light, (0.35, 0.45, 0.75)), **shadow_kwargs)
         print(f"已渲染 {len(items)} 个网格 -> {args.out}（跳过 {skipped} 个）")
+        return 0
+    finally:
+        for pak in paks:
+            pak.close()
+
+
+def _parse_views(specs: list[str] | None):
+    """解析 --view：name:ex,ey,ez,tx,ty,tz。"""
+    views = []
+    for spec in specs or []:
+        name, _, numbers = spec.partition(":")
+        try:
+            values = [float(v) for v in numbers.split(",")]
+        except ValueError:
+            values = []
+        if len(values) != 6:
+            raise SystemExit(f"--view 需要 name:ex,ey,ez,tx,ty,tz，收到 {spec!r}")
+        views.append((name or f"view{len(views) + 1}", values[:3], values[3:]))
+    return views
+
+
+def cmd_batch(args) -> int:
+    """一次输出多角色 × 多机位的对照图。"""
+    paks = _open_all(args)
+    try:
+        import numpy as np
+
+        from .ue4.content import ContentStore
+        from .render import render_scene
+
+        store = ContentStore(paks)
+        stage_items, _ = _stage_items(store, args.map, args.no_texture, args.limit,
+                                      verbose=False)
+        if not stage_items:
+            raise SystemExit("没有可渲染的静态网格")
+
+        characters = [c.strip() for c in args.characters.split(",") if c.strip()]
+        views = _parse_views(args.view)
+        os.makedirs(args.out, exist_ok=True)
+        light = _vec3(args.light, (0.35, 0.45, 0.75))
+        shots = 0
+        for chr_id in characters:
+            char_items, center, radius = _character_items(
+                store, chr_id, args.no_texture, args.flip_uv, verbose=False)
+            if not char_items:
+                print(f"  [warn] {chr_id} 没有可渲染的网格")
+                continue
+            shadow = {"shadow_center": center, "shadow_radius": max(radius * 1.6, 120.0)}
+            # 没给机位时按角色包围盒自动取正视与四分之三侧视
+            cameras = views or [
+                ("front", center + np.array([0.0, -radius * 2.2, radius * 0.12],
+                                            dtype=np.float32), center),
+                ("threequarter", center + np.array([radius * 1.6, -radius * 1.8,
+                                                    radius * 0.5], dtype=np.float32), center),
+            ]
+            for name, eye, target in cameras:
+                path = os.path.join(args.out, f"{chr_id}_{name}.png")
+                render_scene(stage_items + char_items, path, args.size,
+                             np.array(eye, dtype=np.float32),
+                             np.array(target, dtype=np.float32),
+                             args.exposure, args.fov, light=light, **shadow)
+                print(f"  {chr_id} / {name} -> {path}")
+                shots += 1
+        print(f"已输出 {shots} 张对照图 -> {args.out}")
         return 0
     finally:
         for pak in paks:
@@ -866,6 +954,23 @@ def build_parser() -> argparse.ArgumentParser:
                          help="翻转 UV 轴，用于排查贴图方向")
     p_scene.add_argument("--no-texture", action="store_true", help="只渲染纯色")
     p_scene.set_defaults(func=cmd_scene)
+
+    p_batch = sub.add_parser("batch", help="批量输出多角色 × 多机位的对照图")
+    p_batch.add_argument("--map", required=True, help="地图资源路径（不含扩展名）")
+    p_batch.add_argument("--out", required=True, help="输出 PNG 的目录")
+    p_batch.add_argument("--characters", default="chr0101", help="角色 ID，逗号分隔")
+    p_batch.add_argument("--view", action="append",
+                         help="机位 name:ex,ey,ez,tx,ty,tz（可重复；缺省用自动机位）")
+    p_batch.add_argument("--size", type=int, default=1024)
+    p_batch.add_argument("--fov", type=float, default=45.0)
+    p_batch.add_argument("--exposure", type=float, default=1.0,
+                         help="固定曝光（关卡 PostProcess 为 1.0）")
+    p_batch.add_argument("--light", help="光照方向 x,y,z（指向光源）")
+    p_batch.add_argument("--limit", type=int, default=0, help="最多装载多少个网格")
+    p_batch.add_argument("--flip-uv", default="", choices=["", "none", "u", "v", "uv"],
+                         help="翻转 UV 轴，用于排查贴图方向")
+    p_batch.add_argument("--no-texture", action="store_true", help="只渲染纯色")
+    p_batch.set_defaults(func=cmd_batch)
 
     p_character = sub.add_parser("character", help="渲染角色的身体/脸/头发（绑定姿势）")
     p_character.add_argument("--chr", default="chr0101", help="角色 ID，例如 chr0101")
