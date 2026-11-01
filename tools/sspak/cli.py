@@ -194,31 +194,66 @@ def cmd_census(args) -> int:
 def cmd_preview(args) -> int:
     paks = _open_all(args)
     try:
-        for pak in paks:
-            entry = pak.get(args.asset + ".uasset")
-            if entry is None:
-                continue
-            uexp_entry = pak.get(args.asset + ".uexp")
-            uasset = pak.read_entry(entry)
-            uexp = pak.read_entry(uexp_entry) if uexp_entry else b""
-            from .ue4.package import Package
-            from .ue4.staticmesh import parse_static_mesh
+        from .ue4.content import ContentStore
+        from .ue4.material import parse_material_instance, pick_base_color
+        from .ue4.staticmesh import parse_static_mesh
+        from .ue4.texture import decode_texture
+        from .render import render_static_mesh
 
-            package = Package(uasset, uexp)
-            export = package.find_export("StaticMesh")
-            if export is None:
-                raise SystemExit("该资源不包含 StaticMesh")
-            mesh = parse_static_mesh(package.export_bytes(export), package.names)
-            from .render import render_static_mesh
+        store = ContentStore(paks)
+        package = store.package(args.asset)
+        if package is None:
+            raise SystemExit(f"未找到资源: {args.asset}")
+        export = package.find_export("StaticMesh")
+        if export is None:
+            raise SystemExit("该资源不包含 StaticMesh")
+        mesh = parse_static_mesh(package.export_bytes(export), package)
 
-            render_static_mesh(mesh, args.out, args.size)
-            print(f"已渲染 {args.asset} -> {args.out} "
-                  f"({len(mesh.positions)} 顶点 / {len(mesh.indices) // 3} 三角形)")
-            return 0
+        base_color = None
+        if not args.no_texture:
+            material = args.material or (mesh.material_slots[0] if mesh.material_slots else None)
+            texture_path = None
+            for _ in range(6):
+                if not material:
+                    break
+                material_package = store.package(material)
+                if material_package is None:
+                    print(f"  [warn] 材质包不存在: {material}")
+                    break
+                try:
+                    instance = parse_material_instance(material_package)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  [warn] 材质解析失败 {material}: {exc}")
+                    break
+                picked = pick_base_color(instance.textures)
+                if picked:
+                    param, texture_path = picked
+                    print(f"  材质 {material}\n    参数 {param} -> {texture_path}")
+                    break
+                material = instance.parent
+            if texture_path:
+                texture = store.texture(texture_path)
+                if texture is not None:
+                    base_color = decode_texture(texture)
+                    print(f"  贴图 {texture.width}x{texture.height} {texture.pixel_format}")
+            elif not args.no_texture:
+                print("  [warn] 未解析到基础色贴图，使用纯色着色")
+
+        exposure = 1.0
+        if base_color is not None:
+            import numpy as np
+            mean = float(base_color[:, :, :3].astype("f4").mean() / 255.0)
+            exposure = float(np.clip(0.45 / max(mean ** 2.2, 1e-4), 1.0, 8.0))
+            print(f"  平均色 {mean:.3f}，预览曝光 ×{exposure:.1f}")
+
+        render_static_mesh(mesh, args.out, args.size, base_color, exposure=exposure)
+        print(f"已渲染 {args.asset} -> {args.out} "
+              f"({len(mesh.positions)} 顶点 / {len(mesh.indices) // 3} 三角形"
+              f"{'，带贴图' if base_color is not None else ''})")
+        return 0
     finally:
         for pak in paks:
             pak.close()
-    raise SystemExit(f"未找到资源: {args.asset}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -253,6 +288,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_preview.add_argument("--asset", required=True, help="资源路径（不含扩展名）")
     p_preview.add_argument("--out", required=True, help="输出 PNG 路径")
     p_preview.add_argument("--size", type=int, default=1024)
+    p_preview.add_argument("--material", help="指定材质路径（默认取第一个材质槽）")
+    p_preview.add_argument("--no-texture", action="store_true", help="只渲染纯色")
     p_preview.set_defaults(func=cmd_preview)
 
     return parser
