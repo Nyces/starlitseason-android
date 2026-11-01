@@ -139,7 +139,8 @@ FRAGMENT_SHADER = """
             // 无光照的发光材质：只用发光项（Emissive_Additive 系列）
             base = to_linear(texture(emissive_tex, v_uv).rgb) * emissive_boost;
         }
-        color = vec4(to_srgb(clamp(base * exposure, 0.0, 1.0)), alpha);
+        // 输出线性 HDR，曝光与 sRGB 编码交给后处理
+        color = vec4(base, alpha);
     }
 """
 
@@ -173,6 +174,61 @@ OUTLINE_FRAGMENT_SHADER = """
     }
 """
 
+
+POST_VERTEX_SHADER = """
+    #version 330
+    in vec2 in_pos;
+    out vec2 v_uv;
+    void main() {
+        v_uv = in_pos * 0.5 + 0.5;
+        gl_Position = vec4(in_pos, 0.0, 1.0);
+    }
+"""
+
+BRIGHT_FRAGMENT_SHADER = """
+    #version 330
+    uniform sampler2D scene;
+    uniform float threshold;
+    in vec2 v_uv;
+    out vec4 color;
+    void main() {
+        vec3 c = texture(scene, v_uv).rgb;
+        float level = max(c.r, max(c.g, c.b));
+        color = vec4(c * max(level - threshold, 0.0) / max(level, 1e-4), 1.0);
+    }
+"""
+
+BLUR_FRAGMENT_SHADER = """
+    #version 330
+    uniform sampler2D src;
+    uniform vec2 direction;
+    in vec2 v_uv;
+    out vec4 color;
+    void main() {
+        vec3 sum = texture(src, v_uv).rgb * 0.227027;
+        sum += (texture(src, v_uv + direction * 1.3846).rgb
+                + texture(src, v_uv - direction * 1.3846).rgb) * 0.316216;
+        sum += (texture(src, v_uv + direction * 3.2308).rgb
+                + texture(src, v_uv - direction * 3.2308).rgb) * 0.070270;
+        color = vec4(sum, 1.0);
+    }
+"""
+
+COMPOSITE_FRAGMENT_SHADER = """
+    #version 330
+    uniform sampler2D scene;
+    uniform sampler2D bloom;
+    uniform float intensity;
+    uniform float exposure;
+    in vec2 v_uv;
+    out vec4 color;
+    vec3 to_srgb(vec3 c) { return pow(c, vec3(1.0 / 2.2)); }
+    void main() {
+        vec4 scene_color = texture(scene, v_uv);
+        vec3 c = scene_color.rgb * exposure + texture(bloom, v_uv).rgb * intensity;
+        color = vec4(to_srgb(clamp(c, 0.0, 1.0)), 1.0);
+    }
+"""
 
 SHADOW_VERTEX_SHADER = """
     #version 330
@@ -303,7 +359,9 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
                  lighting_intensity: float = 1.0,
                  shadow: bool = True, shadow_strength: float = 0.85,
                  shadow_center: np.ndarray | None = None,
-                 shadow_radius: float | None = None) -> None:
+                 shadow_radius: float | None = None,
+                 bloom: bool = True, bloom_threshold: float = 0.85,
+                 bloom_intensity: float = 0.55) -> None:
     import moderngl
     from PIL import Image
 
@@ -319,9 +377,13 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
     target = np.asarray(target, dtype=np.float32)
 
     ctx = moderngl.create_standalone_context(require=330)
-    fbo = ctx.simple_framebuffer((size, size))
+    # 主场景渲到 HDR，曝光/泛光/编码在最后一步做
+    scene_texture = ctx.texture((size, size), 4, dtype="f2")
+    scene_texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+    scene_depth = ctx.depth_texture((size, size))
+    fbo = ctx.framebuffer(color_attachments=[scene_texture], depth_attachment=scene_depth)
     fbo.use()
-    ctx.clear(0.05, 0.06, 0.08, 1.0)
+    ctx.clear(0.01, 0.012, 0.016, 1.0)
     ctx.enable(moderngl.DEPTH_TEST)
 
     program = ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER)
@@ -493,8 +555,60 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
         ctx.depth_mask = True
         ctx.disable(moderngl.BLEND)
 
-    pixels = fbo.read(components=3)
-    image = Image.frombytes("RGB", fbo.size, pixels).transpose(Image.FLIP_TOP_BOTTOM)
+    # 后处理：亮部提取 -> 两趟高斯 -> 合成（曝光 + sRGB）
+    screen = ctx.simple_framebuffer((size, size))
+    screen.use()
+    ctx.disable(moderngl.DEPTH_TEST)
+    quad_positions = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype="f4")
+    quad_buffer = ctx.buffer(quad_positions.tobytes())
+
+    composite = ctx.program(vertex_shader=POST_VERTEX_SHADER,
+                            fragment_shader=COMPOSITE_FRAGMENT_SHADER)
+    composite_vao = ctx.vertex_array(composite, [(quad_buffer, "2f", "in_pos")])
+    bloom_texture = ctx.texture((1, 1), 4, bytes((0, 0, 0, 0)))
+
+    if bloom:
+        half = max(size // 2, 1)
+        bright = ctx.texture((half, half), 4, dtype="f2")
+        temp = ctx.texture((half, half), 4, dtype="f2")
+        for target_tex in (bright, temp):
+            target_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            target_tex.repeat_x = target_tex.repeat_y = False
+
+        bright_program = ctx.program(vertex_shader=POST_VERTEX_SHADER,
+                                     fragment_shader=BRIGHT_FRAGMENT_SHADER)
+        bright_vao = ctx.vertex_array(bright_program, [(quad_buffer, "2f", "in_pos")])
+        bright_fbo = ctx.framebuffer([bright])
+        bright_fbo.use()
+        scene_texture.use(0)
+        bright_program["scene"].value = 0
+        _set(bright_program, "threshold", float(bloom_threshold))
+        bright_vao.render(moderngl.TRIANGLE_STRIP)
+
+        blur_program = ctx.program(vertex_shader=POST_VERTEX_SHADER,
+                                   fragment_shader=BLUR_FRAGMENT_SHADER)
+        blur_vao = ctx.vertex_array(blur_program, [(quad_buffer, "2f", "in_pos")])
+        passes = (((1.0 / half, 0.0), bright, temp), ((0.0, 1.0 / half), temp, bright))
+        for direction, source, destination in passes:
+            target_fbo = ctx.framebuffer([destination])
+            target_fbo.use()
+            source.use(0)
+            blur_program["src"].value = 0
+            blur_program["direction"].value = direction
+            blur_vao.render(moderngl.TRIANGLE_STRIP)
+        bloom_texture = bright
+        screen.use()
+
+    scene_texture.use(0)
+    bloom_texture.use(1)
+    composite["scene"].value = 0
+    composite["bloom"].value = 1
+    _set(composite, "intensity", float(bloom_intensity if bloom else 0.0))
+    _set(composite, "exposure", float(exposure))
+    composite_vao.render(moderngl.TRIANGLE_STRIP)
+
+    pixels = screen.read(components=3)
+    image = Image.frombytes("RGB", screen.size, pixels).transpose(Image.FLIP_TOP_BOTTOM)
     image.save(out_path)
 
 
