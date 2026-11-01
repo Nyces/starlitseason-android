@@ -308,6 +308,8 @@ def _skeletal_items(store, asset: str, no_texture: bool):
             continue
         slot = mesh.material_slots[section.material_index] \
             if section.material_index < len(mesh.material_slots) else None
+        if slot and "outline" in slot.lower():
+            continue                      # 描边是反向球壳，正视渲染时跳过
         texture = None if no_texture else _material_texture(store, slot)[1]
         items.append(SceneItem(mesh.positions, indices, mesh.uvs, texture))
     return items, mesh

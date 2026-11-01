@@ -125,7 +125,8 @@ def decode_texture(texture: Texture2D) -> np.ndarray:
             "bc7": texture2ddecoder.decode_bc7,
         }[kind]
         rgba = fn(data, width, height)
-        return np.frombuffer(rgba, dtype=np.uint8).reshape(height, width, 4).copy()
+        # texture2ddecoder 返回 BGRA，需要换回 RGBA
+        return np.frombuffer(rgba, dtype=np.uint8).reshape(height, width, 4)[:, :, [2, 1, 0, 3]].copy()
 
     raw = np.frombuffer(data, dtype=np.uint8)
     if kind == "bgra8":
