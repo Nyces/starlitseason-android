@@ -360,8 +360,8 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
                  shadow: bool = True, shadow_strength: float = 0.85,
                  shadow_center: np.ndarray | None = None,
                  shadow_radius: float | None = None,
-                 bloom: bool = True, bloom_threshold: float = 0.85,
-                 bloom_intensity: float = 0.55) -> None:
+                 bloom: bool = True, bloom_threshold: float = 1.05,
+                 bloom_intensity: float = 0.3) -> None:
     import moderngl
     from PIL import Image
 
