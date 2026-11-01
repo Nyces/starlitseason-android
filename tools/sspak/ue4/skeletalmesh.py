@@ -181,7 +181,8 @@ def parse_skeletal_mesh(package: Package) -> SkeletalMesh:
     if uv_size == item and uv_count == num_texcoords * num_vertices:
         raw = np.frombuffer(data, dtype="<f4" if full_precision else "<f2",
                             count=uv_count * 2, offset=uv_offset)
-        uvs = raw.reshape(uv_count, 2)[::num_texcoords].astype(np.float32)
+        # 每顶点 num_texcoords 套 UV，只取第 0 套
+        uvs = raw.reshape(num_vertices, num_texcoords, 2)[:, 0, :].astype(np.float32)
 
     if len(indices) == 0 or int(indices.max()) >= num_vertices:
         raise SkeletalMeshError("索引越界")
