@@ -56,6 +56,14 @@ def mip0_size(pixel_format: str, width: int, height: int) -> int:
     return width * height * unit
 
 
+def mip_chain_sizes(pixel_format: str, width: int, height: int, mips: int) -> list[int]:
+    sizes: list[int] = []
+    for _ in range(max(mips, 1)):
+        sizes.append(mip0_size(pixel_format, max(width, 1), max(height, 1)))
+        width, height = width // 2, height // 2
+    return sizes
+
+
 def _locate_platform_data(data: bytes, start: int) -> tuple[int, str]:
     """定位平台数据头：返回 (PixelFormat 字符串起点对应的长度字段位置, 格式名)。
 
@@ -87,9 +95,17 @@ def parse_texture(package: Package, ubulk: bytes) -> Texture2D:
         raise TextureError(f"纹理尺寸异常 {width}x{height}")
 
     need = mip0_size(pixel_format, width, height)
-    if len(ubulk) < need:
-        raise TextureError(f"ubulk 不足：需要 {need}，实际 {len(ubulk)}")
-    return Texture2D(width, height, pixel_format, ubulk[:need])
+    if len(ubulk) >= need:
+        return Texture2D(width, height, pixel_format, ubulk[:need])
+
+    # 像素内联在导出数据末尾：按 mip 链总长度回推 mip0 起点
+    header_end = length_pos + 4 + struct.unpack_from("<i", data, length_pos)[0]
+    mips = struct.unpack_from("<ii", data, header_end)[1] if header_end + 8 <= len(data) else 1
+    total = sum(mip_chain_sizes(pixel_format, width, height, max(mips, 1)))
+    start = len(data) - total
+    if start < 0 or start + need > len(data):
+        raise TextureError(f"ubulk 不足且内联数据缺失：需要 {need}，实际 {len(ubulk)}")
+    return Texture2D(width, height, pixel_format, data[start:start + need])
 
 
 def decode_texture(texture: Texture2D) -> np.ndarray:

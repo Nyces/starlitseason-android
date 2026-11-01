@@ -204,8 +204,7 @@ def _material_texture(store, material: str | None):
             return None, None
         try:
             instance = parse_material_instance(package)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [warn] 材质解析失败 {material}: {exc}")
+        except Exception:  # noqa: BLE001 - 父级通常是基础材质（无参数可读）
             return None, None
         picked = pick_base_color(instance.textures)
         if picked:
@@ -221,40 +220,165 @@ def _material_texture(store, material: str | None):
 def cmd_preview(args) -> int:
     paks = _open_all(args)
     try:
+        import numpy as np
+
         from .ue4.content import ContentStore
+        from .ue4.skeletalmesh import parse_skeletal_mesh
         from .ue4.staticmesh import parse_static_mesh
-        from .render import render_static_mesh
+        from .render import SceneItem, render_scene
 
         store = ContentStore(paks)
         package = store.package(args.asset)
         if package is None:
             raise SystemExit(f"未找到资源: {args.asset}")
-        export = package.find_export("StaticMesh")
-        if export is None:
-            raise SystemExit("该资源不包含 StaticMesh")
-        mesh = parse_static_mesh(package.export_bytes(export), package)
 
-        base_color = None
-        if not args.no_texture:
+        items = []
+        positions = None
+        label = ""
+        export = package.find_export("StaticMesh")
+        if export is not None:
+            mesh = parse_static_mesh(package.export_bytes(export), package)
+            positions = mesh.positions
             material = args.material or (mesh.material_slots[0] if mesh.material_slots else None)
-            param, base_color = _material_texture(store, material)
+            param, texture = (None, None) if args.no_texture else _material_texture(store, material)
             if param:
                 print(f"  材质 {material}\n    参数 {param}")
-            else:
-                print("  [warn] 未解析到基础色贴图，使用纯色着色")
+            items.append(SceneItem(mesh.positions, mesh.indices, mesh.uvs, texture))
+            label = f"{len(mesh.positions)} 顶点 / {len(mesh.indices) // 3} 三角形"
+        else:
+            skeletal = parse_skeletal_mesh(package)
+            positions = skeletal.positions
+            for section in skeletal.sections:
+                start = section.base_index
+                count = section.num_triangles * 3
+                indices = skeletal.indices[start:start + count]
+                if len(indices) == 0:
+                    continue
+                slot = skeletal.material_slots[section.material_index] \
+                    if section.material_index < len(skeletal.material_slots) else None
+                texture = None if args.no_texture else _material_texture(store, slot)[1]
+                items.append(SceneItem(skeletal.positions, indices, skeletal.uvs, texture))
+                print(f"  分段 材质槽 {section.material_index} -> {slot}")
+            label = (f"{len(skeletal.positions)} 顶点 / {len(skeletal.indices) // 3} 三角形 / "
+                     f"{len(skeletal.bones)} 骨骼 / {len(skeletal.sections)} 分段")
 
         exposure = 1.0
-        if base_color is not None:
-            import numpy as np
-            mean = float(base_color[:, :, :3].astype("f4").mean() / 255.0)
+        means = [item.texture[:, :, :3].astype("f4").mean() / 255.0
+                 for item in items if item.texture is not None]
+        if means:
+            mean = float(np.mean(means))
             exposure = float(np.clip(0.30 / max(mean ** 2.2, 1e-4), 1.0, 6.0))
-            print(f"  贴图 {base_color.shape[1]}x{base_color.shape[0]}，平均色 {mean:.3f}，"
-                  f"预览曝光 ×{exposure:.1f}")
+            print(f"  {len(means)} 张贴图，平均色 {mean:.3f}，预览曝光 ×{exposure:.1f}")
+        if not means and not args.no_texture:
+            print("  [warn] 未解析到基础色贴图，使用纯色着色")
 
-        render_static_mesh(mesh, args.out, args.size, base_color, exposure=exposure)
-        print(f"已渲染 {args.asset} -> {args.out} "
-              f"({len(mesh.positions)} 顶点 / {len(mesh.indices) // 3} 三角形"
-              f"{'，带贴图' if base_color is not None else ''})")
+        center = (positions.min(axis=0) + positions.max(axis=0)) * 0.5
+        radius = float(np.linalg.norm(positions.max(axis=0) - positions.min(axis=0)) * 0.5) or 1.0
+        if args.camera:
+            values = [float(v) for v in args.camera.split(",")]
+            if len(values) != 6:
+                raise SystemExit("--camera 需要 6 个数字: ex,ey,ez,tx,ty,tz")
+            eye, target = np.array(values[:3], np.float32), np.array(values[3:], np.float32)
+        else:
+            target = center
+            eye = center + np.array([radius * 1.9, -radius * 2.4, radius * 0.35], dtype=np.float32)
+
+        render_scene(items, args.out, args.size, eye, target, exposure, args.fov)
+        print(f"已渲染 {args.asset} -> {args.out}（{label}）")
+        return 0
+    finally:
+        for pak in paks:
+            pak.close()
+
+
+def _skeletal_items(store, asset: str, no_texture: bool):
+    from .ue4.skeletalmesh import parse_skeletal_mesh
+    from .render import SceneItem
+
+    package = store.package(asset)
+    if package is None:
+        return [], None
+    mesh = parse_skeletal_mesh(package)
+    items = []
+    for section in mesh.sections:
+        start = section.base_index
+        count = section.num_triangles * 3
+        indices = mesh.indices[start:start + count]
+        if len(indices) == 0:
+            continue
+        slot = mesh.material_slots[section.material_index] \
+            if section.material_index < len(mesh.material_slots) else None
+        texture = None if no_texture else _material_texture(store, slot)[1]
+        items.append(SceneItem(mesh.positions, indices, mesh.uvs, texture))
+    return items, mesh
+
+
+def cmd_character(args) -> int:
+    """把一个角色的身体/脸/头发（绑定姿势）拼在一起渲染。"""
+    paks = _open_all(args)
+    try:
+        import numpy as np
+
+        from .ue4.content import ContentStore
+        from .render import render_scene
+
+        store = ContentStore(paks)
+        chr_id = args.chr
+        candidates = [
+            f"Model/Character/Body/Priv/chr_body_priv001_{chr_id}/Mesh/SK_chr_body_priv001_{chr_id}_a",
+            f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_face",
+            f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_hair",
+            f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_orna",
+        ]
+        items = []
+        positions = []
+        head_center = None
+        for asset in candidates:
+            mesh_items, mesh = _skeletal_items(store, asset, args.no_texture)
+            if not mesh_items:
+                print(f"  [skip] {asset}")
+                continue
+            print(f"  {asset.rsplit('/', 1)[-1]}: {len(mesh.positions)} 顶点 / "
+                  f"{len(mesh.sections)} 分段 / {len(mesh.bones)} 骨骼")
+            lo, hi = mesh.positions.min(axis=0), mesh.positions.max(axis=0)
+            center = (lo + hi) * 0.5
+            shift = np.zeros(3, dtype=np.float32)
+            if asset.endswith("_face"):
+                head_center = center
+            elif head_center is not None and asset.endswith(("_hair", "_orna")):
+                # 头发/饰品顶点不在角色坐标系里，按头部位置整体平移
+                shift = head_center - center
+                for item in mesh_items:
+                    model = np.eye(4, dtype=np.float32)
+                    model[:3, 3] = shift
+                    item.model = model
+            items.extend(mesh_items)
+            positions.append(mesh.positions + shift)
+        if not items:
+            raise SystemExit("没有可渲染的骨骼网格")
+
+        all_positions = np.vstack(positions)
+        lo, hi = all_positions.min(axis=0), all_positions.max(axis=0)
+        center = (lo + hi) * 0.5
+        radius = float(np.linalg.norm(hi - lo) * 0.5) or 1.0
+
+        exposure = 1.0
+        means = [item.texture[:, :, :3].astype("f4").mean() / 255.0
+                 for item in items if item.texture is not None]
+        if means:
+            mean = float(np.mean(means))
+            exposure = float(np.clip(0.30 / max(mean ** 2.2, 1e-4), 1.0, 6.0))
+            print(f"  {len(means)} 张贴图，平均色 {mean:.3f}，预览曝光 ×{exposure:.1f}")
+
+        if args.camera:
+            values = [float(v) for v in args.camera.split(",")]
+            eye, target = np.array(values[:3], np.float32), np.array(values[3:], np.float32)
+        else:
+            target = center
+            eye = center + np.array([0.0, -radius * 2.2, radius * 0.12], dtype=np.float32)
+
+        render_scene(items, args.out, args.size, eye, target, exposure, args.fov)
+        print(f"已渲染 {chr_id} -> {args.out}")
         return 0
     finally:
         for pak in paks:
@@ -393,6 +517,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_preview.add_argument("--out", required=True, help="输出 PNG 路径")
     p_preview.add_argument("--size", type=int, default=1024)
     p_preview.add_argument("--material", help="指定材质路径（默认取第一个材质槽）")
+    p_preview.add_argument("--camera", help="ex,ey,ez,tx,ty,tz")
+    p_preview.add_argument("--fov", type=float, default=45.0)
     p_preview.add_argument("--no-texture", action="store_true", help="只渲染纯色")
     p_preview.set_defaults(func=cmd_preview)
 
@@ -405,6 +531,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_scene.add_argument("--limit", type=int, default=0, help="最多装载多少个网格")
     p_scene.add_argument("--no-texture", action="store_true", help="只渲染纯色")
     p_scene.set_defaults(func=cmd_scene)
+
+    p_character = sub.add_parser("character", help="渲染角色的身体/脸/头发（绑定姿势）")
+    p_character.add_argument("--chr", default="chr0101", help="角色 ID，例如 chr0101")
+    p_character.add_argument("--out", required=True, help="输出 PNG 路径")
+    p_character.add_argument("--size", type=int, default=900)
+    p_character.add_argument("--fov", type=float, default=40.0)
+    p_character.add_argument("--camera", help="ex,ey,ez,tx,ty,tz")
+    p_character.add_argument("--no-texture", action="store_true", help="只渲染纯色")
+    p_character.set_defaults(func=cmd_character)
 
     return parser
 

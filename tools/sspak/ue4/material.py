@@ -65,14 +65,18 @@ def pick_base_color(textures: dict[str, str]) -> tuple[str, str] | None:
     """从贴图参数里挑一张最像"基础色"的贴图。"""
     if not textures:
         return None
-    preferred = ("base", "albedo", "diffuse", "color", "col", "tex", "txt")
-    normal_hints = ("nml", "normal", "nrm", "spec", "rough", "metal", "mask", "opacity", "sdw", "shadow")
+    strong = ("basetexture", "basecolor", "base_color", "albedo", "diffuse", "colortex")
+    weak = ("color", "tex", "txt")
+    negative = ("mask", "lut", "sdw", "shadow", "nml", "normal", "nrm", "spec",
+                "rough", "metal", "opacity", "ref", "outline", "sss")
 
     def score(name: str) -> int:
         low = name.lower()
-        if any(h in low for h in normal_hints):
-            return -10
-        return sum(h in low for h in preferred)
+        if any(word in low for word in negative):
+            return -20
+        if any(word in low for word in strong):
+            return 10
+        return sum(word in low for word in weak)
 
     name, path = max(textures.items(), key=lambda kv: (score(kv[0]), -len(kv[0])))
-    return name, path
+    return (name, path) if score(name) > 0 else None
