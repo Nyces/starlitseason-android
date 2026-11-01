@@ -291,7 +291,20 @@ def cmd_preview(args) -> int:
             pak.close()
 
 
-def _skeletal_items(store, asset: str, no_texture: bool):
+def _flip_uv(uvs, mode: str):
+    if uvs is None or mode in ("", "none"):
+        return uvs
+    import numpy as np
+
+    out = uvs.copy()
+    if "u" in mode:
+        out[:, 0] = 1.0 - out[:, 0]
+    if "v" in mode:
+        out[:, 1] = 1.0 - out[:, 1]
+    return np.asarray(out, dtype=np.float32)
+
+
+def _skeletal_items(store, asset: str, no_texture: bool, flip: str = ""):
     from .ue4.skeletalmesh import parse_skeletal_mesh
     from .render import SceneItem
 
@@ -311,7 +324,7 @@ def _skeletal_items(store, asset: str, no_texture: bool):
         if slot and "outline" in slot.lower():
             continue                      # 描边是反向球壳，正视渲染时跳过
         texture = None if no_texture else _material_texture(store, slot)[1]
-        items.append(SceneItem(mesh.positions, indices, mesh.uvs, texture))
+        items.append(SceneItem(mesh.positions, indices, _flip_uv(mesh.uvs, flip), texture))
     return items, mesh
 
 
@@ -336,7 +349,7 @@ def cmd_character(args) -> int:
         positions = []
         head_center = None
         for asset in candidates:
-            mesh_items, mesh = _skeletal_items(store, asset, args.no_texture)
+            mesh_items, mesh = _skeletal_items(store, asset, args.no_texture, args.flip_uv)
             if not mesh_items:
                 print(f"  [skip] {asset}")
                 continue
@@ -639,6 +652,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_character.add_argument("--fov", type=float, default=40.0)
     p_character.add_argument("--camera", help="ex,ey,ez,tx,ty,tz")
     p_character.add_argument("--no-texture", action="store_true", help="只渲染纯色")
+    p_character.add_argument("--flip-uv", default="", choices=["", "none", "u", "v", "uv"],
+                             help="翻转 UV 轴，用于排查贴图方向")
     p_character.set_defaults(func=cmd_character)
 
     p_shaders = sub.add_parser("shaders", help="导出材质里的 SM5 着色器反汇编")
