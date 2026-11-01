@@ -58,6 +58,8 @@ FRAGMENT_SHADER = """
     uniform float rim_intensity;
     uniform float emissive_boost;
     uniform float exposure;
+    uniform bool unlit;
+    uniform float alpha_cut;
     in vec3 v_nrm;
     in vec3 v_nrm_view;
     in vec3 v_pos;
@@ -68,33 +70,49 @@ FRAGMENT_SHADER = """
     void main() {
         vec3 n = normalize(v_nrm);
         vec3 v = normalize(eye - v_pos);
-        // 明暗：ToonShaderParameter 的 LightVector（世界空间）与 ToonShadowIntensity
-        float shade = dot(n, normalize(light_dir)) * 0.5 + 0.5;
-        shade = clamp((shade - 0.5) * shadow_intensity + 0.5, 0.0, 1.0);
-        // ShadowTexture 的 alpha 标记哪里允许出现卡通阴影（脸/身体靠它收窄阴影）
-        float mask = has_shadow ? texture(shadow_tex, v_uv).a : 1.0;
-        float lit = step(shadow_threshold, mix(1.0, shade, mask));
-        // 阴影区用色表的粉/米色替换，受光区为白色
-        vec3 tone = mix(shadow_tint, vec3(1.0), lit);
-        vec3 base = has_tex ? to_linear(texture(base_tex, v_uv).rgb) : to_linear(tint);
+        float alpha = 1.0;
+        vec3 base;
+        if (has_tex) {
+            vec4 texel = texture(base_tex, v_uv);
+            alpha = texel.a;
+            base = to_linear(texel.rgb);
+        } else {
+            base = to_linear(tint);
+        }
+        if (alpha_cut > 0.0 && alpha < alpha_cut) {
+            discard;                       // BLEND_Masked 的抠像
+        }
         // 材质实例的 BlendColor / AddColor 是配色旋钮（部分服装靠它改色）
         base = base * to_linear(blend) + to_linear(add);
-        // MatCap（SphereMap）：视空间法线 xy 映射到球面贴图，先乘 BlendColor 再取幂、乘 Boost
-        if (has_sphere) {
-            vec3 nv = normalize(v_nrm_view);
-            vec2 uv = nv.xy * vec2(0.5, -0.5) + 0.5;
-            vec3 s = max(texture(sphere_tex, uv).rgb * sphere_blend, vec3(0.0));
-            s = pow(s, vec3(sphere_pow)) * sphere_boost;
-            base += to_linear(s);
+        if (!unlit) {
+            // 明暗：ToonShaderParameter 的 LightVector（世界空间）与 ToonShadowIntensity
+            float shade = dot(n, normalize(light_dir)) * 0.5 + 0.5;
+            shade = clamp((shade - 0.5) * shadow_intensity + 0.5, 0.0, 1.0);
+            // ShadowTexture 的 alpha 标记哪里允许出现卡通阴影（脸/身体靠它收窄阴影）
+            float mask = has_shadow ? texture(shadow_tex, v_uv).a : 1.0;
+            float lit = step(shadow_threshold, mix(1.0, shade, mask));
+            // 阴影区用色表的粉/米色替换，受光区为白色
+            vec3 tone = mix(shadow_tint, vec3(1.0), lit);
+            // MatCap（SphereMap）：视空间法线 xy 映射到球面贴图，先乘 BlendColor 再取幂、乘 Boost
+            if (has_sphere) {
+                vec3 nv = normalize(v_nrm_view);
+                vec2 uv = nv.xy * vec2(0.5, -0.5) + 0.5;
+                vec3 s = max(texture(sphere_tex, uv).rgb * sphere_blend, vec3(0.0));
+                s = pow(s, vec3(sphere_pow)) * sphere_boost;
+                base += to_linear(s);
+            }
+            base = base * to_linear(tone) * lighting_intensity;
+            // 边缘光：pow(1-|N·V|, RimScale)（与 ToonBaseCloth 反汇编一致）
+            float rim = pow(clamp(1.0 - abs(dot(n, v)), 0.0, 1.0), rim_scale) * rim_intensity;
+            base += to_linear(rim_color) * rim;
+            if (has_emissive) {
+                base += to_linear(texture(emissive_tex, v_uv).rgb) * emissive_boost;
+            }
+        } else if (has_emissive) {
+            // 无光照的发光材质：只用发光项（Emissive_Additive 系列）
+            base = to_linear(texture(emissive_tex, v_uv).rgb) * emissive_boost;
         }
-        vec3 c = base * to_linear(tone) * lighting_intensity;
-        // 边缘光：pow(1-|N·V|, RimScale)（与 ToonBaseCloth 反汇编一致）
-        float rim = pow(clamp(1.0 - abs(dot(n, v)), 0.0, 1.0), rim_scale) * rim_intensity;
-        c += to_linear(rim_color) * rim;
-        if (has_emissive) {
-            c += to_linear(texture(emissive_tex, v_uv).rgb) * emissive_boost;
-        }
-        color = vec4(to_srgb(clamp(c * exposure, 0.0, 1.0)), 1.0);
+        color = vec4(to_srgb(clamp(base * exposure, 0.0, 1.0)), alpha);
     }
 """
 
@@ -187,6 +205,8 @@ class SceneItem:
     rim_intensity: float = 1.0
     emissive: np.ndarray | None = None
     emissive_boost: float = 1.0
+    blend_mode: str = "opaque"          # opaque / masked / additive / translucent / modulate
+    unlit: bool = False
     outline: bool = False
     outline_color: tuple[float, float, float] = (0.16, 0.10, 0.09)
     outline_width: float = 0.0008
@@ -302,9 +322,8 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
             vao.render()
         ctx.disable(moderngl.CULL_FACE)
 
-    for item, normals, model, vbo, ibo, small, mvp in prepared:
-        if item.outline:
-            continue
+    def draw(entry) -> None:
+        item, normals, model, vbo, ibo, small, mvp = entry
         vao = ctx.vertex_array(
             program, [(vbo, "3f 3f 2f", "in_pos", "in_nrm", "in_uv")], ibo,
             index_element_size=2 if small else 4)
@@ -316,6 +335,8 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
         _set(program, "add", tuple(item.add))
         _set(program, "rim_scale", float(item.rim_scale))
         _set(program, "rim_intensity", float(item.rim_intensity))
+        _set(program, "unlit", bool(item.unlit))
+        _set(program, "alpha_cut", 0.33 if item.blend_mode == "masked" else 0.0)
         if item.texture is not None:
             texture = _upload_texture(ctx, item.texture)
             texture.use(0)
@@ -346,6 +367,31 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
         else:
             _set(program, "has_shadow", False)
         vao.render()
+
+    transparent_modes = ("additive", "translucent", "modulate")
+    solid = [entry for entry in prepared
+             if not entry[0].outline and entry[0].blend_mode not in transparent_modes]
+    blended = [entry for entry in prepared
+               if not entry[0].outline and entry[0].blend_mode in transparent_modes]
+
+    for entry in solid:
+        draw(entry)
+
+    if blended:
+        # 特效（发光、玻璃）走混合通道：不写深度，按材质混合模式叠加
+        ctx.enable(moderngl.BLEND)
+        ctx.depth_mask = False
+        for entry in blended:
+            mode = entry[0].blend_mode
+            if mode == "additive":
+                ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE)
+            elif mode == "modulate":
+                ctx.blend_func = (moderngl.DST_COLOR, moderngl.ZERO)
+            else:
+                ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+            draw(entry)
+        ctx.depth_mask = True
+        ctx.disable(moderngl.BLEND)
 
     pixels = fbo.read(components=3)
     image = Image.frombytes("RGB", fbo.size, pixels).transpose(Image.FLIP_TOP_BOTTOM)

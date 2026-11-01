@@ -235,6 +235,8 @@ class ToonMaterial:
     shadow_map: object = None
     emissive: object = None
     emissive_boost: float = 1.0
+    blend_mode: str = "opaque"
+    unlit: bool = False
     outline: bool = False
     outline_color: tuple[float, float, float] = (0.16, 0.10, 0.09)
     outline_width: float = 0.0008
@@ -249,6 +251,7 @@ class ToonMaterial:
                          sphere_boost=self.sphere_boost, rim_scale=self.rim_scale,
                          shadow_map=self.shadow_map,
                          emissive=self.emissive, emissive_boost=self.emissive_boost,
+                         blend_mode=self.blend_mode, unlit=self.unlit,
                          outline=self.outline, outline_color=self.outline_color,
                          outline_width=self.outline_width)
 
@@ -263,12 +266,16 @@ def _toon_params(store, material: str | None):
     """
     import numpy as np
 
-    from .ue4.material import parse_material_instance, pick_base_color
+    from .ue4.material import (parse_material_instance, parse_material_settings,
+                               pick_base_color)
     from .ue4.texture import decode_texture
 
     result = ToonMaterial()
     is_outline = bool(material and "outline" in material.lower())
-    line_intensity = None
+
+    # 先把父链走完：混合模式在基础材质上，不能因为拿到贴图就提前返回
+    chain = []
+    settings = None
     current = material
     for _ in range(6):
         if not current:
@@ -279,7 +286,34 @@ def _toon_params(store, material: str | None):
         try:
             instance = parse_material_instance(package)
         except Exception:  # noqa: BLE001 - 父级是基础材质
+            settings = parse_material_settings(package)
+            if "framebuffer" in current.lower():
+                result.unlit = True
+                result.texture = np.full((1, 1, 4), (46, 50, 58, 255), dtype=np.uint8)
             break
+        chain.append(instance)
+        current = instance.parent
+
+    if settings is not None:
+        mode = settings.blend_mode.lower()
+        if "additive" in mode:
+            result.blend_mode = "additive"
+        elif "modulate" in mode:
+            result.blend_mode = "modulate"
+        elif "translucent" in mode or "alphacomposite" in mode:
+            result.blend_mode = "translucent"
+        elif "masked" in mode:
+            result.blend_mode = "masked"
+        if "unlit" in settings.shading_model.lower():
+            result.unlit = True
+    if result.texture is not None:          # 屏幕抓帧材质的占位色
+        return result
+
+    line_intensity = None
+    base_done = False
+    skin_mask = False
+    for instance in chain:
+        parent = instance.parent or ""
         if "BlendColor" in instance.vectors:
             result.blend = tuple(instance.vectors["BlendColor"][:3])
         if "AddColor" in instance.vectors:
@@ -301,22 +335,26 @@ def _toon_params(store, material: str | None):
             result.outline_width = max(float(instance.scalars.get("OutlineScale", 0.2))
                                        * float(instance.scalars.get("DepthOffsetScale", 0.004)),
                                        1e-5)
-        if "hair" in (instance.parent or "").lower():
+        if "hair" in parent.lower():
             result.threshold = 0.94
-        table = instance.textures.get("CelShadowTable") or instance.textures.get("ToonShadowTable")
-        if table:
-            tex = store.texture(table)
-            if tex is not None:
-                img = decode_texture(tex)
-                rows = img.shape[0]
-                dark = img[max(0, int(rows * 0.02)):max(1, int(rows * 0.22)), :, :3]
-                result.shadow = tuple(float(v) / 255.0 for v in dark.reshape(-1, 3).mean(axis=0))
+        if result.shadow == (1.0, 1.0, 1.0):
+            table = (instance.textures.get("CelShadowTable")
+                     or instance.textures.get("ToonShadowTable"))
+            if table:
+                tex = store.texture(table)
+                if tex is not None:
+                    img = decode_texture(tex)
+                    rows = img.shape[0]
+                    dark = img[max(0, int(rows * 0.02)):max(1, int(rows * 0.22)), :, :3]
+                    result.shadow = tuple(float(v) / 255.0
+                                          for v in dark.reshape(-1, 3).mean(axis=0))
         if result.sphere is None and instance.textures.get("SphereMap"):
             tex = store.texture(instance.textures["SphereMap"])
             if tex is not None:
                 result.sphere = decode_texture(tex)
         if result.shadow_map is None:
-            shadow_path = instance.textures.get("ShadowTexture") or instance.textures.get("ShadowMap")
+            shadow_path = (instance.textures.get("ShadowTexture")
+                           or instance.textures.get("ShadowMap"))
             if shadow_path:
                 tex = store.texture(shadow_path)
                 if tex is not None:
@@ -327,29 +365,33 @@ def _toon_params(store, material: str | None):
                 tex = store.texture(instance.textures[name])
                 if tex is not None:
                     result.emissive = decode_texture(tex)
-        skin = "toonbasebody" in (instance.parent or "").lower()
+        if base_done:
+            continue
         picked = pick_base_color(instance.textures)
-        if picked:
-            tex = store.texture(picked[1])
-            if tex is not None:
-                image = decode_texture(tex)
-                if is_outline:
-                    mean = image[:, :, :3].astype("f4").mean(axis=(0, 1)) / 255.0
-                    scale = line_intensity or (0.22, 0.22, 0.22)
-                    result.outline = True
-                    result.outline_color = tuple(
-                        float(min(max(mean[i] * scale[i], 0.0), 1.0)) for i in range(3))
-                    return result
-                result.texture = image
-                if not skin:
-                    return result
-                break
-        current = instance.parent
+        if not picked:
+            continue
+        tex = store.texture(picked[1])
+        if tex is None:
+            continue
+        image = decode_texture(tex)
+        if is_outline:
+            mean = image[:, :, :3].astype("f4").mean(axis=(0, 1)) / 255.0
+            scale = line_intensity or (0.22, 0.22, 0.22)
+            result.outline = True
+            result.outline_color = tuple(
+                float(min(max(mean[i] * scale[i], 0.0), 1.0)) for i in range(3))
+            return result
+        result.texture = image
+        # 皮肤的基础色贴图是遮罩，真正的底色要用色表暗端（下面兜底）
+        if "toonbasebody" in parent.lower():
+            skin_mask = True
+        else:
+            base_done = True
 
     if is_outline:
         result.outline = True
         return result
-    if result.shadow != (1.0, 1.0, 1.0):
+    if (result.texture is None or skin_mask) and result.shadow != (1.0, 1.0, 1.0):
         pixel = np.array([[[int(result.shadow[0] * 255), int(result.shadow[1] * 255),
                             int(result.shadow[2] * 255), 255]]], dtype=np.uint8)
         result.texture = pixel
@@ -585,18 +627,31 @@ def cmd_scene(args) -> int:
                 continue
 
             toon = ToonMaterial()
-            if not args.no_texture:
-                material = (entry.materials[0] if entry.materials and entry.materials[0]
-                            else (mesh.material_slots[0] if mesh.material_slots else None))
-                if material and material not in material_cache:
-                    resolved = _toon_params(store, material)
-                    if resolved.texture is None and not resolved.outline:
-                        resolved.texture = _material_texture(store, material)[1]
-                    material_cache[material] = resolved
-                toon = material_cache.get(material) or ToonMaterial()
-
-            items.append(toon.item(mesh.positions, mesh.indices, mesh.uvs,
-                                   _placement_matrix(entry.location, entry.rotation, entry.scale)))
+            placement = _placement_matrix(entry.location, entry.rotation, entry.scale)
+            sections = mesh.sections or [None]
+            for section in sections:
+                if section is None:
+                    indices, slot_index = mesh.indices, 0
+                else:
+                    start = section.first_index
+                    count = section.num_triangles * 3
+                    indices, slot_index = mesh.indices[start:start + count], section.material_index
+                if len(indices) == 0:
+                    continue
+                material = None
+                if entry.materials and slot_index < len(entry.materials):
+                    material = entry.materials[slot_index]
+                if not material and slot_index < len(mesh.material_slots):
+                    material = mesh.material_slots[slot_index]
+                if not args.no_texture and material:
+                    if material not in material_cache:
+                        resolved = _toon_params(store, material)
+                        if (resolved.texture is None and not resolved.outline
+                                and not resolved.unlit):
+                            resolved.texture = _material_texture(store, material)[1]
+                        material_cache[material] = resolved
+                    toon = material_cache[material]
+                items.append(toon.item(mesh.positions, indices, mesh.uvs, placement))
             if (index + 1) % 20 == 0:
                 print(f"  ... 已装载 {index + 1}/{len(placed)}")
 

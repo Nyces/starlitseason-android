@@ -22,6 +22,37 @@ class MaterialInstance:
     parent: str | None = None
 
 
+@dataclass
+class MaterialSettings:
+    """基础材质（Material）上的混合/着色模式。"""
+
+    blend_mode: str = "BLEND_Opaque"
+    shading_model: str = "MSM_DefaultLit"
+
+
+def parse_material_settings(package: Package) -> MaterialSettings:
+    result = MaterialSettings()
+    for export in package.exports:
+        if export.class_name != "Material":
+            continue
+        data = package.export_bytes(export)
+        props, _ = parse_properties(data, package.names)
+        for prop in props:
+            # TEnumAsByte 序列化成 FName（8 字节：索引 + 编号）
+            if prop.type not in ("ByteProperty", "EnumProperty") or prop.size != 8:
+                continue
+            index = struct.unpack_from("<ii", data, prop.offset)[0]
+            if not 0 <= index < len(package.names):
+                continue
+            text = package.names[index]
+            if prop.name == "BlendMode":
+                result.blend_mode = text
+            elif prop.name == "ShadingModel":
+                result.shading_model = text
+        return result
+    return result
+
+
 def _param_name(items, data, names) -> str | None:
     from .properties import name_text
 
