@@ -102,20 +102,21 @@ def array_items(data: bytes, names: list[str], prop: Property) -> list[list[Prop
     items: list[list[Property]] = []
     stop = prop.offset + prop.size
     pos = prop.offset + 4
+    # 第一元素通常带完整标签；其余元素只保存内部的 None 结尾属性流
+    try:
+        first, _ = parse_one(data, names, pos)
+    except PropertyError:
+        first = None
+    if first is not None and first.type == "StructProperty":
+        pos = first.offset
     while pos + 33 <= stop:
         found = None
-        for delta in range(4):
+        for delta in range(5):
             try:
-                elem, _ = parse_one(data, names, pos + delta)
+                inner, inner_end = parse_properties(data, names, pos + delta)
             except PropertyError:
                 continue
-            if elem is None or elem.type != "StructProperty":
-                continue
-            try:
-                inner, inner_end = parse_properties(data, names, elem.offset)
-            except PropertyError:
-                continue
-            if inner and inner_end <= stop:
+            if inner and inner_end <= stop and inner_end > pos + delta:
                 found = (inner, inner_end)
                 break
         if found is None:
