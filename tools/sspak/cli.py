@@ -486,6 +486,104 @@ def cmd_scene(args) -> int:
             pak.close()
 
 
+def _material_parameters(package) -> list[str]:
+    """材质表达式里的 ParameterName（RDEF 被剥离后，参数名只能从材质资产里取）。"""
+    from .ue4.properties import name_text, parse_properties
+
+    names: list[str] = []
+    for export in package.exports:
+        if not export.class_name.startswith("MaterialExpression"):
+            continue
+        try:
+            data = package.export_bytes(export)
+            props, _ = parse_properties(data, package.names)
+        except Exception:  # noqa: BLE001 - 单个表达式解析失败不影响其它导出
+            continue
+        for prop in props:
+            if prop.name == "ParameterName" and prop.type == "NameProperty":
+                text = name_text(data, prop, package.names)
+                if text not in names:
+                    names.append(text)
+    return names
+
+
+def cmd_shaders(args) -> int:
+    """导出材质包里的 SM5 着色器：RDEF 摘要 + 反汇编全文。"""
+    paks = _open_all(args)
+    try:
+        from .ue4.content import ContentStore
+        from .ue4.shader import ShaderError, find_shaders
+
+        store = ContentStore(paks)
+        package = store.package(args.asset)
+        if package is None:
+            raise SystemExit(f"未找到资源: {args.asset}")
+
+        shaders = sorted(find_shaders(package), key=lambda item: item.offset)
+        if args.max:
+            shaders = shaders[:args.max]
+        if not shaders:
+            raise SystemExit(f"{args.asset} 里没有找到 DXBC 着色器")
+
+        dump: list[str] = [
+            f"资源 {args.asset}",
+            f"uexp {len(package.uexp):,} 字节，共 {len(shaders)} 个着色器（按 zlib 流偏移排序）",
+        ]
+        parameters = _material_parameters(package)
+        if parameters:
+            dump.append("材质参数名（来自材质表达式，RDEF 已被剥离）: " + ", ".join(parameters))
+        dump.append("")
+        for index, shader in enumerate(shaders, 1):
+            dump.append(f"=== #{index} {shader.version}  {shader.source}@{shader.offset}  "
+                        f"{len(shader.data)} 字节 ===")
+
+            rdef = shader.container.rdef
+            if rdef.buffers or rdef.resources:
+                dump.append("[RDEF] " + shader.container.describe_rdef().replace("\n", "\n        "))
+            else:
+                dump.append("[RDEF] 缺失（UE4 cook 时剥离了反射数据，没有缓冲/参数名）")
+
+            try:
+                decl = shader.container.declarations()
+                has_sample = any(inst.is_sample for inst in shader.instructions())
+                text = shader.disassemble()
+            except ShaderError as exc:
+                dump.append(f"[反汇编] {exc}")
+                dump.append("")
+                print(f"[{index}] {shader.version}  反汇编失败：{exc}")
+                continue
+
+            if decl["cb"]:
+                dump.append("[常量缓冲] " + " ".join(decl["cb"]))
+            if decl["t"] or decl["u"]:
+                dump.append("[贴图资源] " + " ".join(decl["t"] +
+                                                    [f"{name}(uav)" for name in decl["u"]]))
+            if decl["s"]:
+                dump.append("[采样器] " + " ".join(decl["s"]))
+            buffers = shader.uniform_buffer_names
+            if buffers:
+                dump.append("[参数表] uniform buffer（按 cb 顺序）: " + ", ".join(buffers))
+            dump.append("[反汇编]")
+            dump.append(text)
+            dump.append("")
+
+            resources = decl["t"] + decl["u"]
+            print(f"[{index}] {shader.version}  {shader.source}@{shader.offset}  "
+                  f"指令 {len(text.splitlines()) - 1} 条  "
+                  f"资源 {','.join(resources) if resources else '无'}  "
+                  f"采样 {'有' if has_sample else '无'}")
+
+        out_dir = os.path.dirname(os.path.abspath(args.out))
+        os.makedirs(out_dir, exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(dump))
+        print(f"已写出 {args.out}")
+        return 0
+    finally:
+        for pak in paks:
+            pak.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sspak", description="StarLit Season pak 工具")
     parser.add_argument("--paks", help="pak 所在目录")
@@ -542,6 +640,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_character.add_argument("--camera", help="ex,ey,ez,tx,ty,tz")
     p_character.add_argument("--no-texture", action="store_true", help="只渲染纯色")
     p_character.set_defaults(func=cmd_character)
+
+    p_shaders = sub.add_parser("shaders", help="导出材质里的 SM5 着色器反汇编")
+    p_shaders.add_argument("--asset", required=True, help="材质路径（不含扩展名）")
+    p_shaders.add_argument("--out", required=True, help="输出 TXT 路径")
+    p_shaders.add_argument("--max", type=int, default=0, help="最多导出多少个着色器")
+    p_shaders.set_defaults(func=cmd_shaders)
 
     return parser
 
