@@ -48,7 +48,7 @@ class ContentStore:
         return self._find(asset, ".uasset") is not None
 
     def package(self, asset: str) -> Package | None:
-        uasset = self._find(asset, ".uasset")
+        uasset = self._find(asset, ".uasset") or self._find(asset, ".umap")
         if uasset is None:
             return None
         pak, entry = uasset
@@ -57,9 +57,15 @@ class ContentStore:
         return Package(data, pak.read_entry(uexp[1]) if uexp else b"")
 
     def texture(self, asset: str) -> Texture2D | None:
+        """读取贴图；像素在 .ubulk 里，缺失或解析失败时返回 None。"""
+        from .texture import TextureError
+
         pak_entry = self._find(asset, ".ubulk")
         package = self.package(asset)
         if package is None:
             return None
         ubulk = pak_entry[0].read_entry(pak_entry[1]) if pak_entry else b""
-        return parse_texture(package, ubulk)
+        try:
+            return parse_texture(package, ubulk)
+        except TextureError:
+            return None

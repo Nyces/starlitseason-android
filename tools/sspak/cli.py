@@ -191,13 +191,38 @@ def cmd_census(args) -> int:
     return 0 if (not args.headers or header_bad == 0) else 1
 
 
+def _material_texture(store, material: str | None):
+    """把材质（含父链）解析成基础色贴图，返回 (参数名, 贴图数组)。"""
+    from .ue4.material import parse_material_instance, pick_base_color
+    from .ue4.texture import decode_texture
+
+    for _ in range(6):
+        if not material:
+            return None, None
+        package = store.package(material)
+        if package is None:
+            return None, None
+        try:
+            instance = parse_material_instance(package)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [warn] 材质解析失败 {material}: {exc}")
+            return None, None
+        picked = pick_base_color(instance.textures)
+        if picked:
+            param, texture_path = picked
+            texture = store.texture(texture_path)
+            if texture is None:
+                return param, None
+            return param, decode_texture(texture)
+        material = instance.parent
+    return None, None
+
+
 def cmd_preview(args) -> int:
     paks = _open_all(args)
     try:
         from .ue4.content import ContentStore
-        from .ue4.material import parse_material_instance, pick_base_color
         from .ue4.staticmesh import parse_static_mesh
-        from .ue4.texture import decode_texture
         from .render import render_static_mesh
 
         store = ContentStore(paks)
@@ -212,44 +237,123 @@ def cmd_preview(args) -> int:
         base_color = None
         if not args.no_texture:
             material = args.material or (mesh.material_slots[0] if mesh.material_slots else None)
-            texture_path = None
-            for _ in range(6):
-                if not material:
-                    break
-                material_package = store.package(material)
-                if material_package is None:
-                    print(f"  [warn] 材质包不存在: {material}")
-                    break
-                try:
-                    instance = parse_material_instance(material_package)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"  [warn] 材质解析失败 {material}: {exc}")
-                    break
-                picked = pick_base_color(instance.textures)
-                if picked:
-                    param, texture_path = picked
-                    print(f"  材质 {material}\n    参数 {param} -> {texture_path}")
-                    break
-                material = instance.parent
-            if texture_path:
-                texture = store.texture(texture_path)
-                if texture is not None:
-                    base_color = decode_texture(texture)
-                    print(f"  贴图 {texture.width}x{texture.height} {texture.pixel_format}")
-            elif not args.no_texture:
+            param, base_color = _material_texture(store, material)
+            if param:
+                print(f"  材质 {material}\n    参数 {param}")
+            else:
                 print("  [warn] 未解析到基础色贴图，使用纯色着色")
 
         exposure = 1.0
         if base_color is not None:
             import numpy as np
             mean = float(base_color[:, :, :3].astype("f4").mean() / 255.0)
-            exposure = float(np.clip(0.45 / max(mean ** 2.2, 1e-4), 1.0, 8.0))
-            print(f"  平均色 {mean:.3f}，预览曝光 ×{exposure:.1f}")
+            exposure = float(np.clip(0.30 / max(mean ** 2.2, 1e-4), 1.0, 6.0))
+            print(f"  贴图 {base_color.shape[1]}x{base_color.shape[0]}，平均色 {mean:.3f}，"
+                  f"预览曝光 ×{exposure:.1f}")
 
         render_static_mesh(mesh, args.out, args.size, base_color, exposure=exposure)
         print(f"已渲染 {args.asset} -> {args.out} "
               f"({len(mesh.positions)} 顶点 / {len(mesh.indices) // 3} 三角形"
               f"{'，带贴图' if base_color is not None else ''})")
+        return 0
+    finally:
+        for pak in paks:
+            pak.close()
+
+
+def _placement_matrix(location, rotation, scale):
+    import numpy as np
+
+    pitch, yaw, roll = (float(v) for v in rotation)
+    sr, cr = np.sin(np.radians(pitch)), np.cos(np.radians(pitch))
+    sy, cy = np.sin(np.radians(yaw)), np.cos(np.radians(yaw))
+    sp, cp = np.sin(np.radians(roll)), np.cos(np.radians(roll))
+    matrix = np.eye(4, dtype=np.float32)
+    matrix[:3, :3] = np.array([
+        [cy * cr, cy * sr * sp - sy * cp, cy * sr * cp + sy * sp],
+        [sy * cr, sy * sr * sp + cy * cp, sy * sr * cp - cy * sp],
+        [-sr, cr * sp, cr * cp]], dtype=np.float32) * np.array(scale, dtype=np.float32)
+    matrix[:3, 3] = np.array(location, dtype=np.float32)
+    return matrix
+
+
+def cmd_scene(args) -> int:
+    paks = _open_all(args)
+    try:
+        import numpy as np
+
+        from .ue4.content import ContentStore
+        from .ue4.level import parse_level
+        from .ue4.staticmesh import parse_static_mesh
+        from .render import SceneItem, render_scene
+
+        store = ContentStore(paks)
+        package = store.package(args.map)
+        if package is None:
+            raise SystemExit(f"未找到地图: {args.map}")
+        placed = parse_level(package)
+        print(f"关卡 {args.map}：静态网格 actor {len(placed)} 个")
+
+        mesh_cache: dict[str, object] = {}
+        material_cache: dict[str, object] = {}
+        items = []
+        skipped = 0
+        for index, entry in enumerate(placed):
+            if args.limit and len(items) >= args.limit:
+                break
+            if entry.mesh not in mesh_cache:
+                mesh_package = store.package(entry.mesh)
+                if mesh_package is None:
+                    mesh_cache[entry.mesh] = None
+                else:
+                    export = mesh_package.find_export("StaticMesh")
+                    try:
+                        mesh_cache[entry.mesh] = (parse_static_mesh(
+                            mesh_package.export_bytes(export), mesh_package)
+                            if export else None)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"  [warn] 网格解析失败 {entry.mesh}: {exc}")
+                        mesh_cache[entry.mesh] = None
+            mesh = mesh_cache[entry.mesh]
+            if mesh is None:
+                skipped += 1
+                continue
+
+            texture = None
+            if not args.no_texture:
+                material = (entry.materials[0] if entry.materials and entry.materials[0]
+                            else (mesh.material_slots[0] if mesh.material_slots else None))
+                if material and material not in material_cache:
+                    material_cache[material] = _material_texture(store, material)[1]
+                texture = material_cache.get(material) if material else None
+
+            items.append(SceneItem(mesh.positions, mesh.indices, mesh.uvs, texture,
+                                   _placement_matrix(entry.location, entry.rotation, entry.scale)))
+            if (index + 1) % 20 == 0:
+                print(f"  ... 已装载 {index + 1}/{len(placed)}")
+
+        if not items:
+            raise SystemExit("没有可渲染的静态网格")
+
+        exposure = 1.0
+        if not args.no_texture:
+            means = [item.texture[:, :, :3].astype("f4").mean() / 255.0
+                     for item in items if item.texture is not None]
+            if means:
+                mean = float(np.mean(means))
+                exposure = float(np.clip(0.30 / max(mean ** 2.2, 1e-4), 1.0, 6.0))
+                print(f"  {len(means)} 张贴图，平均色 {mean:.3f}，预览曝光 ×{exposure:.1f}")
+
+        eye = target = None
+        if args.camera:
+            values = [float(v) for v in args.camera.split(",")]
+            if len(values) != 6:
+                raise SystemExit("--camera 需要 6 个数字: ex,ey,ez,tx,ty,tz")
+            eye = np.array(values[:3], dtype=np.float32)
+            target = np.array(values[3:], dtype=np.float32)
+
+        render_scene(items, args.out, args.size, eye, target, exposure, args.fov)
+        print(f"已渲染 {len(items)} 个网格 -> {args.out}（跳过 {skipped} 个）")
         return 0
     finally:
         for pak in paks:
@@ -291,6 +395,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_preview.add_argument("--material", help="指定材质路径（默认取第一个材质槽）")
     p_preview.add_argument("--no-texture", action="store_true", help="只渲染纯色")
     p_preview.set_defaults(func=cmd_preview)
+
+    p_scene = sub.add_parser("scene", help="渲染关卡中的静态网格组合画面")
+    p_scene.add_argument("--map", required=True, help="地图资源路径（不含扩展名）")
+    p_scene.add_argument("--out", required=True, help="输出 PNG 路径")
+    p_scene.add_argument("--size", type=int, default=1024)
+    p_scene.add_argument("--fov", type=float, default=45.0)
+    p_scene.add_argument("--camera", help="ex,ey,ez,tx,ty,tz")
+    p_scene.add_argument("--limit", type=int, default=0, help="最多装载多少个网格")
+    p_scene.add_argument("--no-texture", action="store_true", help="只渲染纯色")
+    p_scene.set_defaults(func=cmd_scene)
 
     return parser
 

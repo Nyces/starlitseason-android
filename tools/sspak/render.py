@@ -2,9 +2,54 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from .ue4.staticmesh import StaticMesh
+
+VERTEX_SHADER = """
+    #version 330
+    uniform mat4 mvp;
+    uniform mat4 model;
+    in vec3 in_pos;
+    in vec3 in_nrm;
+    in vec2 in_uv;
+    out vec3 v_nrm;
+    out vec3 v_pos;
+    out vec2 v_uv;
+    void main() {
+        v_nrm = mat3(model) * in_nrm;
+        v_pos = (model * vec4(in_pos, 1.0)).xyz;
+        v_uv = in_uv;
+        gl_Position = mvp * vec4(in_pos, 1.0);
+    }
+"""
+
+FRAGMENT_SHADER = """
+    #version 330
+    uniform sampler2D base_tex;
+    uniform bool has_tex;
+    uniform vec3 tint;
+    uniform float exposure;
+    in vec3 v_nrm;
+    in vec3 v_pos;
+    in vec2 v_uv;
+    out vec4 color;
+    vec3 to_linear(vec3 c) { return pow(c, vec3(2.2)); }
+    vec3 to_srgb(vec3 c) { return pow(c, vec3(1.0 / 2.2)); }
+    void main() {
+        vec3 n = normalize(v_nrm);
+        vec3 L1 = normalize(vec3(0.45, -0.7, 0.55));
+        vec3 L2 = normalize(vec3(-0.6, 0.3, 0.2));
+        float d1 = max(dot(n, L1), 0.0);
+        float d2 = max(dot(n, L2), 0.0);
+        vec3 tint_lin = to_linear(tint);
+        vec3 base = has_tex ? to_linear(texture(base_tex, v_uv).rgb) * tint_lin : tint_lin;
+        vec3 c = base * (0.62 + 1.25 * d1 + 0.35 * d2) * exposure;
+        color = vec4(to_srgb(clamp(c, 0.0, 1.0)), 1.0);
+    }
+"""
 
 
 def _perspective(fov_deg: float, aspect: float, near: float, far: float) -> np.ndarray:
@@ -45,24 +90,47 @@ def _smooth_normals(positions: np.ndarray, indices: np.ndarray) -> np.ndarray:
     return (normals / length).astype(np.float32)
 
 
-def render_static_mesh(mesh: StaticMesh, out_path: str, size: int = 1024,
-                       base_color: np.ndarray | None = None,
-                       tint: tuple[float, float, float] = (0.78, 0.76, 0.72),
-                       exposure: float = 1.0) -> None:
+@dataclass
+class SceneItem:
+    positions: np.ndarray
+    indices: np.ndarray
+    uvs: np.ndarray | None = None
+    texture: np.ndarray | None = None
+    model: np.ndarray | None = None
+
+
+def _upload_texture(ctx, array: np.ndarray):
+    import moderngl
+
+    height, width = array.shape[:2]
+    rgba = np.ascontiguousarray(array[:, :, :4] if array.shape[2] == 4
+                                else np.dstack([array, np.ones(array.shape[:2], np.uint8)]))
+    texture = ctx.texture((width, height), 4, rgba.astype("u1").tobytes())
+    if max(width, height) >= 256:
+        texture.build_mipmaps()
+        texture.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+    else:
+        texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+    return texture
+
+
+def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
+                 eye: np.ndarray | None = None, target: np.ndarray | None = None,
+                 exposure: float = 1.0, fov: float = 45.0,
+                 tint: tuple[float, float, float] = (0.78, 0.76, 0.72)) -> None:
     import moderngl
     from PIL import Image
 
-    positions = mesh.positions
-    indices = mesh.indices
-    normals = _smooth_normals(positions, indices)
-    uv_array = mesh.uvs if mesh.uvs is not None else np.zeros((len(positions), 2), np.float32)
-    use_texture = base_color is not None
-    if base_color is not None:
-        tint = (1.0, 1.0, 1.0)
-
-    center = (positions.min(axis=0) + positions.max(axis=0)) * 0.5
-    radius = float(np.linalg.norm(positions.max(axis=0) - positions.min(axis=0)) * 0.5) or 1.0
-    eye = center + np.array([radius * 2.2, -radius * 1.6, radius * 1.2], dtype=np.float32)
+    lo = np.min([item.positions.min(axis=0) for item in items], axis=0)
+    hi = np.max([item.positions.max(axis=0) for item in items], axis=0)
+    center = (lo + hi) * 0.5
+    radius = float(np.linalg.norm(hi - lo) * 0.5) or 1.0
+    if eye is None:
+        eye = center + np.array([0.0, radius * 1.35, radius * 0.18], dtype=np.float32)
+    if target is None:
+        target = center
+    eye = np.asarray(eye, dtype=np.float32)
+    target = np.asarray(target, dtype=np.float32)
 
     ctx = moderngl.create_standalone_context(require=330)
     fbo = ctx.simple_framebuffer((size, size))
@@ -70,75 +138,49 @@ def render_static_mesh(mesh: StaticMesh, out_path: str, size: int = 1024,
     ctx.clear(0.05, 0.06, 0.08, 1.0)
     ctx.enable(moderngl.DEPTH_TEST)
 
-    program = ctx.program(
-        vertex_shader="""
-            #version 330
-            uniform mat4 mvp;
-            in vec3 in_pos;
-            in vec3 in_nrm;
-            in vec2 in_uv;
-            out vec3 v_nrm;
-            out vec3 v_pos;
-            out vec2 v_uv;
-            void main() {
-                v_nrm = in_nrm;
-                v_pos = in_pos;
-                v_uv = in_uv;
-                gl_Position = mvp * vec4(in_pos, 1.0);
-            }
-        """,
-        fragment_shader="""
-            #version 330
-            uniform sampler2D base_tex;
-            uniform bool has_tex;
-            uniform vec3 tint;
-            uniform float exposure;
-            in vec3 v_nrm;
-            in vec3 v_pos;
-            in vec2 v_uv;
-            out vec4 color;
-            vec3 to_linear(vec3 c) { return pow(c, vec3(2.2)); }
-            vec3 to_srgb(vec3 c) { return pow(c, vec3(1.0 / 2.2)); }
-            void main() {
-                vec3 n = normalize(v_nrm);
-                vec3 L1 = normalize(vec3(0.45, -0.7, 0.55));
-                vec3 L2 = normalize(vec3(-0.6, 0.3, 0.2));
-                float d1 = max(dot(n, L1), 0.0);
-                float d2 = max(dot(n, L2), 0.0);
-                vec3 tint_lin = to_linear(tint);
-                vec3 base = has_tex ? to_linear(texture(base_tex, v_uv).rgb) * tint_lin : tint_lin;
-                vec3 c = base * (0.55 + 1.65 * d1 + 0.45 * d2) * exposure;
-                color = vec4(to_srgb(clamp(c, 0.0, 1.0)), 1.0);
-            }
-        """,
-    )
-
-    vbo = ctx.buffer(np.hstack([positions, normals, uv_array]).astype(np.float32).tobytes())
-    ibo = ctx.buffer(indices.astype(np.uint16).tobytes() if len(positions) < 65535
-                     else indices.astype(np.uint32).tobytes())
-    element_size = 2 if len(positions) < 65535 else 4
-    vao = ctx.vertex_array(
-        program, [(vbo, "3f 3f 2f", "in_pos", "in_nrm", "in_uv")], ibo,
-        index_element_size=element_size)
-
-    program["has_tex"].value = use_texture
+    program = ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER)
+    view_proj = _perspective(fov, 1.0, max(radius * 0.002, 0.05), radius * 30 + 100) @ _look_at(
+        eye, target, np.array([0.0, 0.0, 1.0], dtype=np.float32))
     program["tint"].value = tint
     program["exposure"].value = float(exposure)
-    if base_color is not None:
-        height, width = base_color.shape[:2]
-        rgba = np.ascontiguousarray(base_color[:, :, :4] if base_color.shape[2] == 4
-                                    else np.dstack([base_color, np.ones(base_color.shape[:2], np.uint8)]))
-        texture = ctx.texture((width, height), 4, rgba.astype("u1").tobytes())
-        texture.build_mipmaps()
-        texture.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
-        texture.use(0)
-        program["base_tex"].value = 0
 
-    mvp = _perspective(45.0, 1.0, 0.05, radius * 20 + 10) @ _look_at(
-        eye, center, np.array([0.0, 0.0, 1.0], dtype=np.float32))
-    program["mvp"].write(np.ascontiguousarray(mvp.T).astype(np.float32).tobytes())
+    for item in items:
+        positions = item.positions
+        normals = _smooth_normals(positions, item.indices)
+        uv_array = item.uvs if item.uvs is not None else np.zeros((len(positions), 2), np.float32)
+        model = item.model if item.model is not None else np.eye(4, dtype=np.float32)
 
-    vao.render()
+        vbo = ctx.buffer(np.hstack([positions, normals, uv_array]).astype(np.float32).tobytes())
+        ibo = ctx.buffer(item.indices.astype(np.uint16).tobytes() if len(positions) < 65535
+                         else item.indices.astype(np.uint32).tobytes())
+        vao = ctx.vertex_array(
+            program, [(vbo, "3f 3f 2f", "in_pos", "in_nrm", "in_uv")], ibo,
+            index_element_size=2 if len(positions) < 65535 else 4)
+        mvp = view_proj @ model
+        program["mvp"].write(np.ascontiguousarray(mvp.T).astype(np.float32).tobytes())
+        program["model"].write(np.ascontiguousarray(model.T).astype(np.float32).tobytes())
+        if item.texture is not None:
+            texture = _upload_texture(ctx, item.texture)
+            texture.use(0)
+            program["base_tex"].value = 0
+            program["has_tex"].value = True
+        else:
+            program["has_tex"].value = False
+        vao.render()
+
     pixels = fbo.read(components=3)
     image = Image.frombytes("RGB", fbo.size, pixels).transpose(Image.FLIP_TOP_BOTTOM)
     image.save(out_path)
+
+
+def render_static_mesh(mesh: StaticMesh, out_path: str, size: int = 1024,
+                       base_color: np.ndarray | None = None,
+                       tint: tuple[float, float, float] = (0.78, 0.76, 0.72),
+                       exposure: float = 1.0) -> None:
+    positions = mesh.positions
+    center = (positions.min(axis=0) + positions.max(axis=0)) * 0.5
+    radius = float(np.linalg.norm(positions.max(axis=0) - positions.min(axis=0)) * 0.5) or 1.0
+    eye = center + np.array([radius * 2.2, -radius * 1.6, radius * 1.2], dtype=np.float32)
+    item = SceneItem(positions, mesh.indices, mesh.uvs, base_color)
+    render_scene([item], out_path, size, eye, center, exposure,
+                 tint=(1.0, 1.0, 1.0) if base_color is not None else tint)
