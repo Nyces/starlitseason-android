@@ -515,6 +515,50 @@ def _skeletal_items(store, asset: str, no_texture: bool, flip: str = ""):
     return items, mesh
 
 
+def _character_items(store, chr_id: str, no_texture: bool, flip: str = "", verbose: bool = True):
+    """加载身体/脸/头发/饰品（绑定姿势），返回 (items, 包围盒中心, 半径)。"""
+    import numpy as np
+
+    candidates = [
+        f"Model/Character/Body/Priv/chr_body_priv001_{chr_id}/Mesh/SK_chr_body_priv001_{chr_id}_a",
+        f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_face",
+        f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_hair",
+        f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_orna",
+    ]
+    items = []
+    positions = []
+    head_center = None
+    for asset in candidates:
+        mesh_items, mesh = _skeletal_items(store, asset, no_texture, flip)
+        if not mesh_items:
+            continue
+        if verbose:
+            print(f"  {asset.rsplit('/', 1)[-1]}: {len(mesh.positions)} 顶点 / "
+                  f"{len(mesh.sections)} 分段 / {len(mesh.bones)} 骨骼")
+        lo, hi = mesh.positions.min(axis=0), mesh.positions.max(axis=0)
+        center = (lo + hi) * 0.5
+        shift = np.zeros(3, dtype=np.float32)
+        if asset.endswith("_face"):
+            head_center = center
+        elif head_center is not None and asset.endswith(("_hair", "_orna")):
+            # 头发/饰品顶点不在角色坐标系里，按头部位置整体平移
+            shift = head_center - center
+            for item in mesh_items:
+                model = np.eye(4, dtype=np.float32)
+                model[:3, 3] = shift
+                item.model = model
+        items.extend(mesh_items)
+        positions.append(mesh.positions + shift)
+    if not items:
+        return [], None, 0.0
+
+    all_positions = np.vstack(positions)
+    lo, hi = all_positions.min(axis=0), all_positions.max(axis=0)
+    center = (lo + hi) * 0.5
+    radius = float(np.linalg.norm(hi - lo) * 0.5) or 1.0
+    return items, center, radius
+
+
 def cmd_character(args) -> int:
     """把一个角色的身体/脸/头发（绑定姿势）拼在一起渲染。"""
     paks = _open_all(args)
@@ -526,43 +570,9 @@ def cmd_character(args) -> int:
 
         store = ContentStore(paks)
         chr_id = args.chr
-        candidates = [
-            f"Model/Character/Body/Priv/chr_body_priv001_{chr_id}/Mesh/SK_chr_body_priv001_{chr_id}_a",
-            f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_face",
-            f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_hair",
-            f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_orna",
-        ]
-        items = []
-        positions = []
-        head_center = None
-        for asset in candidates:
-            mesh_items, mesh = _skeletal_items(store, asset, args.no_texture, args.flip_uv)
-            if not mesh_items:
-                print(f"  [skip] {asset}")
-                continue
-            print(f"  {asset.rsplit('/', 1)[-1]}: {len(mesh.positions)} 顶点 / "
-                  f"{len(mesh.sections)} 分段 / {len(mesh.bones)} 骨骼")
-            lo, hi = mesh.positions.min(axis=0), mesh.positions.max(axis=0)
-            center = (lo + hi) * 0.5
-            shift = np.zeros(3, dtype=np.float32)
-            if asset.endswith("_face"):
-                head_center = center
-            elif head_center is not None and asset.endswith(("_hair", "_orna")):
-                # 头发/饰品顶点不在角色坐标系里，按头部位置整体平移
-                shift = head_center - center
-                for item in mesh_items:
-                    model = np.eye(4, dtype=np.float32)
-                    model[:3, 3] = shift
-                    item.model = model
-            items.extend(mesh_items)
-            positions.append(mesh.positions + shift)
+        items, center, radius = _character_items(store, chr_id, args.no_texture, args.flip_uv)
         if not items:
             raise SystemExit("没有可渲染的骨骼网格")
-
-        all_positions = np.vstack(positions)
-        lo, hi = all_positions.min(axis=0), all_positions.max(axis=0)
-        center = (lo + hi) * 0.5
-        radius = float(np.linalg.norm(hi - lo) * 0.5) or 1.0
 
         if args.camera:
             values = [float(v) for v in args.camera.split(",")]
@@ -670,6 +680,16 @@ def cmd_scene(args) -> int:
         if not items:
             raise SystemExit("没有可渲染的静态网格")
 
+        character_center = None
+        character_radius = 0.0
+        if args.character:
+            char_items, character_center, character_radius = _character_items(
+                store, args.character, args.no_texture, args.flip_uv, verbose=False)
+            if not char_items:
+                raise SystemExit(f"没有可渲染的角色: {args.character}")
+            items.extend(char_items)
+            print(f"  角色 {args.character}：{len(char_items)} 个分段")
+
         eye = target = None
         if args.camera:
             values = [float(v) for v in args.camera.split(",")]
@@ -678,8 +698,13 @@ def cmd_scene(args) -> int:
             eye = np.array(values[:3], dtype=np.float32)
             target = np.array(values[3:], dtype=np.float32)
 
+        shadow_kwargs = {}
+        if character_center is not None:
+            # 阴影图聚焦到角色附近，避免被整个舞台摊薄
+            shadow_kwargs = {"shadow_center": character_center,
+                             "shadow_radius": max(character_radius * 1.6, 120.0)}
         render_scene(items, args.out, args.size, eye, target, args.exposure, args.fov,
-                     light=_vec3(args.light, (0.35, 0.45, 0.75)))
+                     light=_vec3(args.light, (0.35, 0.45, 0.75)), **shadow_kwargs)
         print(f"已渲染 {len(items)} 个网格 -> {args.out}（跳过 {skipped} 个）")
         return 0
     finally:
@@ -836,6 +861,9 @@ def build_parser() -> argparse.ArgumentParser:
                          help="固定曝光（关卡 PostProcess 为 1.0）")
     p_scene.add_argument("--light", help="光照方向 x,y,z（指向光源）")
     p_scene.add_argument("--limit", type=int, default=0, help="最多装载多少个网格")
+    p_scene.add_argument("--character", help="把角色（绑定姿势）放进场景，例如 chr0101")
+    p_scene.add_argument("--flip-uv", default="", choices=["", "none", "u", "v", "uv"],
+                         help="翻转 UV 轴，用于排查贴图方向")
     p_scene.add_argument("--no-texture", action="store_true", help="只渲染纯色")
     p_scene.set_defaults(func=cmd_scene)
 
