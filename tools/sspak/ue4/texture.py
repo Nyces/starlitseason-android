@@ -98,11 +98,15 @@ def parse_texture(package: Package, ubulk: bytes) -> Texture2D:
     if len(ubulk) >= need:
         return Texture2D(width, height, pixel_format, ubulk[:need])
 
-    # 像素内联在导出数据末尾：按 mip 链总长度回推 mip0 起点
+    # 像素内联在导出数据里：mip 表（每项 16 字节）紧跟平台数据头，mip0 在表后
     header_end = length_pos + 4 + struct.unpack_from("<i", data, length_pos)[0]
     mips = struct.unpack_from("<ii", data, header_end)[1] if header_end + 8 <= len(data) else 1
-    total = sum(mip_chain_sizes(pixel_format, width, height, max(mips, 1)))
-    start = len(data) - total
+    mips = max(mips, 1)
+    start = header_end + mips * 16
+    if start + need > len(data):
+        # 兜底：按 mip 链总长度从末尾回推
+        total = sum(mip_chain_sizes(pixel_format, width, height, mips))
+        start = len(data) - total
     if start < 0 or start + need > len(data):
         raise TextureError(f"ubulk 不足且内联数据缺失：需要 {need}，实际 {len(ubulk)}")
     return Texture2D(width, height, pixel_format, data[start:start + need])
