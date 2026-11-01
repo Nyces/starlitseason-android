@@ -217,6 +217,58 @@ def _material_texture(store, material: str | None):
     return None, None
 
 
+def _toon_params(store, material: str | None):
+    """按 Toon 规则解析材质：返回 (底色贴图, 阴影色, 明暗阈值)。
+
+    阴影色来自材质的 CelShadowTable / ToonShadowTable（2×256 的两色斜坡，
+    暗端是粉/米色，亮端是白）；头发用 0.94 的阶跃阈值，其余 0.47。
+    皮肤等材质没有基础色贴图，就用色表暗端作为底色。
+    """
+    import numpy as np
+
+    from .ue4.material import parse_material_instance, pick_base_color
+    from .ue4.texture import decode_texture
+
+    shadow = (1.0, 1.0, 1.0)
+    threshold = 0.47
+    current = material
+    for _ in range(6):
+        if not current:
+            break
+        package = store.package(current)
+        if package is None:
+            break
+        try:
+            instance = parse_material_instance(package)
+        except Exception:  # noqa: BLE001 - 父级是基础材质
+            break
+        if "hair" in (instance.parent or "").lower():
+            threshold = 0.94
+        table = instance.textures.get("CelShadowTable") or instance.textures.get("ToonShadowTable")
+        if table:
+            tex = store.texture(table)
+            if tex is not None:
+                img = decode_texture(tex)
+                rows = img.shape[0]
+                dark = img[max(0, int(rows * 0.02)):max(1, int(rows * 0.22)), :, :3]
+                shadow = tuple(float(v) / 255.0 for v in dark.reshape(-1, 3).mean(axis=0))
+        if "toonbasebody" in (instance.parent or "").lower():
+            # 皮肤：BaseTexture 是遮罩（8×8 色块），底色取自色表暗端的米色
+            break
+        picked = pick_base_color(instance.textures)
+        if picked:
+            tex = store.texture(picked[1])
+            if tex is not None:
+                return decode_texture(tex), shadow, threshold
+        current = instance.parent
+
+    if shadow != (1.0, 1.0, 1.0):
+        pixel = np.array([[[int(shadow[0] * 255), int(shadow[1] * 255),
+                            int(shadow[2] * 255), 255]]], dtype=np.uint8)
+        return pixel, shadow, threshold
+    return None, shadow, threshold
+
+
 def cmd_preview(args) -> int:
     paks = _open_all(args)
     try:
@@ -240,10 +292,12 @@ def cmd_preview(args) -> int:
             mesh = parse_static_mesh(package.export_bytes(export), package)
             positions = mesh.positions
             material = args.material or (mesh.material_slots[0] if mesh.material_slots else None)
-            param, texture = (None, None) if args.no_texture else _material_texture(store, material)
-            if param:
-                print(f"  材质 {material}\n    参数 {param}")
-            items.append(SceneItem(mesh.positions, mesh.indices, mesh.uvs, texture))
+            texture, shadow, threshold = (None, (1.0, 1.0, 1.0), 0.47) if args.no_texture \
+                else _toon_params(store, material)
+            if texture is not None and shadow != (1.0, 1.0, 1.0):
+                print(f"  材质 {material}\n    阴影色 {tuple(round(v, 2) for v in shadow)} 阈值 {threshold}")
+            items.append(SceneItem(mesh.positions, mesh.indices, mesh.uvs, texture,
+                                   shadow_tint=shadow, threshold=threshold))
             label = f"{len(mesh.positions)} 顶点 / {len(mesh.indices) // 3} 三角形"
         else:
             skeletal = parse_skeletal_mesh(package)
@@ -267,7 +321,7 @@ def cmd_preview(args) -> int:
                  for item in items if item.texture is not None]
         if means:
             mean = float(np.mean(means))
-            exposure = float(np.clip(0.30 / max(mean ** 2.2, 1e-4), 1.0, 6.0))
+            exposure = float(np.clip(0.30 / max(mean ** 2.2, 1e-4), 1.0, 2.0))
             print(f"  {len(means)} 张贴图，平均色 {mean:.3f}，预览曝光 ×{exposure:.1f}")
         if not means and not args.no_texture:
             print("  [warn] 未解析到基础色贴图，使用纯色着色")
@@ -323,8 +377,12 @@ def _skeletal_items(store, asset: str, no_texture: bool, flip: str = ""):
             if section.material_index < len(mesh.material_slots) else None
         if slot and "outline" in slot.lower():
             continue                      # 描边是反向球壳，正视渲染时跳过
-        texture = None if no_texture else _material_texture(store, slot)[1]
-        items.append(SceneItem(mesh.positions, indices, _flip_uv(mesh.uvs, flip), texture))
+        texture = None
+        shadow, threshold = (1.0, 1.0, 1.0), 0.47
+        if not no_texture:
+            texture, shadow, threshold = _toon_params(store, slot)
+        items.append(SceneItem(mesh.positions, indices, _flip_uv(mesh.uvs, flip), texture,
+                               shadow_tint=shadow, threshold=threshold))
     return items, mesh
 
 
@@ -382,7 +440,7 @@ def cmd_character(args) -> int:
                  for item in items if item.texture is not None]
         if means:
             mean = float(np.mean(means))
-            exposure = float(np.clip(0.30 / max(mean ** 2.2, 1e-4), 1.0, 6.0))
+            exposure = float(np.clip(0.30 / max(mean ** 2.2, 1e-4), 1.0, 2.0))
             print(f"  {len(means)} 张贴图，平均色 {mean:.3f}，预览曝光 ×{exposure:.1f}")
 
         if args.camera:
@@ -480,7 +538,7 @@ def cmd_scene(args) -> int:
                      for item in items if item.texture is not None]
             if means:
                 mean = float(np.mean(means))
-                exposure = float(np.clip(0.30 / max(mean ** 2.2, 1e-4), 1.0, 6.0))
+                exposure = float(np.clip(0.30 / max(mean ** 2.2, 1e-4), 1.0, 2.0))
                 print(f"  {len(means)} 张贴图，平均色 {mean:.3f}，预览曝光 ×{exposure:.1f}")
 
         eye = target = None

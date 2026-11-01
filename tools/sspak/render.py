@@ -32,6 +32,8 @@ FRAGMENT_SHADER = """
     uniform bool has_tex;
     uniform vec3 tint;
     uniform float exposure;
+    uniform vec3 shadow_tint;
+    uniform float shadow_threshold;
     in vec3 v_nrm;
     in vec3 v_pos;
     in vec2 v_uv;
@@ -40,13 +42,14 @@ FRAGMENT_SHADER = """
     vec3 to_srgb(vec3 c) { return pow(c, vec3(1.0 / 2.2)); }
     void main() {
         vec3 n = normalize(v_nrm);
-        vec3 L1 = normalize(vec3(0.45, -0.7, 0.55));
-        vec3 L2 = normalize(vec3(-0.6, 0.3, 0.2));
-        float d1 = max(dot(n, L1), 0.0);
-        float d2 = max(dot(n, L2), 0.0);
-        vec3 tint_lin = to_linear(tint);
-        vec3 base = has_tex ? to_linear(texture(base_tex, v_uv).rgb) * tint_lin : tint_lin;
-        vec3 c = base * (0.62 + 1.25 * d1 + 0.35 * d2) * exposure;
+        vec3 L = normalize(vec3(0.35, -0.55, 0.75));
+        // 卡通明暗：N·L 归一化后按阈值硬阶跃（布料/身体 0.47，头发 0.94）
+        float shade = clamp(dot(n, L) * 0.5 + 0.5, 0.0, 1.0);
+        float lit = step(shadow_threshold, shade);
+        // 阴影区用色表的粉/米色替换，受光区为白色
+        vec3 tone = mix(shadow_tint, vec3(1.0), lit);
+        vec3 base = has_tex ? to_linear(texture(base_tex, v_uv).rgb) : to_linear(tint);
+        vec3 c = base * to_linear(tone) * exposure;
         color = vec4(to_srgb(clamp(c, 0.0, 1.0)), 1.0);
     }
 """
@@ -97,6 +100,8 @@ class SceneItem:
     uvs: np.ndarray | None = None
     texture: np.ndarray | None = None
     model: np.ndarray | None = None
+    shadow_tint: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    threshold: float = 0.47
 
 
 def _upload_texture(ctx, array: np.ndarray):
@@ -159,6 +164,8 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
         mvp = view_proj @ model
         program["mvp"].write(np.ascontiguousarray(mvp.T).astype(np.float32).tobytes())
         program["model"].write(np.ascontiguousarray(model.T).astype(np.float32).tobytes())
+        program["shadow_tint"].value = tuple(item.shadow_tint)
+        program["shadow_threshold"].value = float(item.threshold)
         if item.texture is not None:
             texture = _upload_texture(ctx, item.texture)
             texture.use(0)
