@@ -67,8 +67,8 @@ def pick_base_color(textures: dict[str, str]) -> tuple[str, str] | None:
         return None
     strong = ("basetexture", "basecolor", "base_color", "albedo", "diffuse", "colortex")
     weak = ("color", "tex", "txt")
-    negative = ("mask", "lut", "sdw", "shadow", "nml", "normal", "nrm", "spec",
-                "rough", "metal", "opacity", "ref", "outline", "sss")
+    negative = ("mask", "lut", "sdw", "shadow", "nml", "normal", "nrm", "spc",
+                "spec", "emi", "rough", "metal", "opacity", "ref", "outline", "sss")
 
     def score(name: str) -> int:
         low = name.lower()

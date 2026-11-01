@@ -33,8 +33,8 @@ class ContentStore:
         elif asset.startswith("Game/"):
             asset = asset[len("Game/"):]
         parts = asset.split("/")
-        # 对象路径 /A/B/B 与包路径 /A/B 等价
-        if len(parts) >= 2 and parts[-1] == parts[-2]:
+        # 对象路径 /A/B/B 与包路径 /A/B 等价（对象名大小写常与包名不同）
+        if len(parts) >= 2 and parts[-1].lower() == parts[-2].lower():
             parts = parts[:-1]
         return "/".join(parts)
 

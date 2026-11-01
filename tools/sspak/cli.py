@@ -6,6 +6,7 @@ import argparse
 import collections
 import os
 import sys
+from dataclasses import dataclass
 
 from .pak import PakFile, PakError, COMPRESSION_ZLIB, COMPRESSION_NONE
 from .uasset import UASSET_MAGIC, UAssetError, parse_summary
@@ -217,22 +218,57 @@ def _material_texture(store, material: str | None):
     return None, None
 
 
+@dataclass
+class ToonMaterial:
+    """由材质实例反解出的渲染参数（默认值对应 MPC ToonShaderParameter 的真值）。"""
+
+    texture: object = None
+    shadow: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    threshold: float = 0.47
+    blend: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    add: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    rim_scale: float = 7.5
+    sphere: object = None
+    sphere_blend: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    sphere_pow: float = 1.0
+    sphere_boost: float = 1.0
+    shadow_map: object = None
+    emissive: object = None
+    emissive_boost: float = 1.0
+    outline: bool = False
+    outline_color: tuple[float, float, float] = (0.16, 0.10, 0.09)
+    outline_width: float = 0.0008
+
+    def item(self, positions, indices, uvs=None, model=None):
+        from .render import SceneItem
+
+        return SceneItem(positions, indices, uvs, self.texture, model,
+                         shadow_tint=self.shadow, threshold=self.threshold,
+                         blend=self.blend, add=self.add, sphere=self.sphere,
+                         sphere_blend=self.sphere_blend, sphere_pow=self.sphere_pow,
+                         sphere_boost=self.sphere_boost, rim_scale=self.rim_scale,
+                         shadow_map=self.shadow_map,
+                         emissive=self.emissive, emissive_boost=self.emissive_boost,
+                         outline=self.outline, outline_color=self.outline_color,
+                         outline_width=self.outline_width)
+
+
 def _toon_params(store, material: str | None):
-    """按 Toon 规则解析材质：返回 (底色贴图, 阴影色, 明暗阈值)。
+    """按 Toon 规则解析材质，返回 ToonMaterial。
 
     阴影色来自材质的 CelShadowTable / ToonShadowTable（2×256 的两色斜坡，
     暗端是粉/米色，亮端是白）；头发用 0.94 的阶跃阈值，其余 0.47。
     皮肤等材质没有基础色贴图，就用色表暗端作为底色。
+    SphereMap / RimScale / OutlineScale 等按材质实例里的真实值取。
     """
     import numpy as np
 
     from .ue4.material import parse_material_instance, pick_base_color
     from .ue4.texture import decode_texture
 
-    shadow = (1.0, 1.0, 1.0)
-    threshold = 0.47
-    blend = (1.0, 1.0, 1.0)
-    add = (0.0, 0.0, 0.0)
+    result = ToonMaterial()
+    is_outline = bool(material and "outline" in material.lower())
+    line_intensity = None
     current = material
     for _ in range(6):
         if not current:
@@ -245,11 +281,28 @@ def _toon_params(store, material: str | None):
         except Exception:  # noqa: BLE001 - 父级是基础材质
             break
         if "BlendColor" in instance.vectors:
-            blend = tuple(instance.vectors["BlendColor"][:3])
+            result.blend = tuple(instance.vectors["BlendColor"][:3])
         if "AddColor" in instance.vectors:
-            add = tuple(instance.vectors["AddColor"][:3])
+            result.add = tuple(instance.vectors["AddColor"][:3])
+        if "LineColorIntensity" in instance.vectors:
+            line_intensity = tuple(instance.vectors["LineColorIntensity"][:3])
+        if "RimScale" in instance.scalars:
+            result.rim_scale = float(instance.scalars["RimScale"])
+        if "SphereMapColorPow" in instance.scalars:
+            result.sphere_pow = float(instance.scalars["SphereMapColorPow"])
+        if "SphereMapBoost" in instance.scalars:
+            result.sphere_boost = float(instance.scalars["SphereMapBoost"])
+        if "EmissiveBoost" in instance.scalars:
+            result.emissive_boost = float(instance.scalars["EmissiveBoost"])
+        if "EmiParam" in instance.scalars:
+            result.emissive_boost = float(instance.scalars["EmiParam"])
+        if "OutlineScale" in instance.scalars or "DepthOffsetScale" in instance.scalars:
+            # 反汇编里描边宽度 ∝ OutlineScale × DepthOffsetScale × 视距
+            result.outline_width = max(float(instance.scalars.get("OutlineScale", 0.2))
+                                       * float(instance.scalars.get("DepthOffsetScale", 0.004)),
+                                       1e-5)
         if "hair" in (instance.parent or "").lower():
-            threshold = 0.94
+            result.threshold = 0.94
         table = instance.textures.get("CelShadowTable") or instance.textures.get("ToonShadowTable")
         if table:
             tex = store.texture(table)
@@ -257,22 +310,50 @@ def _toon_params(store, material: str | None):
                 img = decode_texture(tex)
                 rows = img.shape[0]
                 dark = img[max(0, int(rows * 0.02)):max(1, int(rows * 0.22)), :, :3]
-                shadow = tuple(float(v) / 255.0 for v in dark.reshape(-1, 3).mean(axis=0))
-        if "toonbasebody" in (instance.parent or "").lower():
-            # 皮肤：BaseTexture 是遮罩（8×8 色块），底色取自色表暗端的米色
-            break
+                result.shadow = tuple(float(v) / 255.0 for v in dark.reshape(-1, 3).mean(axis=0))
+        if result.sphere is None and instance.textures.get("SphereMap"):
+            tex = store.texture(instance.textures["SphereMap"])
+            if tex is not None:
+                result.sphere = decode_texture(tex)
+        if result.shadow_map is None:
+            shadow_path = instance.textures.get("ShadowTexture") or instance.textures.get("ShadowMap")
+            if shadow_path:
+                tex = store.texture(shadow_path)
+                if tex is not None:
+                    result.shadow_map = decode_texture(tex)
+        for name in ("EmissiveTexture", "EmissiveColorTexture", "Emissive",
+                     "emiTex", "EmiTex"):
+            if result.emissive is None and instance.textures.get(name):
+                tex = store.texture(instance.textures[name])
+                if tex is not None:
+                    result.emissive = decode_texture(tex)
+        skin = "toonbasebody" in (instance.parent or "").lower()
         picked = pick_base_color(instance.textures)
         if picked:
             tex = store.texture(picked[1])
             if tex is not None:
-                return decode_texture(tex), shadow, threshold, blend, add
+                image = decode_texture(tex)
+                if is_outline:
+                    mean = image[:, :, :3].astype("f4").mean(axis=(0, 1)) / 255.0
+                    scale = line_intensity or (0.22, 0.22, 0.22)
+                    result.outline = True
+                    result.outline_color = tuple(
+                        float(min(max(mean[i] * scale[i], 0.0), 1.0)) for i in range(3))
+                    return result
+                result.texture = image
+                if not skin:
+                    return result
+                break
         current = instance.parent
 
-    if shadow != (1.0, 1.0, 1.0):
-        pixel = np.array([[[int(shadow[0] * 255), int(shadow[1] * 255),
-                            int(shadow[2] * 255), 255]]], dtype=np.uint8)
-        return pixel, shadow, threshold, blend, add
-    return None, shadow, threshold, blend, add
+    if is_outline:
+        result.outline = True
+        return result
+    if result.shadow != (1.0, 1.0, 1.0):
+        pixel = np.array([[[int(result.shadow[0] * 255), int(result.shadow[1] * 255),
+                            int(result.shadow[2] * 255), 255]]], dtype=np.uint8)
+        result.texture = pixel
+    return result
 
 
 def cmd_preview(args) -> int:
@@ -283,7 +364,7 @@ def cmd_preview(args) -> int:
         from .ue4.content import ContentStore
         from .ue4.skeletalmesh import parse_skeletal_mesh
         from .ue4.staticmesh import parse_static_mesh
-        from .render import SceneItem, render_scene
+        from .render import render_scene
 
         store = ContentStore(paks)
         package = store.package(args.asset)
@@ -298,13 +379,11 @@ def cmd_preview(args) -> int:
             mesh = parse_static_mesh(package.export_bytes(export), package)
             positions = mesh.positions
             material = args.material or (mesh.material_slots[0] if mesh.material_slots else None)
-            texture, shadow, threshold, blend, add = (None, (1.0, 1.0, 1.0), 0.47,
-                                                       (1.0, 1.0, 1.0), (0.0, 0.0, 0.0)) \
-                if args.no_texture else _toon_params(store, material)
-            if texture is not None and shadow != (1.0, 1.0, 1.0):
-                print(f"  材质 {material}\n    阴影色 {tuple(round(v, 2) for v in shadow)} 阈值 {threshold}")
-            items.append(SceneItem(mesh.positions, mesh.indices, mesh.uvs, texture,
-                                   shadow_tint=shadow, threshold=threshold, blend=blend, add=add))
+            toon = ToonMaterial() if args.no_texture else _toon_params(store, material)
+            if toon.texture is not None and toon.shadow != (1.0, 1.0, 1.0):
+                print(f"  材质 {material}\n    阴影色 "
+                      f"{tuple(round(v, 2) for v in toon.shadow)} 阈值 {toon.threshold}")
+            items.append(toon.item(mesh.positions, mesh.indices, mesh.uvs))
             label = f"{len(mesh.positions)} 顶点 / {len(mesh.indices) // 3} 三角形"
         else:
             skeletal = parse_skeletal_mesh(package)
@@ -317,20 +396,14 @@ def cmd_preview(args) -> int:
                     continue
                 slot = skeletal.material_slots[section.material_index] \
                     if section.material_index < len(skeletal.material_slots) else None
-                texture = None if args.no_texture else _material_texture(store, slot)[1]
-                items.append(SceneItem(skeletal.positions, indices, skeletal.uvs, texture))
+                toon = ToonMaterial() if args.no_texture else _toon_params(store, slot)
+                toon.outline = toon.outline or bool(slot and "outline" in slot.lower())
+                items.append(toon.item(skeletal.positions, indices, skeletal.uvs))
                 print(f"  分段 材质槽 {section.material_index} -> {slot}")
             label = (f"{len(skeletal.positions)} 顶点 / {len(skeletal.indices) // 3} 三角形 / "
                      f"{len(skeletal.bones)} 骨骼 / {len(skeletal.sections)} 分段")
 
-        exposure = 1.0
-        means = [item.texture[:, :, :3].astype("f4").mean() / 255.0
-                 for item in items if item.texture is not None]
-        if means:
-            mean = float(np.mean(means))
-            exposure = float(np.clip(0.30 / max(mean ** 2.2, 1e-4), 1.0, 2.0))
-            print(f"  {len(means)} 张贴图，平均色 {mean:.3f}，预览曝光 ×{exposure:.1f}")
-        if not means and not args.no_texture:
+        if not any(item.texture is not None for item in items) and not args.no_texture:
             print("  [warn] 未解析到基础色贴图，使用纯色着色")
 
         center = (positions.min(axis=0) + positions.max(axis=0)) * 0.5
@@ -344,7 +417,7 @@ def cmd_preview(args) -> int:
             target = center
             eye = center + np.array([radius * 1.9, -radius * 2.4, radius * 0.35], dtype=np.float32)
 
-        render_scene(items, args.out, args.size, eye, target, exposure, args.fov)
+        render_scene(items, args.out, args.size, eye, target, args.exposure, args.fov)
         print(f"已渲染 {args.asset} -> {args.out}（{label}）")
         return 0
     finally:
@@ -382,14 +455,10 @@ def _skeletal_items(store, asset: str, no_texture: bool, flip: str = ""):
             continue
         slot = mesh.material_slots[section.material_index] \
             if section.material_index < len(mesh.material_slots) else None
+        toon = ToonMaterial() if no_texture else _toon_params(store, slot)
         if slot and "outline" in slot.lower():
-            continue                      # 描边是反向球壳，正视渲染时跳过
-        texture = None
-        shadow, threshold, blend, add = (1.0, 1.0, 1.0), 0.47, (1.0, 1.0, 1.0), (0.0, 0.0, 0.0)
-        if not no_texture:
-            texture, shadow, threshold, blend, add = _toon_params(store, slot)
-        items.append(SceneItem(mesh.positions, indices, _flip_uv(mesh.uvs, flip), texture,
-                               shadow_tint=shadow, threshold=threshold, blend=blend, add=add))
+            toon.outline = True               # 描边是网格里烘焙的反向壳，剔除正面再画
+        items.append(toon.item(mesh.positions, indices, _flip_uv(mesh.uvs, flip)))
     return items, mesh
 
 
@@ -442,14 +511,6 @@ def cmd_character(args) -> int:
         center = (lo + hi) * 0.5
         radius = float(np.linalg.norm(hi - lo) * 0.5) or 1.0
 
-        exposure = 1.0
-        means = [item.texture[:, :, :3].astype("f4").mean() / 255.0
-                 for item in items if item.texture is not None]
-        if means:
-            mean = float(np.mean(means))
-            exposure = float(np.clip(0.30 / max(mean ** 2.2, 1e-4), 1.0, 2.0))
-            print(f"  {len(means)} 张贴图，平均色 {mean:.3f}，预览曝光 ×{exposure:.1f}")
-
         if args.camera:
             values = [float(v) for v in args.camera.split(",")]
             eye, target = np.array(values[:3], np.float32), np.array(values[3:], np.float32)
@@ -457,7 +518,7 @@ def cmd_character(args) -> int:
             target = center
             eye = center + np.array([0.0, -radius * 2.2, radius * 0.12], dtype=np.float32)
 
-        render_scene(items, args.out, args.size, eye, target, exposure, args.fov)
+        render_scene(items, args.out, args.size, eye, target, args.exposure, args.fov)
         print(f"已渲染 {chr_id} -> {args.out}")
         return 0
     finally:
@@ -489,7 +550,7 @@ def cmd_scene(args) -> int:
         from .ue4.content import ContentStore
         from .ue4.level import parse_level
         from .ue4.staticmesh import parse_static_mesh
-        from .render import SceneItem, render_scene
+        from .render import render_scene
 
         store = ContentStore(paks)
         package = store.package(args.map)
@@ -523,30 +584,24 @@ def cmd_scene(args) -> int:
                 skipped += 1
                 continue
 
-            texture = None
+            toon = ToonMaterial()
             if not args.no_texture:
                 material = (entry.materials[0] if entry.materials and entry.materials[0]
                             else (mesh.material_slots[0] if mesh.material_slots else None))
                 if material and material not in material_cache:
-                    material_cache[material] = _material_texture(store, material)[1]
-                texture = material_cache.get(material) if material else None
+                    resolved = _toon_params(store, material)
+                    if resolved.texture is None and not resolved.outline:
+                        resolved.texture = _material_texture(store, material)[1]
+                    material_cache[material] = resolved
+                toon = material_cache.get(material) or ToonMaterial()
 
-            items.append(SceneItem(mesh.positions, mesh.indices, mesh.uvs, texture,
+            items.append(toon.item(mesh.positions, mesh.indices, mesh.uvs,
                                    _placement_matrix(entry.location, entry.rotation, entry.scale)))
             if (index + 1) % 20 == 0:
                 print(f"  ... 已装载 {index + 1}/{len(placed)}")
 
         if not items:
             raise SystemExit("没有可渲染的静态网格")
-
-        exposure = 1.0
-        if not args.no_texture:
-            means = [item.texture[:, :, :3].astype("f4").mean() / 255.0
-                     for item in items if item.texture is not None]
-            if means:
-                mean = float(np.mean(means))
-                exposure = float(np.clip(0.30 / max(mean ** 2.2, 1e-4), 1.0, 2.0))
-                print(f"  {len(means)} 张贴图，平均色 {mean:.3f}，预览曝光 ×{exposure:.1f}")
 
         eye = target = None
         if args.camera:
@@ -556,7 +611,7 @@ def cmd_scene(args) -> int:
             eye = np.array(values[:3], dtype=np.float32)
             target = np.array(values[3:], dtype=np.float32)
 
-        render_scene(items, args.out, args.size, eye, target, exposure, args.fov)
+        render_scene(items, args.out, args.size, eye, target, args.exposure, args.fov)
         print(f"已渲染 {len(items)} 个网格 -> {args.out}（跳过 {skipped} 个）")
         return 0
     finally:
@@ -697,6 +752,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_preview.add_argument("--material", help="指定材质路径（默认取第一个材质槽）")
     p_preview.add_argument("--camera", help="ex,ey,ez,tx,ty,tz")
     p_preview.add_argument("--fov", type=float, default=45.0)
+    p_preview.add_argument("--exposure", type=float, default=1.0,
+                           help="固定曝光（关卡 PostProcess 为 1.0）")
     p_preview.add_argument("--no-texture", action="store_true", help="只渲染纯色")
     p_preview.set_defaults(func=cmd_preview)
 
@@ -706,6 +763,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_scene.add_argument("--size", type=int, default=1024)
     p_scene.add_argument("--fov", type=float, default=45.0)
     p_scene.add_argument("--camera", help="ex,ey,ez,tx,ty,tz")
+    p_scene.add_argument("--exposure", type=float, default=1.0,
+                         help="固定曝光（关卡 PostProcess 为 1.0）")
     p_scene.add_argument("--limit", type=int, default=0, help="最多装载多少个网格")
     p_scene.add_argument("--no-texture", action="store_true", help="只渲染纯色")
     p_scene.set_defaults(func=cmd_scene)
@@ -716,6 +775,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_character.add_argument("--size", type=int, default=900)
     p_character.add_argument("--fov", type=float, default=40.0)
     p_character.add_argument("--camera", help="ex,ey,ez,tx,ty,tz")
+    p_character.add_argument("--exposure", type=float, default=1.0,
+                             help="固定曝光（关卡 PostProcess 为 1.0）")
     p_character.add_argument("--no-texture", action="store_true", help="只渲染纯色")
     p_character.add_argument("--flip-uv", default="", choices=["", "none", "u", "v", "uv"],
                              help="翻转 UV 轴，用于排查贴图方向")
