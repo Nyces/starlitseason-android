@@ -214,10 +214,40 @@ BLUR_FRAGMENT_SHADER = """
     }
 """
 
+AO_FRAGMENT_SHADER = """
+    #version 330
+    uniform sampler2D depth_tex;
+    uniform float strength;
+    in vec2 v_uv;
+    out vec4 color;
+    const vec2 KERNEL[8] = vec2[8](
+        vec2( 0.000, -0.010), vec2(-0.008, -0.006), vec2( 0.008, -0.006),
+        vec2(-0.010,  0.000), vec2( 0.010,  0.000), vec2(-0.008,  0.006),
+        vec2( 0.008,  0.006), vec2( 0.000,  0.010));
+    void main() {
+        float d = texture(depth_tex, v_uv).r;
+        if (d >= 0.99999) {
+            color = vec4(1.0);
+            return;
+        }
+        float occluded = 0.0;
+        for (int i = 0; i < 8; ++i) {
+            float sd = texture(depth_tex, v_uv + KERNEL[i]).r;
+            float diff = d - sd;
+            if (diff > 0.0006 && diff < 0.02) {
+                occluded += 1.0;
+            }
+        }
+        color = vec4(vec3(1.0 - occluded / 8.0 * strength), 1.0);
+    }
+"""
+
 COMPOSITE_FRAGMENT_SHADER = """
     #version 330
     uniform sampler2D scene;
     uniform sampler2D bloom;
+    uniform sampler2D ao;
+    uniform bool has_ao;
     uniform float intensity;
     uniform float exposure;
     in vec2 v_uv;
@@ -225,7 +255,11 @@ COMPOSITE_FRAGMENT_SHADER = """
     vec3 to_srgb(vec3 c) { return pow(c, vec3(1.0 / 2.2)); }
     void main() {
         vec4 scene_color = texture(scene, v_uv);
-        vec3 c = scene_color.rgb * exposure + texture(bloom, v_uv).rgb * intensity;
+        vec3 c = scene_color.rgb * exposure;
+        if (has_ao) {
+            c *= texture(ao, v_uv).r;
+        }
+        c += texture(bloom, v_uv).rgb * intensity;
         color = vec4(to_srgb(clamp(c, 0.0, 1.0)), 1.0);
     }
 """
@@ -361,7 +395,8 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
                  shadow_center: np.ndarray | None = None,
                  shadow_radius: float | None = None,
                  bloom: bool = True, bloom_threshold: float = 1.05,
-                 bloom_intensity: float = 0.3) -> None:
+                 bloom_intensity: float = 0.3,
+                 ao: bool = True, ao_strength: float = 0.45) -> None:
     import moderngl
     from PIL import Image
 
@@ -599,10 +634,31 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
         bloom_texture = bright
         screen.use()
 
+    # 深度差近似的环境光遮蔽：让角色与地面、舞台构件之间压出暗部
+    ao_texture = ctx.texture((1, 1), 1, bytes((255,)))
+    if ao:
+        ao_size = max(size // 2, 1)
+        ao_texture = ctx.texture((ao_size, ao_size), 1, dtype="f1")
+        ao_texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        ao_texture.repeat_x = ao_texture.repeat_y = False
+        ao_program = ctx.program(vertex_shader=POST_VERTEX_SHADER,
+                                 fragment_shader=AO_FRAGMENT_SHADER)
+        ao_vao = ctx.vertex_array(ao_program, [(quad_buffer, "2f", "in_pos")])
+        ao_fbo = ctx.framebuffer([ao_texture])
+        ao_fbo.use()
+        scene_depth.use(0)
+        ao_program["depth_tex"].value = 0
+        _set(ao_program, "strength", float(ao_strength))
+        ao_vao.render(moderngl.TRIANGLE_STRIP)
+        screen.use()
+
     scene_texture.use(0)
     bloom_texture.use(1)
+    ao_texture.use(2)
     composite["scene"].value = 0
     composite["bloom"].value = 1
+    _set(composite, "ao", 2)
+    _set(composite, "has_ao", bool(ao))
     _set(composite, "intensity", float(bloom_intensity if bloom else 0.0))
     _set(composite, "exposure", float(exposure))
     composite_vao.render(moderngl.TRIANGLE_STRIP)
