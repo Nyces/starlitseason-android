@@ -7,6 +7,13 @@ dependencies = [
     "cryptography>=42",
 ]
 
+[project.optional-dependencies]
+render = [
+    "numpy>=1.26",
+    "moderngl>=5.10",
+    "Pillow>=10",
+]
+
 [project.scripts]
 sspak = "sspak.cli:main"
 

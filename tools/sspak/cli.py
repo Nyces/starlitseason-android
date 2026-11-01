@@ -191,6 +191,36 @@ def cmd_census(args) -> int:
     return 0 if (not args.headers or header_bad == 0) else 1
 
 
+def cmd_preview(args) -> int:
+    paks = _open_all(args)
+    try:
+        for pak in paks:
+            entry = pak.get(args.asset + ".uasset")
+            if entry is None:
+                continue
+            uexp_entry = pak.get(args.asset + ".uexp")
+            uasset = pak.read_entry(entry)
+            uexp = pak.read_entry(uexp_entry) if uexp_entry else b""
+            from .ue4.package import Package
+            from .ue4.staticmesh import parse_static_mesh
+
+            package = Package(uasset, uexp)
+            export = package.find_export("StaticMesh")
+            if export is None:
+                raise SystemExit("该资源不包含 StaticMesh")
+            mesh = parse_static_mesh(package.export_bytes(export), package.names)
+            from .render import render_static_mesh
+
+            render_static_mesh(mesh, args.out, args.size)
+            print(f"已渲染 {args.asset} -> {args.out} "
+                  f"({len(mesh.positions)} 顶点 / {len(mesh.indices) // 3} 三角形)")
+            return 0
+    finally:
+        for pak in paks:
+            pak.close()
+    raise SystemExit(f"未找到资源: {args.asset}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sspak", description="StarLit Season pak 工具")
     parser.add_argument("--paks", help="pak 所在目录")
@@ -218,6 +248,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_census = sub.add_parser("census", help="资产普查")
     p_census.add_argument("--headers", action="store_true", help="解析全部 uasset 包头")
     p_census.set_defaults(func=cmd_census)
+
+    p_preview = sub.add_parser("preview", help="渲染 StaticMesh 预览图")
+    p_preview.add_argument("--asset", required=True, help="资源路径（不含扩展名）")
+    p_preview.add_argument("--out", required=True, help="输出 PNG 路径")
+    p_preview.add_argument("--size", type=int, default=1024)
+    p_preview.set_defaults(func=cmd_preview)
 
     return parser
 
