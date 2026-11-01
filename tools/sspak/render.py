@@ -58,6 +58,10 @@ FRAGMENT_SHADER = """
     uniform float rim_intensity;
     uniform float emissive_boost;
     uniform float exposure;
+    uniform sampler2D shadow_map;
+    uniform mat4 light_vp;
+    uniform bool has_shadowmap;
+    uniform float shadow_strength;
     uniform bool unlit;
     uniform float alpha_cut;
     in vec3 v_nrm;
@@ -91,6 +95,27 @@ FRAGMENT_SHADER = """
             // ShadowTexture 的 alpha 标记哪里允许出现卡通阴影（脸/身体靠它收窄阴影）
             float mask = has_shadow ? texture(shadow_tex, v_uv).a : 1.0;
             float lit = step(shadow_threshold, mix(1.0, shade, mask));
+            float shadow_amount = 0.0;
+            // 方向光阴影贴图（3x3 PCF）
+            if (has_shadowmap) {
+                // 沿法线偏移采样点，压掉自阴影粉刺
+                vec4 lp = light_vp * vec4(v_pos + n * 2.0, 1.0);
+                vec3 proj = lp.xyz / lp.w;
+                if (abs(proj.x) <= 1.0 && abs(proj.y) <= 1.0 && abs(proj.z) <= 1.0) {
+                    vec2 uv = proj.xy * 0.5 + 0.5;
+                    float depth = proj.z * 0.5 + 0.5;
+                    vec2 texel = 1.0 / vec2(textureSize(shadow_map, 0));
+                    float sum = 0.0;
+                    for (int y = -1; y <= 1; ++y) {
+                        for (int x = -1; x <= 1; ++x) {
+                            float stored = texture(shadow_map, uv + vec2(x, y) * texel).r;
+                            sum += (depth - 0.004) <= stored ? 1.0 : 0.0;
+                        }
+                    }
+                    shadow_amount = (1.0 - sum / 9.0) * shadow_strength;
+                    lit *= 1.0 - shadow_amount;
+                }
+            }
             // 阴影区用色表的粉/米色替换，受光区为白色
             vec3 tone = mix(shadow_tint, vec3(1.0), lit);
             // MatCap（SphereMap）：视空间法线 xy 映射到球面贴图，先乘 BlendColor 再取幂、乘 Boost
@@ -102,6 +127,8 @@ FRAGMENT_SHADER = """
                 base += to_linear(s);
             }
             base = base * to_linear(tone) * lighting_intensity;
+            // 没有卡通色表的材质（舞台/道具）靠这一项才能看出投影
+            base *= mix(vec3(1.0), vec3(0.60, 0.61, 0.68), shadow_amount);
             // 边缘光：pow(1-|N·V|, RimScale)（与 ToonBaseCloth 反汇编一致）
             float rim = pow(clamp(1.0 - abs(dot(n, v)), 0.0, 1.0), rim_scale) * rim_intensity;
             base += to_linear(rim_color) * rim;
@@ -147,6 +174,25 @@ OUTLINE_FRAGMENT_SHADER = """
 """
 
 
+SHADOW_VERTEX_SHADER = """
+    #version 330
+    uniform mat4 light_vp;
+    uniform mat4 model;
+    in vec3 in_pos;
+    void main() {
+        gl_Position = light_vp * model * vec4(in_pos, 1.0);
+    }
+"""
+
+SHADOW_FRAGMENT_SHADER = """
+    #version 330
+    out vec4 color;
+    void main() {
+        color = vec4(1.0);
+    }
+"""
+
+
 def _perspective(fov_deg: float, aspect: float, near: float, far: float) -> np.ndarray:
     f = 1.0 / np.tan(np.radians(fov_deg) / 2)
     return np.array(
@@ -171,6 +217,14 @@ def _look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
     m[1, 3] = -np.dot(true_up, eye)
     m[2, 3] = np.dot(forward, eye)
     return m
+
+
+def _orthographic(half: float, near: float, far: float) -> np.ndarray:
+    return np.array(
+        [[1.0 / half, 0, 0, 0],
+         [0, 1.0 / half, 0, 0],
+         [0, 0, -2.0 / (far - near), -(far + near) / (far - near)],
+         [0, 0, 0, 1]], dtype=np.float32)
 
 
 def _smooth_normals(positions: np.ndarray, indices: np.ndarray) -> np.ndarray:
@@ -246,7 +300,10 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
                  tint: tuple[float, float, float] = (0.78, 0.76, 0.72),
                  light: tuple[float, float, float] = (0.0, 0.0, 1.0),
                  shadow_intensity: float = 1.5,
-                 lighting_intensity: float = 1.0) -> None:
+                 lighting_intensity: float = 1.0,
+                 shadow: bool = True, shadow_strength: float = 0.85,
+                 shadow_center: np.ndarray | None = None,
+                 shadow_radius: float | None = None) -> None:
     import moderngl
     from PIL import Image
 
@@ -322,6 +379,9 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
             vao.render()
         ctx.disable(moderngl.CULL_FACE)
 
+    shadow_tex = None
+    light_vp = np.eye(4, dtype=np.float32)
+
     def draw(entry) -> None:
         item, normals, model, vbo, ibo, small, mvp = entry
         vao = ctx.vertex_array(
@@ -366,6 +426,14 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
             _set(program, "has_shadow", True)
         else:
             _set(program, "has_shadow", False)
+        if shadow_tex is not None:
+            shadow_tex.use(4)
+            _set(program, "shadow_map", 4)
+            _set_matrix(program, "light_vp", light_vp)
+            _set(program, "has_shadowmap", True)
+            _set(program, "shadow_strength", float(shadow_strength))
+        else:
+            _set(program, "has_shadowmap", False)
         vao.render()
 
     transparent_modes = ("additive", "translucent", "modulate")
@@ -373,6 +441,38 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
              if not entry[0].outline and entry[0].blend_mode not in transparent_modes]
     blended = [entry for entry in prepared
                if not entry[0].outline and entry[0].blend_mode in transparent_modes]
+
+    if shadow and solid:
+        # 从光源方向渲一张深度图，正交投影覆盖指定范围（默认整个场景）
+        light_dir = np.asarray(light, dtype=np.float32)
+        norm = float(np.linalg.norm(light_dir))
+        light_dir = light_dir / norm if norm > 1e-6 else np.array([0.0, 0.0, 1.0], np.float32)
+        up = (np.array([0.0, 0.0, 1.0], np.float32) if abs(light_dir[2]) < 0.9
+              else np.array([0.0, 1.0, 0.0], np.float32))
+        focus = center if shadow_center is None else np.asarray(shadow_center, np.float32)
+        span = radius if shadow_radius is None else float(shadow_radius)
+        light_view = _look_at(focus + light_dir * span * 4.0, focus, up)
+        light_vp = _orthographic(span * 1.6, 0.1, span * 8.0 + 100.0) @ light_view
+
+        shadow_tex = ctx.depth_texture((2048, 2048))
+        shadow_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        shadow_fbo = ctx.framebuffer(depth_attachment=shadow_tex)
+        shadow_fbo.use()
+        shadow_fbo.clear(depth=1.0)
+        shadow_program = ctx.program(vertex_shader=SHADOW_VERTEX_SHADER,
+                                     fragment_shader=SHADOW_FRAGMENT_SHADER)
+        _set_matrix(shadow_program, "light_vp", light_vp)
+        ctx.disable(moderngl.CULL_FACE)   # 双面写入，取最近深度，避免自阴影
+        for item, normals, model, vbo, ibo, small, _ in solid:
+            pos_vbo = ctx.buffer(item.positions.astype(np.float32).tobytes())
+            vao = ctx.vertex_array(
+                shadow_program, [(pos_vbo, "3f", "in_pos")], ibo,
+                index_element_size=2 if small else 4)
+            _set_matrix(shadow_program, "model", model)
+            vao.render()
+        ctx.disable(moderngl.CULL_FACE)
+        shadow_tex.compare_func = ""      # 采样时要深度值，不要 0/1 比较结果
+        fbo.use()
 
     for entry in solid:
         draw(entry)

@@ -459,12 +459,23 @@ def cmd_preview(args) -> int:
             target = center
             eye = center + np.array([radius * 1.9, -radius * 2.4, radius * 0.35], dtype=np.float32)
 
-        render_scene(items, args.out, args.size, eye, target, args.exposure, args.fov)
+        render_scene(items, args.out, args.size, eye, target, args.exposure, args.fov,
+                     light=_vec3(args.light, (0.0, 0.0, 1.0)))
         print(f"已渲染 {args.asset} -> {args.out}（{label}）")
         return 0
     finally:
         for pak in paks:
             pak.close()
+
+
+def _vec3(text: str | None, default: tuple[float, float, float]):
+    """解析 "x,y,z" 形式的向量参数。"""
+    if not text:
+        return default
+    values = [float(v) for v in text.split(",")]
+    if len(values) != 3:
+        raise SystemExit("向量参数需要 3 个数字: x,y,z")
+    return tuple(values)
 
 
 def _flip_uv(uvs, mode: str):
@@ -560,7 +571,8 @@ def cmd_character(args) -> int:
             target = center
             eye = center + np.array([0.0, -radius * 2.2, radius * 0.12], dtype=np.float32)
 
-        render_scene(items, args.out, args.size, eye, target, args.exposure, args.fov)
+        render_scene(items, args.out, args.size, eye, target, args.exposure, args.fov,
+                     light=_vec3(args.light, (0.0, 0.0, 1.0)))
         print(f"已渲染 {chr_id} -> {args.out}")
         return 0
     finally:
@@ -666,7 +678,8 @@ def cmd_scene(args) -> int:
             eye = np.array(values[:3], dtype=np.float32)
             target = np.array(values[3:], dtype=np.float32)
 
-        render_scene(items, args.out, args.size, eye, target, args.exposure, args.fov)
+        render_scene(items, args.out, args.size, eye, target, args.exposure, args.fov,
+                     light=_vec3(args.light, (0.35, 0.45, 0.75)))
         print(f"已渲染 {len(items)} 个网格 -> {args.out}（跳过 {skipped} 个）")
         return 0
     finally:
@@ -809,6 +822,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_preview.add_argument("--fov", type=float, default=45.0)
     p_preview.add_argument("--exposure", type=float, default=1.0,
                            help="固定曝光（关卡 PostProcess 为 1.0）")
+    p_preview.add_argument("--light", help="光照方向 x,y,z（指向光源）")
     p_preview.add_argument("--no-texture", action="store_true", help="只渲染纯色")
     p_preview.set_defaults(func=cmd_preview)
 
@@ -820,6 +834,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_scene.add_argument("--camera", help="ex,ey,ez,tx,ty,tz")
     p_scene.add_argument("--exposure", type=float, default=1.0,
                          help="固定曝光（关卡 PostProcess 为 1.0）")
+    p_scene.add_argument("--light", help="光照方向 x,y,z（指向光源）")
     p_scene.add_argument("--limit", type=int, default=0, help="最多装载多少个网格")
     p_scene.add_argument("--no-texture", action="store_true", help="只渲染纯色")
     p_scene.set_defaults(func=cmd_scene)
@@ -832,6 +847,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_character.add_argument("--camera", help="ex,ey,ez,tx,ty,tz")
     p_character.add_argument("--exposure", type=float, default=1.0,
                              help="固定曝光（关卡 PostProcess 为 1.0）")
+    p_character.add_argument("--light", help="光照方向 x,y,z（指向光源）")
     p_character.add_argument("--no-texture", action="store_true", help="只渲染纯色")
     p_character.add_argument("--flip-uv", default="", choices=["", "none", "u", "v", "uv"],
                              help="翻转 UV 轴，用于排查贴图方向")
