@@ -34,6 +34,8 @@ FRAGMENT_SHADER = """
     uniform float exposure;
     uniform vec3 shadow_tint;
     uniform float shadow_threshold;
+    uniform vec3 blend;
+    uniform vec3 add;
     in vec3 v_nrm;
     in vec3 v_pos;
     in vec2 v_uv;
@@ -49,6 +51,8 @@ FRAGMENT_SHADER = """
         // 阴影区用色表的粉/米色替换，受光区为白色
         vec3 tone = mix(shadow_tint, vec3(1.0), lit);
         vec3 base = has_tex ? to_linear(texture(base_tex, v_uv).rgb) : to_linear(tint);
+        // 材质实例的 BlendColor / AddColor 是配色旋钮（部分服装靠它改色）
+        base = base * to_linear(blend) + to_linear(add);
         vec3 c = base * to_linear(tone) * exposure;
         color = vec4(to_srgb(clamp(c, 0.0, 1.0)), 1.0);
     }
@@ -102,6 +106,8 @@ class SceneItem:
     model: np.ndarray | None = None
     shadow_tint: tuple[float, float, float] = (1.0, 1.0, 1.0)
     threshold: float = 0.47
+    blend: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    add: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
 def _upload_texture(ctx, array: np.ndarray):
@@ -166,6 +172,8 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
         program["model"].write(np.ascontiguousarray(model.T).astype(np.float32).tobytes())
         program["shadow_tint"].value = tuple(item.shadow_tint)
         program["shadow_threshold"].value = float(item.threshold)
+        program["blend"].value = tuple(item.blend)
+        program["add"].value = tuple(item.add)
         if item.texture is not None:
             texture = _upload_texture(ctx, item.texture)
             texture.use(0)

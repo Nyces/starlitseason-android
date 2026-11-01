@@ -231,6 +231,8 @@ def _toon_params(store, material: str | None):
 
     shadow = (1.0, 1.0, 1.0)
     threshold = 0.47
+    blend = (1.0, 1.0, 1.0)
+    add = (0.0, 0.0, 0.0)
     current = material
     for _ in range(6):
         if not current:
@@ -242,6 +244,10 @@ def _toon_params(store, material: str | None):
             instance = parse_material_instance(package)
         except Exception:  # noqa: BLE001 - 父级是基础材质
             break
+        if "BlendColor" in instance.vectors:
+            blend = tuple(instance.vectors["BlendColor"][:3])
+        if "AddColor" in instance.vectors:
+            add = tuple(instance.vectors["AddColor"][:3])
         if "hair" in (instance.parent or "").lower():
             threshold = 0.94
         table = instance.textures.get("CelShadowTable") or instance.textures.get("ToonShadowTable")
@@ -259,14 +265,14 @@ def _toon_params(store, material: str | None):
         if picked:
             tex = store.texture(picked[1])
             if tex is not None:
-                return decode_texture(tex), shadow, threshold
+                return decode_texture(tex), shadow, threshold, blend, add
         current = instance.parent
 
     if shadow != (1.0, 1.0, 1.0):
         pixel = np.array([[[int(shadow[0] * 255), int(shadow[1] * 255),
                             int(shadow[2] * 255), 255]]], dtype=np.uint8)
-        return pixel, shadow, threshold
-    return None, shadow, threshold
+        return pixel, shadow, threshold, blend, add
+    return None, shadow, threshold, blend, add
 
 
 def cmd_preview(args) -> int:
@@ -292,12 +298,13 @@ def cmd_preview(args) -> int:
             mesh = parse_static_mesh(package.export_bytes(export), package)
             positions = mesh.positions
             material = args.material or (mesh.material_slots[0] if mesh.material_slots else None)
-            texture, shadow, threshold = (None, (1.0, 1.0, 1.0), 0.47) if args.no_texture \
-                else _toon_params(store, material)
+            texture, shadow, threshold, blend, add = (None, (1.0, 1.0, 1.0), 0.47,
+                                                       (1.0, 1.0, 1.0), (0.0, 0.0, 0.0)) \
+                if args.no_texture else _toon_params(store, material)
             if texture is not None and shadow != (1.0, 1.0, 1.0):
                 print(f"  材质 {material}\n    阴影色 {tuple(round(v, 2) for v in shadow)} 阈值 {threshold}")
             items.append(SceneItem(mesh.positions, mesh.indices, mesh.uvs, texture,
-                                   shadow_tint=shadow, threshold=threshold))
+                                   shadow_tint=shadow, threshold=threshold, blend=blend, add=add))
             label = f"{len(mesh.positions)} 顶点 / {len(mesh.indices) // 3} 三角形"
         else:
             skeletal = parse_skeletal_mesh(package)
@@ -378,11 +385,11 @@ def _skeletal_items(store, asset: str, no_texture: bool, flip: str = ""):
         if slot and "outline" in slot.lower():
             continue                      # 描边是反向球壳，正视渲染时跳过
         texture = None
-        shadow, threshold = (1.0, 1.0, 1.0), 0.47
+        shadow, threshold, blend, add = (1.0, 1.0, 1.0), 0.47, (1.0, 1.0, 1.0), (0.0, 0.0, 0.0)
         if not no_texture:
-            texture, shadow, threshold = _toon_params(store, slot)
+            texture, shadow, threshold, blend, add = _toon_params(store, slot)
         items.append(SceneItem(mesh.positions, indices, _flip_uv(mesh.uvs, flip), texture,
-                               shadow_tint=shadow, threshold=threshold))
+                               shadow_tint=shadow, threshold=threshold, blend=blend, add=add))
     return items, mesh
 
 
