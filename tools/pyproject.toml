@@ -1,0 +1,14 @@
+[project]
+name = "sspak"
+version = "0.1.0"
+description = "Pak / uasset tooling for the StarLit Season Android port verification pipeline"
+requires-python = ">=3.10"
+dependencies = [
+    "cryptography>=42",
+]
+
+[project.scripts]
+sspak = "sspak.cli:main"
+
+[tool.setuptools]
+packages = ["sspak"]
