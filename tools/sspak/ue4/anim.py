@@ -10,13 +10,14 @@
     TArray<FTrackToSkeletonMap>：int32 数量 + 每项 int32 骨骼下标（主骨架）
     int32 0, int32 65536
     int32 NumKeys
-    TArray<int32> 轨道偏移
-    紧跟着的第二段偏移（缩放通道）
-    int32 0
-    FByteBulkData 字节流：每个键 12 字节（3×float）
+    TArray<int32> 轨道表：每轨 4 个 int = [位移键数, 位移偏移, 旋转键数, 旋转偏移]
+    紧跟着的缩放偏移段
+    字节流：每个键 12 字节（3×float）
 
-键的语义：半径 `(x, y, z)`，旋转把 w 用 `sqrt(1 - x² - y² - z²)` 补回；
-偏移表按 (键数, 字节偏移) 成对出现，排序后每个轨占 channels 个连续通道。
+键的语义：分量 `(x, y, z)`，旋转把 w 用 `sqrt(1 - x² - y² - z²)` 补回。
+
+目前只解旋转通道：120 轨的旋转块排序后能铺满一整段连续字节（最多 1 处重叠），
+位移通道的偏移语意仍未定，所以不参与渲染，避免把角色整体拉歪。
 """
 
 from __future__ import annotations
@@ -147,63 +148,41 @@ def parse_animation(package: Package) -> AnimSequence:
         raise AnimSequenceError("找不到曲线名字符串，无法定位字节流尾部")
     stream_end = tail - 4
 
-    extra = np.frombuffer(data, dtype="<i4", count=16, offset=pos).astype(np.int64)
-    variants = [
-        offsets[2:],
-        np.concatenate([offsets[2:], extra]),
-        offsets,
-        np.concatenate([offsets, extra]),
-    ]
-    best = None
-    for values in variants:
-        pairs = _collect_pairs(values, num_keys)
-        if len(pairs) < track_count:
-            continue
-        max_end = max(off + count * KEY_SIZE for count, off in pairs)
-        base = stream_end - max_end
-        if base < pos + 4 or base > stream_end:
-            continue
-        pairs.sort(key=lambda item: item[1])
-        channels = min(max(len(pairs) // track_count, 2), 3)
-        for rot_channel in (1, 0):
-            score = _score_rotations(pairs, base, data, track_count, channels, rot_channel)
-            if best is None or score > best[0]:
-                best = (score, pairs, base, channels, rot_channel)
-    if best is None:
-        raise AnimSequenceError("无法定位字节流起点")
-    score, pairs, base, channels, rot_channel = best
-    if score < 0.6:
-        raise AnimSequenceError(f"旋转键校验通过率过低（{score:.2f}）")
+    # 轨道表按 4 个 int 一组：[位移键数, 位移偏移, 旋转键数, 旋转偏移]。
+    # 旋转键块排序后几乎铺满一段连续区域（120 轨里最多 1 处重叠），据此定流起点。
+    if offset_count % 4 != 0:
+        raise AnimSequenceError(f"轨道表长度不是 4 的倍数（{offset_count}）")
+    groups = offsets.reshape(-1, 4)
+    rot_blocks = [(int(rot_off), int(num_rot))
+                  for num_pos, pos_off, num_rot, rot_off in groups
+                  if 1 <= num_rot <= num_keys and rot_off >= 0]
+    if not rot_blocks:
+        raise AnimSequenceError("没有旋转键块")
+    rot_end = max(off + count * KEY_SIZE for off, count in rot_blocks)
+    base = stream_end - rot_end
+    if base < props_end:
+        raise AnimSequenceError(f"旋转键流起点异常 base={base}")
+
+    rot_blocks.sort()
+    overlaps = 0
+    end = 0
+    for off, count in rot_blocks:
+        if off < end:
+            overlaps += 1
+        end = max(end, off + count * KEY_SIZE)
+    quality = 1.0 - overlaps / len(rot_blocks)
 
     seq = AnimSequence(export.name, num_frames, float(length), bone_indices,
-                       quality=score)
-    for t in range(track_count):
-        rotations = positions = None
-        for c in range(channels):
-            index = t * channels + c
-            if index >= len(pairs):
-                break
-            count, off = pairs[index]
-            keys = _read_keys(data, base + off, count)
-            if c == rot_channel:
+                       quality=quality)
+    for num_pos, pos_off, num_rot, rot_off in groups:
+        rotations = np.zeros((0, 3), np.float32)
+        if 1 <= num_rot <= num_keys and rot_off >= 0:
+            keys = _read_keys(data, base + int(rot_off), int(num_rot))
+            if _valid_rotations(keys):
                 rotations = keys
-            elif c == (1 - rot_channel) and c < 2:
-                positions = keys
-        seq.rotations.append(rotations if _valid_rotations(rotations)
-                             else np.zeros((0, 3), np.float32))
-        seq.positions.append(positions if positions is not None
-                             else np.zeros((0, 3), np.float32))
+        seq.rotations.append(rotations)
+        seq.positions.append(np.zeros((0, 3), np.float32))   # 位移通道语义还没定
     return seq
-
-
-def _collect_pairs(values: np.ndarray, num_keys: int) -> list[tuple[int, int]]:
-    """把整数流解释成 (键数, 字节偏移) 对，丢弃不合法的组合。"""
-    pairs = []
-    for i in range(0, len(values) - 1, 2):
-        count, off = int(values[i]), int(values[i + 1])
-        if 1 <= count <= num_keys and off >= 0:
-            pairs.append((count, off))
-    return pairs
 
 
 def _valid_rotations(keys: np.ndarray | None) -> bool:
@@ -211,23 +190,6 @@ def _valid_rotations(keys: np.ndarray | None) -> bool:
     if keys is None or len(keys) == 0:
         return False
     return bool(np.all(np.isfinite(keys)) and np.all(np.abs(keys) <= 1.02))
-
-
-def _score_rotations(pairs, base, data, track_count, channels, rot_channel) -> float:
-    good = checked = 0
-    for t in range(track_count):
-        index = t * channels + rot_channel
-        if index >= len(pairs):
-            continue
-        count, off = pairs[index]
-        try:
-            keys = _read_keys(data, base + off, count)
-        except AnimSequenceError:
-            continue
-        checked += 1
-        if _valid_rotations(keys):
-            good += 1
-    return good / checked if checked else 0.0
 
 
 def _read_keys(data: bytes, offset: int, count: int) -> np.ndarray:

@@ -1028,7 +1028,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_scene.add_argument("--character", help="把角色（绑定姿势）放进场景，例如 chr0101")
     p_scene.add_argument("--pose", action="append",
                          help="按骨骼名摆角色姿势：骨骼名:轴:角度（轴为 x/y/z），可重复")
-    p_scene.add_argument("--anim", help="实验性：把角色摆成 AnimSequence 的某一帧（键布局尚未验证）")
+    p_scene.add_argument("--anim", help="实验性：把角色摆成 AnimSequence 的某一帧（只解旋转通道）")
     p_scene.add_argument("--frame", type=int, default=0, help="--anim 的帧号")
     p_scene.add_argument("--flip-uv", default="", choices=["", "none", "u", "v", "uv"],
                          help="翻转 UV 轴，用于排查贴图方向")
@@ -1065,7 +1065,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_character.add_argument("--pose", action="append",
                              help="按骨骼名摆姿势：骨骼名:轴:角度（轴为 x/y/z），可重复")
     p_character.add_argument("--anim",
-                             help="实验性：用 AnimSequence 的某一帧摆姿势（键布局尚未验证）")
+                             help="实验性：用 AnimSequence 的某一帧摆姿势（只解旋转通道）")
     p_character.add_argument("--frame", type=int, default=0, help="--anim 的帧号")
     p_character.add_argument("--flip-uv", default="", choices=["", "none", "u", "v", "uv"],
                              help="翻转 UV 轴，用于排查贴图方向")
