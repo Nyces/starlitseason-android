@@ -514,7 +514,41 @@ def _parse_pose(specs: list[str] | None):
     return pose
 
 
-def _skeletal_items(store, asset: str, no_texture: bool, flip: str = "", pose=None):
+def _master_bone_names(store) -> list[str]:
+    """主骨架（SK_chr_all_bone）的骨骼名，动画轨道下标用它换成骨骼名。"""
+    from .ue4.skeletalmesh import parse_skeletal_mesh
+
+    package = store.package("Model/Character/Body/Base/chr_body_base/Mesh/SK_chr_all_bone")
+    if package is None:
+        raise SystemExit("未找到主骨架网格 SK_chr_all_bone")
+    return [name for name, _ in parse_skeletal_mesh(package).bones]
+
+
+def _anim_pose(store, anim: str, frame: int) -> dict:
+    """把动画某一帧解成 {骨骼名: 3×3 绝对局部旋转}（实验性，失败会抛出）。"""
+    import numpy as np
+
+    from .ue4.anim import AnimSequenceError, parse_animation, quat_matrix
+
+    package = store.package(anim)
+    if package is None:
+        raise SystemExit(f"未找到动画: {anim}")
+    try:
+        sequence = parse_animation(package)
+    except AnimSequenceError as exc:
+        raise SystemExit(f"动画解析失败 {anim}: {exc}") from exc
+    names = _master_bone_names(store)
+    pose = {}
+    for bone, xyz in sequence.sample(frame).items():
+        if 0 <= bone < len(names):
+            pose[names[bone]] = quat_matrix(xyz)
+    print(f"  动画 {anim.rsplit('/', 1)[-1]}：{len(sequence.bone_indices)} 轨 / "
+          f"{sequence.num_frames} 帧 / 自检通过率 {sequence.quality:.2f}")
+    return pose
+
+
+def _skeletal_items(store, asset: str, no_texture: bool, flip: str = "", pose=None,
+                    replace: bool = False):
     from .ue4.skeletalmesh import parse_skeletal_mesh
     from .render import SceneItem
 
@@ -525,7 +559,7 @@ def _skeletal_items(store, asset: str, no_texture: bool, flip: str = "", pose=No
     positions = mesh.positions
     if pose:
         try:
-            positions = mesh.posed_positions(pose)
+            positions = mesh.posed_positions(pose, replace=replace)
         except Exception as exc:  # noqa: BLE001 - 蒙皮失败时退回绑定姿势
             print(f"  [warn] 蒙皮失败 {asset.rsplit('/', 1)[-1]}: {exc}")
     items = []
@@ -545,7 +579,7 @@ def _skeletal_items(store, asset: str, no_texture: bool, flip: str = "", pose=No
 
 
 def _character_items(store, chr_id: str, no_texture: bool, flip: str = "", verbose: bool = True,
-                     pose=None):
+                     pose=None, replace: bool = False):
     """加载身体/脸/头发/饰品（绑定姿势，可按骨骼名摆姿势），返回 (items, 中心, 半径)。"""
     import numpy as np
 
@@ -559,7 +593,7 @@ def _character_items(store, chr_id: str, no_texture: bool, flip: str = "", verbo
     positions = []
     head_center = None
     for asset in candidates:
-        mesh_items, mesh, posed = _skeletal_items(store, asset, no_texture, flip, pose)
+        mesh_items, mesh, posed = _skeletal_items(store, asset, no_texture, flip, pose, replace)
         if not mesh_items:
             continue
         if verbose:
@@ -600,8 +634,14 @@ def cmd_character(args) -> int:
 
         store = ContentStore(paks)
         chr_id = args.chr
+        pose = _parse_pose(args.pose)
+        replace = False
+        if args.anim:
+            # 实验性：动画键是绝对局部旋转，直接替换绑定姿势
+            pose = _anim_pose(store, args.anim, args.frame)
+            replace = True
         items, center, radius = _character_items(store, chr_id, args.no_texture, args.flip_uv,
-                                                 pose=_parse_pose(args.pose))
+                                                 pose=pose, replace=replace)
         if not items:
             raise SystemExit("没有可渲染的骨骼网格")
 
@@ -737,9 +777,14 @@ def cmd_scene(args) -> int:
         character_center = None
         character_radius = 0.0
         if args.character:
+            pose = _parse_pose(args.pose)
+            replace = False
+            if args.anim:
+                pose = _anim_pose(store, args.anim, args.frame)
+                replace = True
             char_items, character_center, character_radius = _character_items(
                 store, args.character, args.no_texture, args.flip_uv, verbose=False,
-                pose=_parse_pose(args.pose))
+                pose=pose, replace=replace)
             if not char_items:
                 raise SystemExit(f"没有可渲染的角色: {args.character}")
             items.extend(char_items)
@@ -983,6 +1028,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_scene.add_argument("--character", help="把角色（绑定姿势）放进场景，例如 chr0101")
     p_scene.add_argument("--pose", action="append",
                          help="按骨骼名摆角色姿势：骨骼名:轴:角度（轴为 x/y/z），可重复")
+    p_scene.add_argument("--anim", help="实验性：把角色摆成 AnimSequence 的某一帧（键布局尚未验证）")
+    p_scene.add_argument("--frame", type=int, default=0, help="--anim 的帧号")
     p_scene.add_argument("--flip-uv", default="", choices=["", "none", "u", "v", "uv"],
                          help="翻转 UV 轴，用于排查贴图方向")
     p_scene.add_argument("--no-texture", action="store_true", help="只渲染纯色")
@@ -1017,6 +1064,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_character.add_argument("--no-texture", action="store_true", help="只渲染纯色")
     p_character.add_argument("--pose", action="append",
                              help="按骨骼名摆姿势：骨骼名:轴:角度（轴为 x/y/z），可重复")
+    p_character.add_argument("--anim",
+                             help="实验性：用 AnimSequence 的某一帧摆姿势（键布局尚未验证）")
+    p_character.add_argument("--frame", type=int, default=0, help="--anim 的帧号")
     p_character.add_argument("--flip-uv", default="", choices=["", "none", "u", "v", "uv"],
                              help="翻转 UV 轴，用于排查贴图方向")
     p_character.set_defaults(func=cmd_character)
