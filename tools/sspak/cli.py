@@ -514,20 +514,31 @@ def _parse_pose(specs: list[str] | None):
     return pose
 
 
-def _master_bone_names(store) -> list[str]:
-    """主骨架（SK_chr_all_bone）的骨骼名，动画轨道下标用它换成骨骼名。"""
-    from .ue4.skeletalmesh import parse_skeletal_mesh
+def _master_bones(store):
+    """主骨架（SK_chr_all_bone）的骨骼名与绑定旋转矩阵。"""
+    from .ue4.skeletalmesh import _quat_matrix, parse_skeletal_mesh
 
     package = store.package("Model/Character/Body/Base/chr_body_base/Mesh/SK_chr_all_bone")
     if package is None:
         raise SystemExit("未找到主骨架网格 SK_chr_all_bone")
-    return [name for name, _ in parse_skeletal_mesh(package).bones]
+    mesh = parse_skeletal_mesh(package)
+    names = [name for name, _ in mesh.bones]
+    binds = [_quat_matrix(pose[:4]) for pose in mesh.bind_pose]
+    return names, binds
+
+
+def _rotation_angle(matrix) -> float:
+    import numpy as np
+
+    return float(np.degrees(np.arccos(np.clip((np.trace(matrix) - 1) / 2, -1.0, 1.0))))
 
 
 def _anim_pose(store, anim: str, frame: int) -> dict:
-    """把动画某一帧解成 {骨骼名: 3×3 绝对局部旋转}（实验性，失败会抛出）。"""
-    import numpy as np
+    """把动画某一帧解成 {骨骼名: 3×3 局部旋转}（实验性，失败会抛出）。
 
+    键有两种可能语义：绝对局部旋转，或相对绑定姿势的增量。逐轨选与绑定姿势
+    偏差更小的解释——待机类动画不会把骨头拧出大角度，这比全局二选一更稳。
+    """
     from .ue4.anim import AnimSequenceError, parse_animation, quat_matrix
 
     package = store.package(anim)
@@ -537,13 +548,21 @@ def _anim_pose(store, anim: str, frame: int) -> dict:
         sequence = parse_animation(package)
     except AnimSequenceError as exc:
         raise SystemExit(f"动画解析失败 {anim}: {exc}") from exc
-    names = _master_bone_names(store)
+    names, binds = _master_bones(store)
     pose = {}
+    relative = 0
     for bone, xyz in sequence.sample(frame).items():
-        if 0 <= bone < len(names):
-            pose[names[bone]] = quat_matrix(xyz)
+        if not 0 <= bone < len(names):
+            continue
+        rotation = quat_matrix(xyz)
+        if _rotation_angle(rotation) < _rotation_angle(rotation.T @ binds[bone]) \
+                and _rotation_angle(rotation) > 1.0:
+            pose[names[bone]] = rotation @ binds[bone]
+            relative += 1
+        else:
+            pose[names[bone]] = rotation
     print(f"  动画 {anim.rsplit('/', 1)[-1]}：{len(sequence.bone_indices)} 轨 / "
-          f"{sequence.num_frames} 帧 / 自检通过率 {sequence.quality:.2f}")
+          f"{sequence.num_frames} 帧 / 自检 {sequence.quality:.2f} / 增量解释 {relative} 轨")
     return pose
 
 
@@ -578,9 +597,23 @@ def _skeletal_items(store, asset: str, no_texture: bool, flip: str = "", pose=No
     return items, mesh, positions
 
 
+def _head_attachment(mesh, pose, replace: bool):
+    """头部骨骼的刚性变换（G_pose · G_bind⁻¹），供没有头部骨骼的头发/饰品跟随。"""
+    import numpy as np
+
+    names = [b[0] for b in mesh.bones]
+    for bone in ("SC_Head", "AO_Head"):
+        if bone in names:
+            i = names.index(bone)
+            posed = mesh.posed_globals(pose, replace)
+            bind = mesh.bind_matrices()
+            return posed[i] @ np.linalg.inv(bind[i])
+    return np.eye(4)
+
+
 def _character_items(store, chr_id: str, no_texture: bool, flip: str = "", verbose: bool = True,
                      pose=None, replace: bool = False):
-    """加载身体/脸/头发/饰品（绑定姿势，可按骨骼名摆姿势），返回 (items, 中心, 半径)。"""
+    """加载身体/脸/头发/饰品（可按骨骼名摆姿势），返回 (items, 中心, 半径)。"""
     import numpy as np
 
     candidates = [
@@ -591,28 +624,35 @@ def _character_items(store, chr_id: str, no_texture: bool, flip: str = "", verbo
     ]
     items = []
     positions = []
-    head_center = None
+    head_bind_center = None
+    head_matrix = np.eye(4, dtype=np.float64)
     for asset in candidates:
-        mesh_items, mesh, posed = _skeletal_items(store, asset, no_texture, flip, pose, replace)
+        # 头发/饰品的骨骼里没有头部骨骼，不能直接吃身体动画，改用头部刚性变换跟随
+        attached = asset.endswith(("_hair", "_orna"))
+        mesh_items, mesh, posed = _skeletal_items(
+            store, asset, no_texture, flip, None if attached else pose, replace)
         if not mesh_items:
             continue
         if verbose:
             print(f"  {asset.rsplit('/', 1)[-1]}: {len(mesh.positions)} 顶点 / "
                   f"{len(mesh.sections)} 分段 / {len(mesh.bones)} 骨骼")
-        lo, hi = posed.min(axis=0), posed.max(axis=0)
-        center = (lo + hi) * 0.5
-        shift = np.zeros(3, dtype=np.float32)
+        bind_center = (mesh.positions.min(axis=0) + mesh.positions.max(axis=0)) * 0.5
         if asset.endswith("_face"):
-            head_center = center
-        elif head_center is not None and asset.endswith(("_hair", "_orna")):
-            # 头发/饰品顶点不在角色坐标系里，按头部位置整体平移
-            shift = head_center - center
+            head_bind_center = bind_center
+        elif not attached and pose:
+            head_matrix = _head_attachment(mesh, pose, replace)
+        if attached and head_bind_center is not None:
+            shift = np.eye(4, dtype=np.float64)
+            shift[:3, 3] = head_bind_center - bind_center
+            model = head_matrix @ shift
             for item in mesh_items:
-                model = np.eye(4, dtype=np.float32)
-                model[:3, 3] = shift
-                item.model = model
-        items.extend(mesh_items)
-        positions.append(posed + shift)
+                item.model = model.astype(np.float32)
+            items.extend(mesh_items)
+            world = posed @ model[:3, :3].T + model[:3, 3]
+            positions.append(world.astype(np.float32))
+        else:
+            items.extend(mesh_items)
+            positions.append(posed)
     if not items:
         return [], None, 0.0
 
@@ -637,7 +677,7 @@ def cmd_character(args) -> int:
         pose = _parse_pose(args.pose)
         replace = False
         if args.anim:
-            # 实验性：动画键是绝对局部旋转，直接替换绑定姿势
+            # 实验性：_anim_pose 已把绑定旋转合进矩阵，这里直接替换局部旋转
             pose = _anim_pose(store, args.anim, args.frame)
             replace = True
         items, center, radius = _character_items(store, chr_id, args.no_texture, args.flip_uv,
