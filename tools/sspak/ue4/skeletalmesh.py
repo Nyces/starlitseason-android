@@ -62,9 +62,12 @@ class SkeletalMesh:
                            dtype=np.float64)
         return _accumulate(self.bones, locals_)
 
-    def posed_positions(self, rotations: dict[str, np.ndarray] | None = None) -> np.ndarray:
-        """按骨骼旋转（父空间，绕骨骼原点）重新蒙皮，返回顶点位置。
+    def posed_positions(self, rotations: dict[str, np.ndarray] | None = None,
+                        replace: bool = False) -> np.ndarray:
+        """按骨骼旋转重新蒙皮，返回顶点位置。
 
+        rotations 是「父空间、绕骨骼原点」的旋转；默认叠加在绑定姿势上。
+        replace=True 时直接用旋转替换绑定姿势的旋转（动画键就是绝对局部旋转）。
         rotations 为空时返回绑定姿势的顶点（应与 positions 一致）。
         """
         if self.influence_bones is None or self.bind_pose is None:
@@ -77,7 +80,11 @@ class SkeletalMesh:
             if bone is None:
                 continue
             local = locals_[bone].copy()
-            local[:3, :3] = np.asarray(rotation, dtype=np.float64) @ local[:3, :3]
+            scale = np.asarray(self.bind_pose[bone][7:10], dtype=np.float64)
+            if replace:
+                local[:3, :3] = np.asarray(rotation, dtype=np.float64) * scale
+            else:
+                local[:3, :3] = np.asarray(rotation, dtype=np.float64) @ local[:3, :3]
             locals_[bone] = local
 
         globals_ = _accumulate(self.bones, locals_)
