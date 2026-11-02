@@ -492,14 +492,42 @@ def _flip_uv(uvs, mode: str):
     return np.asarray(out, dtype=np.float32)
 
 
-def _skeletal_items(store, asset: str, no_texture: bool, flip: str = ""):
+def _parse_pose(specs: list[str] | None):
+    """解析 --pose：骨骼名:轴:角度，轴取 x/y/z，可重复。"""
+    import numpy as np
+
+    pose = {}
+    for spec in specs or []:
+        parts = spec.split(":")
+        if len(parts) != 3 or parts[1].lower() not in ("x", "y", "z"):
+            raise SystemExit(f"--pose 需要 骨骼名:轴:角度（轴为 x/y/z），收到 {spec!r}")
+        name, axis, angle = parts[0], parts[1].lower(), float(parts[2])
+        angle = np.radians(angle)
+        c, s = np.cos(angle), np.sin(angle)
+        if axis == "x":
+            rotation = np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
+        elif axis == "y":
+            rotation = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float64)
+        else:
+            rotation = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
+        pose[name] = rotation
+    return pose
+
+
+def _skeletal_items(store, asset: str, no_texture: bool, flip: str = "", pose=None):
     from .ue4.skeletalmesh import parse_skeletal_mesh
     from .render import SceneItem
 
     package = store.package(asset)
     if package is None:
-        return [], None
+        return [], None, None
     mesh = parse_skeletal_mesh(package)
+    positions = mesh.positions
+    if pose:
+        try:
+            positions = mesh.posed_positions(pose)
+        except Exception as exc:  # noqa: BLE001 - 蒙皮失败时退回绑定姿势
+            print(f"  [warn] 蒙皮失败 {asset.rsplit('/', 1)[-1]}: {exc}")
     items = []
     for section in mesh.sections:
         start = section.base_index
@@ -512,12 +540,13 @@ def _skeletal_items(store, asset: str, no_texture: bool, flip: str = ""):
         toon = ToonMaterial() if no_texture else _toon_params(store, slot)
         if slot and "outline" in slot.lower():
             toon.outline = True               # 描边是网格里烘焙的反向壳，剔除正面再画
-        items.append(toon.item(mesh.positions, indices, _flip_uv(mesh.uvs, flip)))
-    return items, mesh
+        items.append(toon.item(positions, indices, _flip_uv(mesh.uvs, flip)))
+    return items, mesh, positions
 
 
-def _character_items(store, chr_id: str, no_texture: bool, flip: str = "", verbose: bool = True):
-    """加载身体/脸/头发/饰品（绑定姿势），返回 (items, 包围盒中心, 半径)。"""
+def _character_items(store, chr_id: str, no_texture: bool, flip: str = "", verbose: bool = True,
+                     pose=None):
+    """加载身体/脸/头发/饰品（绑定姿势，可按骨骼名摆姿势），返回 (items, 中心, 半径)。"""
     import numpy as np
 
     candidates = [
@@ -530,13 +559,13 @@ def _character_items(store, chr_id: str, no_texture: bool, flip: str = "", verbo
     positions = []
     head_center = None
     for asset in candidates:
-        mesh_items, mesh = _skeletal_items(store, asset, no_texture, flip)
+        mesh_items, mesh, posed = _skeletal_items(store, asset, no_texture, flip, pose)
         if not mesh_items:
             continue
         if verbose:
             print(f"  {asset.rsplit('/', 1)[-1]}: {len(mesh.positions)} 顶点 / "
                   f"{len(mesh.sections)} 分段 / {len(mesh.bones)} 骨骼")
-        lo, hi = mesh.positions.min(axis=0), mesh.positions.max(axis=0)
+        lo, hi = posed.min(axis=0), posed.max(axis=0)
         center = (lo + hi) * 0.5
         shift = np.zeros(3, dtype=np.float32)
         if asset.endswith("_face"):
@@ -549,7 +578,7 @@ def _character_items(store, chr_id: str, no_texture: bool, flip: str = "", verbo
                 model[:3, 3] = shift
                 item.model = model
         items.extend(mesh_items)
-        positions.append(mesh.positions + shift)
+        positions.append(posed + shift)
     if not items:
         return [], None, 0.0
 
@@ -571,7 +600,8 @@ def cmd_character(args) -> int:
 
         store = ContentStore(paks)
         chr_id = args.chr
-        items, center, radius = _character_items(store, chr_id, args.no_texture, args.flip_uv)
+        items, center, radius = _character_items(store, chr_id, args.no_texture, args.flip_uv,
+                                                 pose=_parse_pose(args.pose))
         if not items:
             raise SystemExit("没有可渲染的骨骼网格")
 
@@ -708,7 +738,8 @@ def cmd_scene(args) -> int:
         character_radius = 0.0
         if args.character:
             char_items, character_center, character_radius = _character_items(
-                store, args.character, args.no_texture, args.flip_uv, verbose=False)
+                store, args.character, args.no_texture, args.flip_uv, verbose=False,
+                pose=_parse_pose(args.pose))
             if not char_items:
                 raise SystemExit(f"没有可渲染的角色: {args.character}")
             items.extend(char_items)
@@ -950,6 +981,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_scene.add_argument("--light", help="光照方向 x,y,z（指向光源）")
     p_scene.add_argument("--limit", type=int, default=0, help="最多装载多少个网格")
     p_scene.add_argument("--character", help="把角色（绑定姿势）放进场景，例如 chr0101")
+    p_scene.add_argument("--pose", action="append",
+                         help="按骨骼名摆角色姿势：骨骼名:轴:角度（轴为 x/y/z），可重复")
     p_scene.add_argument("--flip-uv", default="", choices=["", "none", "u", "v", "uv"],
                          help="翻转 UV 轴，用于排查贴图方向")
     p_scene.add_argument("--no-texture", action="store_true", help="只渲染纯色")
@@ -982,6 +1015,8 @@ def build_parser() -> argparse.ArgumentParser:
                              help="固定曝光（关卡 PostProcess 为 1.0）")
     p_character.add_argument("--light", help="光照方向 x,y,z（指向光源）")
     p_character.add_argument("--no-texture", action="store_true", help="只渲染纯色")
+    p_character.add_argument("--pose", action="append",
+                             help="按骨骼名摆姿势：骨骼名:轴:角度（轴为 x/y/z），可重复")
     p_character.add_argument("--flip-uv", default="", choices=["", "none", "u", "v", "uv"],
                              help="翻转 UV 轴，用于排查贴图方向")
     p_character.set_defaults(func=cmd_character)

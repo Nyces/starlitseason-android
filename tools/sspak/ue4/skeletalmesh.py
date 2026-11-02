@@ -36,6 +36,7 @@ class SkinSection:
     num_triangles: int
     base_vertex_index: int
     num_vertices: int
+    bone_map: np.ndarray | None = None      # 分段内骨骼下标 -> ReferenceSkeleton 下标
 
 
 @dataclass
@@ -46,6 +47,83 @@ class SkeletalMesh:
     uvs: np.ndarray | None = None
     material_slots: list[str] = field(default_factory=list)
     bones: list[tuple[str, int]] = field(default_factory=list)
+    # 绑定姿势：每骨骼的本地 FTransform（四元数 xyzw + 平移 + 缩放）
+    bind_pose: np.ndarray | None = None
+    # 蒙皮：每顶点 4 个 (骨骼索引, 权重)；骨骼索引是 LOD 骨骼表的下标
+    influence_bones: np.ndarray | None = None
+    influence_weights: np.ndarray | None = None
+    bone_map: np.ndarray | None = None       # LOD 骨骼下标 -> ReferenceSkeleton 下标
+
+    def bind_matrices(self) -> np.ndarray:
+        """绑定姿势下每根骨骼的全局矩阵。"""
+        if not self.bones:
+            raise SkeletalMeshError("没有骨骼")
+        locals_ = np.array([_transform_matrix(self.bind_pose[i]) for i in range(len(self.bones))],
+                           dtype=np.float64)
+        return _accumulate(self.bones, locals_)
+
+    def posed_positions(self, rotations: dict[str, np.ndarray] | None = None) -> np.ndarray:
+        """按骨骼旋转（父空间，绕骨骼原点）重新蒙皮，返回顶点位置。
+
+        rotations 为空时返回绑定姿势的顶点（应与 positions 一致）。
+        """
+        if self.influence_bones is None or self.bind_pose is None:
+            raise SkeletalMeshError("缺少蒙皮数据")
+        index = {name: i for i, (name, _) in enumerate(self.bones)}
+        locals_ = np.array([_transform_matrix(self.bind_pose[i]) for i in range(len(self.bones))],
+                           dtype=np.float64)
+        for name, rotation in (rotations or {}).items():
+            bone = index.get(name)
+            if bone is None:
+                continue
+            local = locals_[bone].copy()
+            local[:3, :3] = np.asarray(rotation, dtype=np.float64) @ local[:3, :3]
+            locals_[bone] = local
+
+        globals_ = _accumulate(self.bones, locals_)
+        bind = _accumulate(self.bones, np.array(
+            [_transform_matrix(self.bind_pose[i]) for i in range(len(self.bones))],
+            dtype=np.float64))
+        skin = globals_ @ np.linalg.inv(bind)             # (B,4,4)
+
+        used = np.zeros(len(self.bones), dtype=bool)
+        used[self.influence_bones] = True
+        if not used.all():                                # 未参与蒙皮的骨骼不必求逆
+            skin[~used] = np.eye(4, dtype=np.float64)
+
+        weights = self.influence_weights.astype(np.float64)      # (N,4)
+        matrices = skin[self.influence_bones]                    # (N,4,4,4)
+        rotated = np.einsum("nkij,nj->nki", matrices[..., :3, :3], self.positions)
+        moved = rotated + matrices[..., :3, 3]
+        return np.einsum("nk,nki->ni", weights, moved).astype(np.float32)
+
+
+def _quat_matrix(q) -> np.ndarray:
+    """UE 的 FQuat（x, y, z, w）转 3×3 旋转矩阵。"""
+    x, y, z, w = (float(v) for v in q)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]],
+        dtype=np.float64)
+
+
+def _transform_matrix(transform) -> np.ndarray:
+    """FTransform（四元数 + 平移 + 缩放）转 4×4 矩阵。"""
+    matrix = np.eye(4, dtype=np.float64)
+    scale = np.asarray(transform[7:10], dtype=np.float64)
+    matrix[:3, :3] = _quat_matrix(transform[:4]) * scale
+    matrix[:3, 3] = np.asarray(transform[4:7], dtype=np.float64)
+    return matrix
+
+
+def _accumulate(bones: list[tuple[str, int]], locals_: np.ndarray) -> np.ndarray:
+    """按父索引把本地矩阵累乘成全局矩阵。"""
+    out = np.zeros_like(locals_)
+    for i in range(len(bones)):
+        parent = bones[i][1]
+        out[i] = locals_[i] if parent < 0 or parent >= len(bones) else out[parent] @ locals_[i]
+    return out
 
 
 def _i32(data: bytes, pos: int) -> int:
@@ -68,14 +146,17 @@ def _section(data: bytes, pos: int) -> tuple[SkinSection, int]:
         count = _i32(data, pos)
         pos += 4 + count * MESH_TO_MESH_VERT_DATA
     bone_map = _i32(data, pos)
-    pos += 4 + bone_map * 2
+    pos += 4
+    section_bones = np.frombuffer(data, dtype="<u2", count=bone_map, offset=pos).astype(np.int32)
+    pos += bone_map * 2
     num_vertices = _i32(data, pos)
     pos += 4 + 4                                 # NumVertices + MaxBoneInfluences
     pos += 2 + 20                                # CorrespondClothAssetIndex + FClothingSectionData
     pos += 4 + _i32(data, pos) * 4               # DuplicatedVertices
     pos += 4 + _i32(data, pos) * 8               # DupVertIndexData
     pos += 4                                     # bDisabled
-    return SkinSection(material_index, base_index, num_triangles, base_vertex, num_vertices), pos
+    return SkinSection(material_index, base_index, num_triangles, base_vertex, num_vertices,
+                       section_bones), pos
 
 
 def parse_skeletal_mesh(package: Package) -> SkeletalMesh:
@@ -105,7 +186,10 @@ def parse_skeletal_mesh(package: Package) -> SkeletalMesh:
         bones.append((name, parent))
         pos += 12
     pose_count = _i32(data, pos)
-    pos += 4 + pose_count * 40                   # FTransform = 四元数 + 平移 + 缩放
+    pos += 4
+    poses = np.frombuffer(data, dtype="<f4", count=pose_count * 10, offset=pos)
+    poses = poses.reshape(-1, 10).astype(np.float32)
+    pos += pose_count * 40
     name_map = _i32(data, pos)
     pos += 4 + name_map * 12
 
@@ -122,7 +206,9 @@ def parse_skeletal_mesh(package: Package) -> SkeletalMesh:
     if cooked_out:
         raise SkeletalMeshError("LOD0 被剔除")
     required = _i32(data, pos)
-    pos += 4 + required * 2
+    pos += 4
+    bone_map = np.frombuffer(data, dtype="<u2", count=required, offset=pos).astype(np.int32)
+    pos += required * 2
 
     section_count = _i32(data, pos)
     pos += 4
@@ -183,8 +269,35 @@ def parse_skeletal_mesh(package: Package) -> SkeletalMesh:
                             count=uv_count * 2, offset=uv_offset)
         # 每顶点 num_texcoords 套 UV，只取第 0 套
         uvs = raw.reshape(num_vertices, num_texcoords, 2)[:, 0, :].astype(np.float32)
+    pos = uv_offset + uv_size * uv_count
+
+    # 蒙皮权重：头部 5 个 int32（变量骨骼标志、stride、顶点数、元素大小、元素个数），
+    # 数据是每顶点 4 个 uint8 骨骼下标 + 4 个 uint8 权重
+    pos += 2                                     # 蒙皮权重 FStripDataFlags
+    _, _, weight_vertices, weight_stride, weight_count = struct.unpack_from("<5i", data, pos)
+    pos += 20
+    if weight_stride != 8 or weight_count != num_vertices or weight_vertices != num_vertices:
+        raise SkeletalMeshError(
+            f"蒙皮权重缓冲异常 stride={weight_stride} count={weight_count}")
+    raw = np.frombuffer(data, dtype=np.uint8, count=weight_count * weight_stride,
+                        offset=pos).reshape(weight_count, weight_stride)
+    lod_bones = raw[:, :4].astype(np.int32)
+    influence_weights = raw[:, 4:].astype(np.float32) / 255.0
+    # 权重里的骨骼下标是「分段内局部下标」，要按分段的 BoneMap 换成 ReferenceSkeleton 下标
+    influence_bones = lod_bones
+    for section in sections:
+        if section.bone_map is None or section.bone_map.size == 0:
+            continue
+        lo = section.base_vertex_index
+        hi = lo + section.num_vertices
+        local = lod_bones[lo:hi]
+        mapped = section.bone_map[np.clip(local, 0, section.bone_map.size - 1)]
+        influence_bones = influence_bones.copy()
+        influence_bones[lo:hi] = np.where(local < section.bone_map.size, mapped, local)
 
     if len(indices) == 0 or int(indices.max()) >= num_vertices:
         raise SkeletalMeshError("索引越界")
     return SkeletalMesh(positions=positions, indices=indices, sections=sections,
-                        uvs=uvs, material_slots=slots, bones=bones)
+                        uvs=uvs, material_slots=slots, bones=bones,
+                        bind_pose=poses, influence_bones=influence_bones,
+                        influence_weights=influence_weights, bone_map=bone_map)
