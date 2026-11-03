@@ -551,18 +551,30 @@ def _anim_pose(store, anim: str, frame: int) -> dict:
     names, binds = _master_bones(store)
     pose = {}
     relative = 0
-    for bone, xyz in sequence.sample(frame).items():
-        if not 0 <= bone < len(names):
+    skipped = 0
+    from .ue4.anim import _sample_keys
+
+    for t, bone in enumerate(sequence.bone_indices):
+        bone = int(bone)
+        keys = sequence.rotations[t]
+        if len(keys) == 0 or not 0 <= bone < len(names):
             continue
-        rotation = quat_matrix(xyz)
-        if _rotation_angle(rotation) < _rotation_angle(rotation.T @ binds[bone]) \
-                and _rotation_angle(rotation) > 1.0:
+        rotation = quat_matrix(_sample_keys(keys, frame, sequence.num_frames))
+        angle = _rotation_angle(rotation)
+        deviation = _rotation_angle(rotation.T @ binds[bone])
+        use_delta = angle < deviation and angle > 1.0
+        if len(keys) == 1 and deviation > 115.0 and _rotation_angle(binds[bone]) < 5.0:
+            # 绑定≈单位旋转、单键却差 115° 以上：偏移表串到了别的骨骼的键块（实测 SO_Spine2）
+            skipped += 1
+            continue
+        if use_delta:
             pose[names[bone]] = rotation @ binds[bone]
             relative += 1
         else:
             pose[names[bone]] = rotation
     print(f"  动画 {anim.rsplit('/', 1)[-1]}：{len(sequence.bone_indices)} 轨 / "
-          f"{sequence.num_frames} 帧 / 自检 {sequence.quality:.2f} / 增量解释 {relative} 轨")
+          f"{sequence.num_frames} 帧 / 自检 {sequence.quality:.2f} / "
+          f"增量 {relative} 轨 / 钳制 {skipped} 轨")
     return pose
 
 
