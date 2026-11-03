@@ -281,17 +281,25 @@ def parse_skeletal_mesh(package: Package) -> SkeletalMesh:
     pos = uv_offset + uv_size * uv_count
 
     # 蒙皮权重：头部 5 个 int32（变量骨骼标志、stride、顶点数、元素大小、元素个数），
-    # 数据是每顶点 4 个 uint8 骨骼下标 + 4 个 uint8 权重
+    # 数据前半是骨骼下标、后半是权重；4 影响时 8 字节，8 影响时 16 字节
     pos += 2                                     # 蒙皮权重 FStripDataFlags
     _, _, weight_vertices, weight_stride, weight_count = struct.unpack_from("<5i", data, pos)
     pos += 20
-    if weight_stride != 8 or weight_count != num_vertices or weight_vertices != num_vertices:
+    if weight_stride not in (8, 16) or weight_count != num_vertices \
+            or weight_vertices != num_vertices:
         raise SkeletalMeshError(
             f"蒙皮权重缓冲异常 stride={weight_stride} count={weight_count}")
-    raw = np.frombuffer(data, dtype=np.uint8, count=weight_count * weight_stride,
-                        offset=pos).reshape(weight_count, weight_stride)
-    lod_bones = raw[:, :4].astype(np.int32)
-    influence_weights = raw[:, 4:].astype(np.float32) / 255.0
+    if weight_stride == 8:
+        raw = np.frombuffer(data, dtype=np.uint8, count=weight_count * 8,
+                            offset=pos).reshape(weight_count, 8)
+        lod_bones = raw[:, :4].astype(np.int32)
+        influence_weights = raw[:, 4:].astype(np.float32) / 255.0
+    else:
+        # 16 字节/顶点：前 8 字节仍是 4 下标 + 4 权重，后 8 字节是空的扩展槽
+        raw = np.frombuffer(data, dtype=np.uint8, count=weight_count * 16,
+                            offset=pos).reshape(weight_count, 16)
+        lod_bones = raw[:, :4].astype(np.int32)
+        influence_weights = raw[:, 4:8].astype(np.float32) / 255.0
     # 权重里的骨骼下标是「分段内局部下标」，要按分段的 BoneMap 换成 ReferenceSkeleton 下标
     influence_bones = lod_bones
     for section in sections:
