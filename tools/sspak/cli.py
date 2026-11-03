@@ -598,7 +598,7 @@ def _skeletal_items(store, asset: str, no_texture: bool, flip: str = "", pose=No
 
 
 def _head_attachment(mesh, pose, replace: bool):
-    """头部骨骼的刚性变换（G_pose · G_bind⁻¹），供没有头部骨骼的头发/饰品跟随。"""
+    """头部骨骼的刚性变换 + 绑定位置的平移，供头部局部空间的头发/饰品跟随。"""
     import numpy as np
 
     names = [b[0] for b in mesh.bones]
@@ -607,7 +607,10 @@ def _head_attachment(mesh, pose, replace: bool):
             i = names.index(bone)
             posed = mesh.posed_globals(pose, replace)
             bind = mesh.bind_matrices()
-            return posed[i] @ np.linalg.inv(bind[i])
+            transform = posed[i] @ np.linalg.inv(bind[i])
+            place = np.eye(4)
+            place[:3, 3] = bind[i][:3, 3]
+            return transform @ place
     return np.eye(4)
 
 
@@ -624,10 +627,9 @@ def _character_items(store, chr_id: str, no_texture: bool, flip: str = "", verbo
     ]
     items = []
     positions = []
-    head_bind_center = None
     head_matrix = np.eye(4, dtype=np.float64)
     for asset in candidates:
-        # 头发/饰品的骨骼里没有头部骨骼，不能直接吃身体动画，改用头部刚性变换跟随
+        # 头发/饰品的顶点在头部局部空间，骨骼里没有身体头部骨骼，改用头部刚性变换跟随
         attached = asset.endswith(("_hair", "_orna"))
         mesh_items, mesh, posed = _skeletal_items(
             store, asset, no_texture, flip, None if attached else pose, replace)
@@ -636,19 +638,13 @@ def _character_items(store, chr_id: str, no_texture: bool, flip: str = "", verbo
         if verbose:
             print(f"  {asset.rsplit('/', 1)[-1]}: {len(mesh.positions)} 顶点 / "
                   f"{len(mesh.sections)} 分段 / {len(mesh.bones)} 骨骼")
-        bind_center = (mesh.positions.min(axis=0) + mesh.positions.max(axis=0)) * 0.5
-        if asset.endswith("_face"):
-            head_bind_center = bind_center
-        elif not attached and pose:
+        if not attached:
             head_matrix = _head_attachment(mesh, pose, replace)
-        if attached and head_bind_center is not None:
-            shift = np.eye(4, dtype=np.float64)
-            shift[:3, 3] = head_bind_center - bind_center
-            model = head_matrix @ shift
+        if attached:
             for item in mesh_items:
-                item.model = model.astype(np.float32)
+                item.model = head_matrix.astype(np.float32)
             items.extend(mesh_items)
-            world = posed @ model[:3, :3].T + model[:3, 3]
+            world = posed @ head_matrix[:3, :3].T + head_matrix[:3, 3]
             positions.append(world.astype(np.float32))
         else:
             items.extend(mesh_items)
