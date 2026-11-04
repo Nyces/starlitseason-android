@@ -515,7 +515,7 @@ def _parse_pose(specs: list[str] | None):
 
 
 def _master_bones(store):
-    """主骨架（SK_chr_all_bone）的骨骼名与绑定旋转矩阵。"""
+    """主骨架（SK_chr_all_bone）的骨骼名、绑定旋转矩阵与父索引。"""
     from .ue4.skeletalmesh import _quat_matrix, parse_skeletal_mesh
 
     package = store.package("Model/Character/Body/Base/chr_body_base/Mesh/SK_chr_all_bone")
@@ -524,7 +524,8 @@ def _master_bones(store):
     mesh = parse_skeletal_mesh(package)
     names = [name for name, _ in mesh.bones]
     binds = [_quat_matrix(pose[:4]) for pose in mesh.bind_pose]
-    return names, binds
+    parents = [parent for _, parent in mesh.bones]
+    return names, binds, parents
 
 
 def _rotation_angle(matrix) -> float:
@@ -549,7 +550,7 @@ def _anim_pose(store, anim: str, frame: int) -> dict:
         sequence = parse_animation(package)
     except AnimSequenceError as exc:
         raise SystemExit(f"动画解析失败 {anim}: {exc}") from exc
-    names, binds = _master_bones(store)
+    names, binds, parents = _master_bones(store)
     pose = {}
     relative = 0
     skipped = 0
@@ -564,15 +565,48 @@ def _anim_pose(store, anim: str, frame: int) -> dict:
             continue
         shared.setdefault(tuple(np.round(np.asarray(keys[0], dtype=np.float64), 3)), []).append(t)
 
+    def track_of(bone: int):
+        for t, index in enumerate(sequence.bone_indices):
+            if int(index) == bone and len(sequence.rotations[t]) == 1:
+                return sequence.rotations[t][0]
+        return None
+
     for t, bone in enumerate(sequence.bone_indices):
         bone = int(bone)
         keys = sequence.rotations[t]
         if len(keys) == 0 or not 0 <= bone < len(names):
             continue
+        if any(tag in names[bone] for tag in ("Eye", "Iris", "Highlight", "Facial",
+                                             "Double", "Tongue")):
+            # 整个脸部骨架由单独的 *_facial_* 动画驱动；身体动画里这些轨道是被串块污染的，
+            # 照应用会让眼珠/眼白错位（chr0105 斗鸡眼、chr0107/0111/0502 只亮一只眼），
+            # 而且脸部皮肤和眼珠会各转各的、皮肤插进眼睛。
+            skipped += 1
+            continue
+        if names[bone].startswith("SC_"):
+            # SC_ 是控制骨：子骨已经写了同一个键时再转一次会把这段骨骼转两倍
+            # （SC_Head 与 AO_Head 共用 9° 的键，头实际转了 17.5°，chr0103 右眼被拉斜）。
+            for child, parent in enumerate(parents):
+                if parent != bone:
+                    continue
+                child_key = track_of(child)
+                if child_key is not None and np.allclose(
+                        np.asarray(child_key, dtype=np.float64),
+                        np.asarray(keys[0], dtype=np.float64), atol=0.01):
+                    skipped += 1
+                    child_skip = True
+                    break
+            else:
+                child_skip = False
+            if child_skip:
+                continue
         rotation = quat_matrix(_sample_keys(keys, frame, sequence.num_frames))
         angle = _rotation_angle(rotation)
         deviation = _rotation_angle(rotation.T @ binds[bone])
-        use_delta = angle < deviation and angle > 1.0
+        # 键接近单位旋转、绑定却转了 90° 以上：这条轨道表示「保持绑定姿势」。
+        # 以前用 angle > 1.0 把它排除，结果 AO_Hips 的绑定是 90°、键是 0.4°，
+        # 被当成绝对旋转覆盖掉，整条腿翻到身后（chr0104 没有腿）。
+        use_delta = angle < deviation
         if len(keys) == 1 and deviation > 115.0 and _rotation_angle(binds[bone]) < 5.0:
             # 绑定≈单位旋转、单键却差 115° 以上：偏移表串到了别的骨骼的键块（实测 SO_Spine2）
             skipped += 1
