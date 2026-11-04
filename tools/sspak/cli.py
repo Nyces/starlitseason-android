@@ -540,6 +540,7 @@ def _anim_pose(store, anim: str, frame: int) -> dict:
     偏差更小的解释——待机类动画不会把骨头拧出大角度，这比全局二选一更稳。
     """
     from .ue4.anim import AnimSequenceError, parse_animation, quat_matrix
+    import numpy as np
 
     package = store.package(anim)
     if package is None:
@@ -554,6 +555,15 @@ def _anim_pose(store, anim: str, frame: int) -> dict:
     skipped = 0
     from .ue4.anim import _sample_keys
 
+    # 同一份单键数据被多条互不相关的轨道共用：压缩键块串了位置，不是各骨骼各自的键。
+    # 例子是 chr0103 待机里的 GR_Facial/GR_Eye/PR_Eye/AO_Eye/SO_Spine2/CS_Chest/PS_Breast，
+    # 它们共用一个约 120° 的值（恰是肩胸链的绑定旋转），照原样应用会把眼珠甩出眼眶、胸部撕裂。
+    shared: dict[tuple, list[int]] = {}
+    for t, keys in enumerate(sequence.rotations):
+        if len(keys) != 1:
+            continue
+        shared.setdefault(tuple(np.round(np.asarray(keys[0], dtype=np.float64), 3)), []).append(t)
+
     for t, bone in enumerate(sequence.bone_indices):
         bone = int(bone)
         keys = sequence.rotations[t]
@@ -565,6 +575,11 @@ def _anim_pose(store, anim: str, frame: int) -> dict:
         use_delta = angle < deviation and angle > 1.0
         if len(keys) == 1 and deviation > 115.0 and _rotation_angle(binds[bone]) < 5.0:
             # 绑定≈单位旋转、单键却差 115° 以上：偏移表串到了别的骨骼的键块（实测 SO_Spine2）
+            skipped += 1
+            continue
+        if (len(keys) == 1 and deviation > 90.0
+                and len(shared.get(tuple(np.round(np.asarray(keys[0], dtype=np.float64), 3)), [])) >= 2):
+            # 单键、离绑定 90° 以上，且同样的键被两条以上轨道共用：属于串块的键，跳过
             skipped += 1
             continue
         if use_delta:
@@ -610,11 +625,15 @@ def _skeletal_items(store, asset: str, no_texture: bool, flip: str = "", pose=No
 
 
 def _head_attachment(mesh, pose, replace: bool):
-    """头部骨骼的刚性变换 + 绑定位置的平移，供头部局部空间的头发/饰品跟随。"""
+    """头部骨骼的刚性变换 + 绑定位置的平移，供头部局部空间的头发/饰品跟随。
+
+    取 SO_Head：脸部蒙皮几乎全部绑在它上面（SC_Head/AO_Head 只是它的父级），
+    用父级会让头发比脸少转几度，刘海就压到眼睛上。
+    """
     import numpy as np
 
     names = [b[0] for b in mesh.bones]
-    for bone in ("SC_Head", "AO_Head"):
+    for bone in ("SO_Head", "AO_Head", "SC_Head"):
         if bone in names:
             i = names.index(bone)
             posed = mesh.posed_globals(pose, replace)
