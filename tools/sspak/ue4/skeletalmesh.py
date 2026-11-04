@@ -295,11 +295,16 @@ def parse_skeletal_mesh(package: Package) -> SkeletalMesh:
         lod_bones = raw[:, :4].astype(np.int32)
         influence_weights = raw[:, 4:].astype(np.float32) / 255.0
     else:
-        # 16 字节/顶点：前 8 字节仍是 4 下标 + 4 权重，后 8 字节是空的扩展槽
+        # 16 字节/顶点是 8 影响：前 8 字节是骨骼下标，后 8 字节是权重
         raw = np.frombuffer(data, dtype=np.uint8, count=weight_count * 16,
                             offset=pos).reshape(weight_count, 16)
-        lod_bones = raw[:, :4].astype(np.int32)
-        influence_weights = raw[:, 4:8].astype(np.float32) / 255.0
+        lod_bones = raw[:, :8].astype(np.int32)
+        influence_weights = raw[:, 8:].astype(np.float32) / 255.0
+        keep = np.argsort(-influence_weights, axis=1)[:, :4]
+        lod_bones = np.take_along_axis(lod_bones, keep, axis=1)
+        influence_weights = np.take_along_axis(influence_weights, keep, axis=1)
+        total = influence_weights.sum(axis=1, keepdims=True)
+        influence_weights = np.divide(influence_weights, np.where(total > 0, total, 1.0))
     # 权重里的骨骼下标是「分段内局部下标」，要按分段的 BoneMap 换成 ReferenceSkeleton 下标
     influence_bones = lod_bones
     for section in sections:
