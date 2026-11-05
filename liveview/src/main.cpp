@@ -1,8 +1,9 @@
-// liveview —— live 演出验证程序（骨架）
+// liveview —— live 演出验证程序
 //
 // 当前能力：
 //   读取 live bundle、按 tick 采样相机、以时间轴方式逐帧推进（--play）。
-// 后续里程碑：Vulkan 渲染后端、舞台与角色数据接入、音轨同步。
+//   打开 LIVEVIEW_RENDER 后可用 --render 开窗口播放（Vulkan 清屏阶段）。
+// 后续里程碑：舞台与角色数据接入、音轨同步。
 
 #include <cstdio>
 #include <cstdlib>
@@ -11,6 +12,10 @@
 
 #include "bundle.h"
 
+#ifdef LIVEVIEW_RENDER
+#include "render_vulkan.h"
+#endif
+
 namespace {
 
 void PrintUsage() {
@@ -18,7 +23,8 @@ void PrintUsage() {
         "用法:\n"
         "  liveview <bundle>            打印包信息与首末关键帧\n"
         "  liveview <bundle> --at <帧>  输出该帧插值后的机位\n"
-        "  liveview <bundle> --play <秒> 按 tick 频率逐帧推进并打印机位\n");
+        "  liveview <bundle> --play <秒> 按 tick 频率逐帧推进并打印机位\n"
+        "  liveview <bundle> --render[=秒] 打开窗口按时间轴播放（需编译渲染后端）\n");
 }
 
 void PrintPose(const liveview::Bundle& bundle, double frame) {
@@ -76,6 +82,20 @@ int main(int argc, char** argv) {
             for (int64_t frame = 0; frame <= total; frame += display_step) {
                 PrintPose(bundle, static_cast<double>(frame));
             }
+        } else if (option == "--render" || option.rfind("--render=", 0) == 0) {
+#ifdef LIVEVIEW_RENDER
+            double seconds = -1.0;
+            if (option.size() > 9) {
+                seconds = std::atof(option.c_str() + 9);
+            } else if (i + 1 < argc && argv[i + 1][0] != '-') {
+                seconds = std::atof(argv[++i]);
+            }
+            return liveview::RunRender(bundle, seconds);
+#else
+            std::fprintf(stderr,
+                         "本构建未启用渲染后端（需用 -DLIVEVIEW_RENDER=ON 重新构建）\n");
+            return 1;
+#endif
         } else {
             PrintUsage();
             return 1;

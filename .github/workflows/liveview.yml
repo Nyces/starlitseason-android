@@ -52,3 +52,24 @@ jobs:
         with:
           name: liveview-windows
           path: build/Release/liveview.exe
+
+  # 渲染后端是可选构建：CI 上没有 GPU，只验证能编译通过。
+  render:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (LIVEVIEW_RENDER=ON)
+        run: cmake -S liveview -B build-render -DCMAKE_BUILD_TYPE=Release -DLIVEVIEW_RENDER=ON
+
+      - name: Build
+        run: cmake --build build-render --config Release --parallel
+
+      - name: Check binary
+        shell: pwsh
+        run: |
+          $exe = "build-render/Release/liveview.exe"
+          if (-not (Test-Path $exe)) { throw "未生成启用了渲染的 liveview.exe" }
+          & $exe --help
+          if ($LASTEXITCODE -ne 0) { throw "liveview --help 失败" }
+          Get-Item $exe | Select-Object Name, Length
