@@ -475,7 +475,7 @@ def cmd_preview(args) -> int:
             eye = center + np.array([radius * 1.9, -radius * 2.4, radius * 0.35], dtype=np.float32)
 
         render_scene(items, args.out, args.size, eye, target, args.exposure, args.fov,
-                     light=_vec3(args.light, (0.0, 0.0, 1.0)))
+                     light=_vec3(args.light, (0.0, 0.55, 0.83)))
         print(f"已渲染 {args.asset} -> {args.out}（{label}）")
         return 0
     finally:
@@ -779,7 +779,7 @@ def cmd_character(args) -> int:
             eye = center + np.array([0.0, -radius * 2.2, radius * 0.12], dtype=np.float32)
 
         render_scene(items, args.out, args.size, eye, target, args.exposure, args.fov,
-                     light=_vec3(args.light, (0.0, 0.0, 1.0)))
+                     light=_vec3(args.light, (0.0, 0.55, 0.83)))
         print(f"已渲染 {chr_id} -> {args.out}")
         return 0
     finally:

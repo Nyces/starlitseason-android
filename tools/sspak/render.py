@@ -402,7 +402,9 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
                  eye: np.ndarray | None = None, target: np.ndarray | None = None,
                  exposure: float = 1.0, fov: float = 45.0,
                  tint: tuple[float, float, float] = (0.78, 0.76, 0.72),
-                 light: tuple[float, float, float] = (0.0, 0.0, 1.0),
+                 # 默认主光来自前上方：正上方打光时 ToonBaseFace 的 dot(N,L) 分界线
+                 # 正好横落在鼻梁和两颊上，渲出一条横贯脸的色带。
+                 light: tuple[float, float, float] = (0.0, 0.55, 0.83),
                  shadow_intensity: float = 1.5,
                  lighting_intensity: float = 1.0,
                  shadow: bool = True, shadow_strength: float = 0.85,
