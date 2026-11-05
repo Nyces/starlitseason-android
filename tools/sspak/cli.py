@@ -1055,6 +1055,12 @@ def cmd_sequence(args) -> int:
                     f"{'∞' if s.start is None else s.start}..{'∞' if s.end is None else s.end}"
                     for s in track.sections) or "无"
                 print(f"      {track.class_name} 区段 {len(track.sections)} {spans}")
+                for section in track.sections:
+                    keys = sum(len(v) for v in section.channels.values())
+                    named = ", ".join(f"{k}({len(v)})"
+                                      for k, v in list(section.channels.items())[:4])
+                    print(f"         通道 {len(section.channels)} 个 / 关键帧 {keys} "
+                          f"{named}")
         return 0
     finally:
         for pak in paks:

@@ -38,6 +38,8 @@ class Section:
     class_name: str
     start: int | None            # None = Open（该侧没有边界）
     end: int | None
+    # 通道名 -> 关键帧 [(帧号, 值)]，只解析浮点通道
+    channels: dict[str, list[tuple[int, float]]] = field(default_factory=dict)
 
 
 @dataclass
@@ -121,15 +123,72 @@ def _struct_fields(data: bytes, names: list[str], prop: Property) -> list[Proper
     return inner
 
 
-def _section_range(pkg: Package, export_index: int) -> tuple[int, int, str]:
+# MovieSceneFloatChannel 的 Times / Values 数组：计数(4) + 结构体标签头(49) + 元素。
+TIMES_HEADER = 49
+TIMES_STRIDE = 4            # FFrameNumber: int32
+VALUES_STRIDE = 23          # float 值(4) + 三个模式字节(3) + 四个切线(16)
+
+
+def _float_channel(data: bytes, names: list[str], prop: Property) -> list[tuple[int, float]]:
+    """解出 MovieSceneFloatChannel 的关键帧 [(帧号, 值)]。"""
+    inner, _ = parse_properties(data, names, prop.offset)
+    times = next((p for p in inner if p.name == "Times"), None)
+    values = next((p for p in inner if p.name == "Values"), None)
+    if times is None or values is None:
+        return []
+    count = struct.unpack_from("<i", data, times.offset)[0]
+    if count <= 0:
+        return []
+    if times.size < 4 + TIMES_HEADER + count * TIMES_STRIDE:
+        return []
+    if values.size < 4 + TIMES_HEADER + count * VALUES_STRIDE:
+        return []
+    times_at = times.offset + 4 + TIMES_HEADER
+    values_at = values.offset + 4 + TIMES_HEADER
+    keys = []
+    for i in range(count):
+        frame = struct.unpack_from("<i", data, times_at + i * TIMES_STRIDE)[0]
+        value = struct.unpack_from("<f", data, values_at + i * VALUES_STRIDE)[0]
+        keys.append((int(frame), float(value)))
+    return keys
+
+
+def _collect_channels(data: bytes, names: list[str], prop: Property,
+                      out: dict[str, list[tuple[int, float]]]) -> None:
+    """递归收集一个结构体里的浮点通道。"""
+    if prop.type != "StructProperty":
+        return
+    struct_name = prop.struct_name or ""
+    if struct_name == "MovieSceneFloatChannel":
+        out[prop.name] = _float_channel(data, names, prop)
+        return
+    # 通道可能包在自定义结构里（LiveCameraMovementSection 的 Channels）
+    try:
+        inner, _ = parse_properties(data, names, prop.offset)
+    except Exception:  # noqa: BLE001 - 非标签结构体
+        return
+    for child in inner:
+        _collect_channels(data, names, child, out)
+
+
+def _section(pkg: Package, export_index: int) -> Section:
     export = pkg.exports[export_index - 1]
     data = pkg.export_bytes(export)
     props, _ = parse_properties(data, pkg.names)
+    start: int | None = None
+    end: int | None = None
     for prop in props:
         if prop.name == "SectionRange":
             start, end = _frame_range(data, prop)
-            return start, end, export.class_name
-    return 0, 0, export.class_name
+    section = Section(export_index=export_index, class_name=export.class_name,
+                      start=start, end=end)
+    for prop in props:
+        if prop.type != "StructProperty":
+            continue
+        if prop.name in ("Easing", "SectionRange", "Signature"):
+            continue
+        _collect_channels(data, pkg.names, prop, section.channels)
+    return section
 
 
 def _track(pkg: Package, export_index: int) -> Track:
@@ -145,9 +204,7 @@ def _track(pkg: Package, export_index: int) -> Track:
             index = struct.unpack_from("<i", data, prop.offset + 4 + i * 4)[0]
             if index <= 0:
                 continue
-            start, end, cls = _section_range(pkg, index)
-            track.sections.append(Section(export_index=index, class_name=cls,
-                                          start=start, end=end))
+            track.sections.append(_section(pkg, index))
     return track
 
 
