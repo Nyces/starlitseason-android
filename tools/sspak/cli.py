@@ -1023,6 +1023,44 @@ def _material_parameters(package) -> list[str]:
     return names
 
 
+def cmd_sequence(args) -> int:
+    """列出 LevelSequence 的绑定、轨道与区段范围。"""
+    from .ue4.sequence import SequenceError, parse_level_sequence
+
+    paks = _open_all(args)
+    try:
+        from .ue4.content import ContentStore
+
+        store = ContentStore(paks)
+        package = store.package(args.asset)
+        if package is None:
+            raise SystemExit(f"未找到资源: {args.asset}")
+        try:
+            info = parse_level_sequence(package)
+        except SequenceError as exc:
+            raise SystemExit(str(exc))
+        start = "∞" if info.play_start is None else f"{info.play_start}"
+        end = "∞" if info.play_end is None else f"{info.play_end}"
+        seconds = ""
+        if info.play_start is not None and info.play_end is not None and info.tick_fps:
+            seconds = f"（{(info.play_end - info.play_start) / info.tick_fps:.2f}s）"
+        print(f"播放范围 {start} .. {end} 帧{seconds}   "
+              f"tick={info.tick_fps:g}fps display={info.display_fps:g}fps")
+        print(f"占位对象 {len(info.possessables)} 个，绑定 {len(info.bindings)} 个")
+        for binding in info.bindings:
+            classes = sorted({track.class_name for track in binding.tracks})
+            print(f"  [{binding.name}] 轨道 {len(binding.tracks)} 条 {classes}")
+            for track in binding.tracks[:args.tracks]:
+                spans = ", ".join(
+                    f"{'∞' if s.start is None else s.start}..{'∞' if s.end is None else s.end}"
+                    for s in track.sections) or "无"
+                print(f"      {track.class_name} 区段 {len(track.sections)} {spans}")
+        return 0
+    finally:
+        for pak in paks:
+            pak.close()
+
+
 def cmd_shaders(args) -> int:
     """导出材质包里的 SM5 着色器：RDEF 摘要 + 反汇编全文。"""
     paks = _open_all(args)
@@ -1202,6 +1240,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_shaders.add_argument("--out", required=True, help="输出 TXT 路径")
     p_shaders.add_argument("--max", type=int, default=0, help="最多导出多少个着色器")
     p_shaders.set_defaults(func=cmd_shaders)
+
+    p_sequence = sub.add_parser("sequence", help="列出 LevelSequence 的绑定、轨道与区段")
+    p_sequence.add_argument("--asset", required=True, help="序列资源路径（不含扩展名）")
+    p_sequence.add_argument("--tracks", type=int, default=6, help="每个绑定最多列出多少条轨道")
+    p_sequence.set_defaults(func=cmd_sequence)
 
     return parser
 
