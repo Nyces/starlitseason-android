@@ -241,6 +241,7 @@ class ToonMaterial:
     outline: bool = False
     outline_color: tuple[float, float, float] = (0.16, 0.10, 0.09)
     outline_width: float = 0.0008
+    skip: bool = False                   # 腮红这类纯叠色层，当前不画
 
     def item(self, positions, indices, uvs=None, model=None):
         from .render import SceneItem
@@ -309,6 +310,15 @@ def _toon_params(store, material: str | None):
             result.unlit = True
     if result.texture is not None:          # 屏幕抓帧材质的占位色
         return result
+
+    # 腮红（材质名 *_constant）：底色参数指向整张脸贴图，真正要画的是
+    # CheekColor + CheekMaskTexture 蒙版叠色。按普通底色贴图画会变成一条横穿脸颊的色带，
+    # 还会压住眼珠（chr0103 右眼看起来像被切掉一块），所以整段直接不画。
+    if material and "constant" in material.lower():
+        for instance in chain:
+            if "CheekColor" in instance.vectors:
+                result.skip = True
+                return result
 
     line_intensity = None
     base_done = False
@@ -629,6 +639,8 @@ def _anim_pose(store, anim: str, frame: int) -> dict:
 
 def _skeletal_items(store, asset: str, no_texture: bool, flip: str = "", pose=None,
                     replace: bool = False):
+    import numpy as np
+
     from .ue4.skeletalmesh import parse_skeletal_mesh
     from .render import SceneItem
 
@@ -652,9 +664,17 @@ def _skeletal_items(store, asset: str, no_texture: bool, flip: str = "", pose=No
         slot = mesh.material_slots[section.material_index] \
             if section.material_index < len(mesh.material_slots) else None
         toon = ToonMaterial() if no_texture else _toon_params(store, slot)
+        if toon.skip:
+            continue
         if slot and "outline" in slot.lower():
             toon.outline = True               # 描边是网格里烘焙的反向壳，剔除正面再画
-        items.append(toon.item(positions, indices, _flip_uv(mesh.uvs, flip)))
+        verts = positions
+        if slot and slot.lower().endswith("_iris"):
+            # 虹膜片和眼球表面几乎共面（实测两者最前都到 y≈7.89），斜视时会互相穿插，
+            # 眼白盖掉半边虹膜（chr0103 右眼看着像瞳孔被切掉一块）。沿脸朝前推 0.5 单位。
+            verts = positions.copy()
+            verts[np.unique(indices), 1] += 0.5
+        items.append(toon.item(verts, indices, _flip_uv(mesh.uvs, flip)))
     return items, mesh, positions
 
 
