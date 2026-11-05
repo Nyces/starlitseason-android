@@ -1023,6 +1023,52 @@ def _material_parameters(package) -> list[str]:
     return names
 
 
+def cmd_live_bundle(args) -> int:
+    """把 LevelSequence 的相机轨道导出成 liveview 验证程序可直接读的文本包。"""
+    from .ue4.sequence import camera_pose, parse_level_sequence
+
+    paks = _open_all(args)
+    try:
+        from .ue4.content import ContentStore
+
+        store = ContentStore(paks)
+        package = store.package(args.asset)
+        if package is None:
+            raise SystemExit(f"未找到资源: {args.asset}")
+        info = parse_level_sequence(package)
+        binding = None
+        if args.binding:
+            binding = next((b for b in info.bindings if b.name == args.binding), None)
+        if binding is None:
+            binding = next((b for b in info.bindings
+                            if any(t.class_name == "LiveCameraMovementTrack"
+                                   for t in b.tracks)), info.bindings[0])
+        start = args.start if args.start is not None else (info.play_start or 0)
+        end = args.end if args.end is not None else (info.play_end or 0)
+        step = max(1, args.step)
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        written = 0
+        with open(args.out, "w", encoding="utf-8") as handle:
+            handle.write("#liveview-bundle 1\n")
+            handle.write(f"#asset {args.asset}\n")
+            handle.write(f"#binding {binding.name}\n")
+            handle.write(f"#tick {info.tick_fps:g}\n")
+            handle.write(f"#range {start} {end} {step}\n")
+            for frame in range(start, end + 1, step):
+                pose = camera_pose(binding, frame)
+                if pose is None:
+                    continue
+                pos, aim = pose.position, pose.target
+                handle.write(f"F {frame} {pos[0]:.4f} {pos[1]:.4f} {pos[2]:.4f} "
+                             f"{aim[0]:.4f} {aim[1]:.4f} {aim[2]:.4f}\n")
+                written += 1
+        print(f"已写出 {written} 帧机位 -> {args.out}（绑定 {binding.name}）")
+        return 0
+    finally:
+        for pak in paks:
+            pak.close()
+
+
 def cmd_sequence(args) -> int:
     """列出 LevelSequence 的绑定、轨道与区段范围。"""
     from .ue4.sequence import (SequenceError, camera_pose, parse_level_sequence,
@@ -1278,6 +1324,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_sequence.add_argument("--camera-frame", type=int, default=None,
                             help="在指定帧输出各相机绑定的机位（可直接喂给 --camera）")
     p_sequence.set_defaults(func=cmd_sequence)
+
+    p_bundle = sub.add_parser("live-bundle", help="导出 liveview 验证程序用的相机轨包")
+    p_bundle.add_argument("--asset", required=True, help="LevelSequence 资源路径（不含扩展名）")
+    p_bundle.add_argument("--out", required=True, help="输出文本包路径")
+    p_bundle.add_argument("--binding", help="相机绑定名（默认取第一个带 Movement 轨道的）")
+    p_bundle.add_argument("--start", type=int, default=None, help="起始帧")
+    p_bundle.add_argument("--end", type=int, default=None, help="结束帧")
+    p_bundle.add_argument("--step", type=int, default=240, help="采样步长（帧）")
+    p_bundle.set_defaults(func=cmd_live_bundle)
 
     return parser
 

@@ -1,0 +1,54 @@
+name: liveview
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "liveview/**"
+      - ".github/workflows/liveview.yml"
+  pull_request:
+    paths:
+      - "liveview/**"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S liveview -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $exe = "build/Release/liveview.exe"
+          if (-not (Test-Path $exe)) { throw "未生成 liveview.exe" }
+          $bundle = Join-Path $env:RUNNER_TEMP "smoke.bundle"
+          @(
+            "#liveview-bundle 1",
+            "#asset smoke",
+            "#binding CamAllA",
+            "#tick 24000",
+            "#range 0 480 240",
+            "F 0 0.0000 1000.0000 200.0000 0.0000 400.0000 200.0000",
+            "F 240 10.0000 990.0000 200.0000 0.0000 400.0000 200.0000",
+            "F 480 20.0000 980.0000 200.0000 0.0000 400.0000 200.0000"
+          ) | Set-Content -Path $bundle -Encoding ascii
+          & $exe $bundle
+          if ($LASTEXITCODE -ne 0) { throw "liveview 读取文本包失败" }
+          & $exe $bundle --at 120
+          if ($LASTEXITCODE -ne 0) { throw "liveview 采样失败" }
+          & $exe $bundle --play 0.02
+          if ($LASTEXITCODE -ne 0) { throw "liveview 时间轴推进失败" }
+          Get-Item $exe | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: liveview-windows
+          path: build/Release/liveview.exe
