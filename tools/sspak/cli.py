@@ -669,12 +669,23 @@ def _skeletal_items(store, asset: str, no_texture: bool, flip: str = "", pose=No
         if slot and "outline" in slot.lower():
             toon.outline = True               # 描边是网格里烘焙的反向壳，剔除正面再画
         verts = positions
+        uvs = _flip_uv(mesh.uvs, flip)
         if slot and slot.lower().endswith("_iris"):
             # 虹膜片和眼球表面几乎共面（实测两者最前都到 y≈7.89），斜视时会互相穿插，
             # 眼白盖掉半边虹膜（chr0103 右眼看着像瞳孔被切掉一块）。沿脸朝前推 0.5 单位。
             verts = positions.copy()
             verts[np.unique(indices), 1] += 0.5
-        items.append(toon.item(verts, indices, _flip_uv(mesh.uvs, flip)))
+        elif slot and slot.lower().endswith("_eyebase"):
+            # 眼白贴图大概率是两眼镜像的（chr0301 右眼外缘 u=0.021、左眼 0.979）。
+            # 但 chr0103/chr0102 两眼共用同一块 UV，右眼的虹膜会被画成相反的样子，
+            # 看上去一只眼正常、另一只眼色淡。这里检测到 U 两侧均值相同就补一次镜像。
+            left = positions[:, 0] < 0
+            if left.any() and (~left).any() and abs(float(uvs[left, 0].mean())
+                                                    - float(uvs[~left, 0].mean())) < 0.02:
+                uvs = uvs.copy()
+                centre = float(uvs[left, 0].mean())
+                uvs[left, 0] = 2.0 * centre - uvs[left, 0]
+        items.append(toon.item(verts, indices, uvs))
     return items, mesh, positions
 
 
