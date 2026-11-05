@@ -1025,7 +1025,7 @@ def _material_parameters(package) -> list[str]:
 
 def cmd_sequence(args) -> int:
     """列出 LevelSequence 的绑定、轨道与区段范围。"""
-    from .ue4.sequence import SequenceError, parse_level_sequence
+    from .ue4.sequence import SequenceError, parse_level_sequence, sample_section
 
     paks = _open_all(args)
     try:
@@ -1047,6 +1047,18 @@ def cmd_sequence(args) -> int:
         print(f"播放范围 {start} .. {end} 帧{seconds}   "
               f"tick={info.tick_fps:g}fps display={info.display_fps:g}fps")
         print(f"占位对象 {len(info.possessables)} 个，绑定 {len(info.bindings)} 个")
+        if args.sample is not None:
+            print(f"\n第 {args.sample} 帧采样：")
+            for binding in info.bindings[:4]:
+                for track in binding.tracks:
+                    for section in track.sections:
+                        values = sample_section(section, args.sample)
+                        if not values:
+                            continue
+                        shown = ", ".join(f"{k}={v:.2f}"
+                                          for k, v in list(values.items())[:6])
+                        print(f"  [{binding.name}] {track.class_name}: {shown}")
+            return 0
         for binding in info.bindings:
             classes = sorted({track.class_name for track in binding.tracks})
             print(f"  [{binding.name}] 轨道 {len(binding.tracks)} 条 {classes}")
@@ -1250,6 +1262,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sequence = sub.add_parser("sequence", help="列出 LevelSequence 的绑定、轨道与区段")
     p_sequence.add_argument("--asset", required=True, help="序列资源路径（不含扩展名）")
     p_sequence.add_argument("--tracks", type=int, default=6, help="每个绑定最多列出多少条轨道")
+    p_sequence.add_argument("--sample", type=int, default=None,
+                            help="在指定帧采样通道值（线性插值）")
     p_sequence.set_defaults(func=cmd_sequence)
 
     return parser

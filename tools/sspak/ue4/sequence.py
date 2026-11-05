@@ -208,6 +208,36 @@ def _track(pkg: Package, export_index: int) -> Track:
     return track
 
 
+def sample_channel(keys: list[tuple[int, float]], frame: float) -> float | None:
+    """在关键帧之间线性插值；超出两端时钳制。"""
+    if not keys:
+        return None
+    if frame <= keys[0][0]:
+        return keys[0][1]
+    if frame >= keys[-1][0]:
+        return keys[-1][1]
+    for i in range(1, len(keys)):
+        right_frame, right_value = keys[i]
+        if frame <= right_frame:
+            left_frame, left_value = keys[i - 1]
+            span = right_frame - left_frame
+            if span <= 0:
+                return right_value
+            t = (frame - left_frame) / span
+            return left_value + (right_value - left_value) * t
+    return keys[-1][1]
+
+
+def sample_section(section: Section, frame: float) -> dict[str, float]:
+    """取某个区段在指定帧的通道值。"""
+    out: dict[str, float] = {}
+    for name, keys in section.channels.items():
+        value = sample_channel(keys, frame)
+        if value is not None:
+            out[name] = value
+    return out
+
+
 def parse_level_sequence(package: Package) -> MovieSceneInfo:
     scene_export = package.find_export("LevelSequence")
     if scene_export is None:
