@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass, field
 
@@ -236,6 +237,40 @@ def sample_section(section: Section, frame: float) -> dict[str, float]:
         if value is not None:
             out[name] = value
     return out
+
+
+@dataclass
+class CameraPose:
+    position: tuple[float, float, float]
+    target: tuple[float, float, float]
+
+
+def camera_pose(binding: Binding, frame: float) -> CameraPose | None:
+    """把 LiveCameraMovement 的通道还原成机位。
+
+    实测约定（已在 Stg111 舞台上渲出正确画面）：
+        FreeLocationX/Y/Z 是环绕中心点，
+        RotateOffsetDistance 是相机到中心点的距离，
+        RotateOffsetYaw/Pitch 是环绕方位角（度，绕 Z 轴 / 俯仰）。
+    """
+    track = next((t for t in binding.tracks
+                  if t.class_name == "LiveCameraMovementTrack" and t.sections), None)
+    if track is None:
+        return None
+    values = sample_section(track.sections[0], frame)
+    centre = (values.get("FreeLocationX", 0.0),
+              values.get("FreeLocationY", 0.0),
+              values.get("FreeLocationZ", 0.0))
+    distance = values.get("RotateOffsetDistance", 0.0)
+    yaw = math.radians(values.get("RotateOffsetYaw", 0.0))
+    pitch = math.radians(values.get("RotateOffsetPitch", 0.0))
+    offset = (math.sin(yaw) * math.cos(pitch),
+              math.cos(yaw) * math.cos(pitch),
+              math.sin(pitch))
+    position = (centre[0] + offset[0] * distance,
+                centre[1] + offset[1] * distance,
+                centre[2] + offset[2] * distance)
+    return CameraPose(position=position, target=centre)
 
 
 def parse_level_sequence(package: Package) -> MovieSceneInfo:

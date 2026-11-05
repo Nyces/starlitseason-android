@@ -1025,7 +1025,8 @@ def _material_parameters(package) -> list[str]:
 
 def cmd_sequence(args) -> int:
     """列出 LevelSequence 的绑定、轨道与区段范围。"""
-    from .ue4.sequence import SequenceError, parse_level_sequence, sample_section
+    from .ue4.sequence import (SequenceError, camera_pose, parse_level_sequence,
+                               sample_section)
 
     paks = _open_all(args)
     try:
@@ -1047,6 +1048,16 @@ def cmd_sequence(args) -> int:
         print(f"播放范围 {start} .. {end} 帧{seconds}   "
               f"tick={info.tick_fps:g}fps display={info.display_fps:g}fps")
         print(f"占位对象 {len(info.possessables)} 个，绑定 {len(info.bindings)} 个")
+        if args.camera_frame is not None:
+            print(f"\n第 {args.camera_frame} 帧机位：")
+            for binding in info.bindings:
+                pose = camera_pose(binding, args.camera_frame)
+                if pose is None:
+                    continue
+                pos, aim = pose.position, pose.target
+                print(f"  [{binding.name}] \"{pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f},"
+                      f"{aim[0]:.2f},{aim[1]:.2f},{aim[2]:.2f}\"")
+            return 0
         if args.sample is not None:
             print(f"\n第 {args.sample} 帧采样：")
             for binding in info.bindings[:4]:
@@ -1264,6 +1275,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sequence.add_argument("--tracks", type=int, default=6, help="每个绑定最多列出多少条轨道")
     p_sequence.add_argument("--sample", type=int, default=None,
                             help="在指定帧采样通道值（线性插值）")
+    p_sequence.add_argument("--camera-frame", type=int, default=None,
+                            help="在指定帧输出各相机绑定的机位（可直接喂给 --camera）")
     p_sequence.set_defaults(func=cmd_sequence)
 
     return parser
