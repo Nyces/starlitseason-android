@@ -274,6 +274,10 @@ def _toon_params(store, material: str | None):
 
     result = ToonMaterial()
     is_outline = bool(material and "outline" in material.lower())
+    # 眼睛相关材质（eyebase / eyelens / iris）的 SphereMap 是一张反光贴图，按视线空间
+    # 法线取样；左右眼法线互为镜像，采样到的位置不对称，结果两眼反光不同（虹膜材质名是
+    # face_iris，不含 eye，必须单独算进来）。
+    is_eye = bool(material and any(tag in material.lower() for tag in ("eye", "iris")))
 
     # 先把父链走完：混合模式在基础材质上，不能因为拿到贴图就提前返回
     chain = []
@@ -359,7 +363,7 @@ def _toon_params(store, material: str | None):
                     dark = img[max(0, int(rows * 0.02)):max(1, int(rows * 0.22)), :, :3]
                     result.shadow = tuple(float(v) / 255.0
                                           for v in dark.reshape(-1, 3).mean(axis=0))
-        if result.sphere is None and instance.textures.get("SphereMap"):
+        if result.sphere is None and not is_eye and instance.textures.get("SphereMap"):
             tex = store.texture(instance.textures["SphereMap"])
             if tex is not None:
                 result.sphere = decode_texture(tex)
@@ -675,16 +679,6 @@ def _skeletal_items(store, asset: str, no_texture: bool, flip: str = "", pose=No
             # 眼白盖掉半边虹膜（chr0103 右眼看着像瞳孔被切掉一块）。沿脸朝前推 0.5 单位。
             verts = positions.copy()
             verts[np.unique(indices), 1] += 0.5
-        elif slot and slot.lower().endswith("_eyebase"):
-            # 眼白贴图大概率是两眼镜像的（chr0301 右眼外缘 u=0.021、左眼 0.979）。
-            # 但 chr0103/chr0102 两眼共用同一块 UV，右眼的虹膜会被画成相反的样子，
-            # 看上去一只眼正常、另一只眼色淡。这里检测到 U 两侧均值相同就补一次镜像。
-            left = positions[:, 0] < 0
-            if left.any() and (~left).any() and abs(float(uvs[left, 0].mean())
-                                                    - float(uvs[~left, 0].mean())) < 0.02:
-                uvs = uvs.copy()
-                centre = float(uvs[left, 0].mean())
-                uvs[left, 0] = 2.0 * centre - uvs[left, 0]
         items.append(toon.item(verts, indices, uvs))
     return items, mesh, positions
 
