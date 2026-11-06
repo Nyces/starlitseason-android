@@ -560,8 +560,8 @@ def _is_space_offset(keys, bind) -> bool:
 
     实测：5 个角色的待机动画里 AO_Neck 的键都稳定在绕 Z 约 88°，整段只变化
     10~22°，而网格里 AO_Neck 的绑定量是单位旋转。照直应用会让头转 90°（正
-    面机位只能看到后脑勺）。这类「几乎不动、却离绑定很远」的通道视为骨骼
-    空间差异，保绑定姿势；真正在动的通道（整段变化大）不受影响。
+    面机位只能看到后脑勺）；live 动画里它的变化幅度也只有 29°，同样要按空间
+    常量处理（阈值取 35° 才能覆盖两种动画）。
     """
     import numpy as np
 
@@ -570,7 +570,7 @@ def _is_space_offset(keys, bind) -> bool:
     samples = [quat_matrix(_sample_keys(keys, f, 100000)) for f in np.linspace(0, 99999, 9)]
     deviation = float(np.mean([_angle_between(s, bind) for s in samples]))
     spread = max(_angle_between(a, b) for a in samples for b in samples)
-    return deviation > 55.0 and spread < 25.0
+    return deviation > 55.0 and spread < 35.0
 
 
 def _anim_pose(store, anim: str, frame: int) -> tuple[dict, dict]:

@@ -198,7 +198,14 @@ def _read_block(stream: bytes, count: int, offset: int, key_count: int) -> np.nd
 
 def _read_rotation_block(stream: bytes, count: int, offset: int,
                          key_count: int) -> np.ndarray | None:
-    """读旋转块：跳过 2 个键的前导；越界或前导解释不成立时退回原偏移。"""
+    """读旋转块。
+
+    UE3/UE4 的文档写明「n>1 的旋转轨，键数据前 24 字节是压缩头」；
+    单键轨没有压缩头，直接读偏移处。实测也一致：按 off 读单键会读到合法
+    四元数，按 off+24 会读到相邻块里不相干的数据。
+    """
+    if count == 1:
+        return _read_block(stream, count, offset, key_count)
     shifted = offset + KEY_PREAMBLE * KEY_SIZE
     if shifted + count * KEY_SIZE <= len(stream):
         return _read_block(stream, count, shifted, key_count)
