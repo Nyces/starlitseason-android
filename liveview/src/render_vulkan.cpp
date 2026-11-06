@@ -132,7 +132,9 @@ bool CreateRenderWindow(std::string* error) {
     window_class.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
     window_class.lpfnWndProc = WindowProc;
     window_class.hInstance = hinstance;
-    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    // 这里不能用 LoadCursorW + IDC_ARROW：未定义 UNICODE 时 IDC_ARROW 展开成
+    // MAKEINTRESOURCEA（char*），和 LoadCursorW 的 LPCWSTR 参数类型不匹配。
+    window_class.hCursor = LoadCursor(nullptr, IDC_ARROW);
     window_class.lpszClassName = L"liveview_window";
     if (RegisterClassExW(&window_class) == 0) {
         const DWORD code = GetLastError();
@@ -1042,7 +1044,7 @@ int RunRender(const Bundle& bundle, double seconds) {
         if (elapsed - title_time >= 0.25) {
             title_time = elapsed;
             const std::string title =
-                "liveview 帧 " + std::to_string(static_cast<long long>(frame)) + "  " +
+                "liveview frame " + std::to_string(static_cast<long long>(frame)) + "  " +
                 FormatPose(pose);
             SetWindowTextA(g_window, title.c_str());
         }
