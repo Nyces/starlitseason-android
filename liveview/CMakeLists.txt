@@ -1,12 +1,14 @@
-# liveview —— live 演出验证程序的骨架
+# liveview —— live 演出验证程序
 #
-# 目标：在 PC 上以真实 LevelSequence 数据驱动一场 live（相机 / 角色 / 舞台 / 音轨）。
-# 当前阶段只做「读数据 + 时间轴 + 探测」，渲染后端（Vulkan）在后续里程碑接入。
-#
+# 里程碑 1（原生）：双击启动、选游戏目录、输入 AES 密钥、原生解析 pak 索引。
 # 本地没有 C++ 工具链时，构建由 GitHub Actions 完成（见 .github/workflows/liveview.yml）。
 
 cmake_minimum_required(VERSION 3.16)
 project(liveview LANGUAGES CXX)
+
+if(NOT WIN32)
+  message(FATAL_ERROR "liveview 目前只支持 Windows（Win32 对话框 + pak 校验）")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,12 +21,17 @@ endif()
 add_executable(liveview
   src/main.cpp
   src/bundle.cpp
+  src/aes256.cpp
+  src/pak.cpp
+  src/config.cpp
+  src/dialogs.cpp
 )
 
 target_include_directories(liveview PRIVATE src)
 
 if(MSVC)
-  target_compile_options(liveview PRIVATE /W4 /permissive-)
+  # /utf-8：源码和字符串字面量按 UTF-8 解释，否则中文对话框会乱码
+  target_compile_options(liveview PRIVATE /W4 /permissive- /utf-8)
 else()
   target_compile_options(liveview PRIVATE -Wall -Wextra)
 endif()
@@ -34,10 +41,6 @@ endif()
 # 运行时由程序自己 LoadLibrary("vulkan-1.dll") 取入口函数。
 option(LIVEVIEW_RENDER "启用 Vulkan 渲染后端（窗口 + 交换链 + 清屏）" OFF)
 if(LIVEVIEW_RENDER)
-  if(NOT WIN32)
-    message(FATAL_ERROR "渲染后端目前只支持 Windows（Win32 窗口 + VK_KHR_win32_surface）")
-  endif()
-
   include(FetchContent)
   set(VULKAN_HEADERS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
   set(VULKAN_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
