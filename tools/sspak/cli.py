@@ -548,13 +548,42 @@ def _rotation_angle(matrix) -> float:
     return float(np.degrees(np.arccos(np.clip((np.trace(matrix) - 1) / 2, -1.0, 1.0))))
 
 
-def _anim_pose(store, anim: str, frame: int) -> dict:
-    """把动画某一帧解成 {骨骼名: 3×3 局部旋转}（实验性，失败会抛出）。
+def _angle_between(a, b) -> float:
+    """两个 3×3 旋转矩阵之间的夹角（度）。"""
+    import numpy as np
 
-    键有两种可能语义：绝对局部旋转，或相对绑定姿势的增量。逐轨选与绑定姿势
-    偏差更小的解释——待机类动画不会把骨头拧出大角度，这比全局二选一更稳。
+    return float(np.degrees(np.arccos(np.clip((np.trace(a.T @ b) - 1) / 2, -1, 1))))
+
+
+def _is_space_offset(keys, bind) -> bool:
+    """判断一条旋转通道是不是「骨骼空间常量」。
+
+    实测：5 个角色的待机动画里 AO_Neck 的键都稳定在绕 Z 约 88°，整段只变化
+    10~22°，而网格里 AO_Neck 的绑定量是单位旋转。照直应用会让头转 90°（正
+    面机位只能看到后脑勺）。这类「几乎不动、却离绑定很远」的通道视为骨骼
+    空间差异，保绑定姿势；真正在动的通道（整段变化大）不受影响。
     """
-    from .ue4.anim import AnimSequenceError, parse_animation, quat_matrix
+    import numpy as np
+
+    from .ue4.anim import _sample_keys, quat_matrix
+
+    samples = [quat_matrix(_sample_keys(keys, f, 100000)) for f in np.linspace(0, 99999, 9)]
+    deviation = float(np.mean([_angle_between(s, bind) for s in samples]))
+    spread = max(_angle_between(a, b) for a in samples for b in samples)
+    return deviation > 55.0 and spread < 25.0
+
+
+def _anim_pose(store, anim: str, frame: int) -> tuple[dict, dict]:
+    """把动画某一帧解成 ({骨骼名: 局部旋转}, {骨骼名: 局部位移})。
+
+    只用能自证的数据：
+      - 键数 > 1 的旋转通道（逐个键都必须是单位四元数）；
+      - 键数 > 1 的位移通道（逐帧变化才是真位移）。
+    键数 = 1 的通道表示整段恒定，但实测这些通道的偏移会指进别的轨的键块
+    （读出来是别根骨骼的位移，甚至 |xyz| = 92 这种非法四元数），无法自证，
+    一律回退绑定姿势。
+    """
+    from .ue4.anim import AnimSequenceError, _sample_keys, parse_animation, quat_matrix
     import numpy as np
 
     package = store.package(anim)
@@ -564,85 +593,34 @@ def _anim_pose(store, anim: str, frame: int) -> dict:
         sequence = parse_animation(package)
     except AnimSequenceError as exc:
         raise SystemExit(f"动画解析失败 {anim}: {exc}") from exc
-    names, binds, parents = _master_bones(store)
-    pose = {}
-    relative = 0
-    skipped = 0
-    from .ue4.anim import _sample_keys
 
-    # 同一份单键数据被多条互不相关的轨道共用：压缩键块串了位置，不是各骨骼各自的键。
-    # 例子是 chr0103 待机里的 GR_Facial/GR_Eye/PR_Eye/AO_Eye/SO_Spine2/CS_Chest/PS_Breast，
-    # 它们共用一个约 120° 的值（恰是肩胸链的绑定旋转），照原样应用会把眼珠甩出眼眶、胸部撕裂。
-    shared: dict[tuple, list[int]] = {}
-    for t, keys in enumerate(sequence.rotations):
-        if len(keys) != 1:
-            continue
-        shared.setdefault(tuple(np.round(np.asarray(keys[0], dtype=np.float64), 3)), []).append(t)
-
-    def track_of(bone: int):
-        for t, index in enumerate(sequence.bone_indices):
-            if int(index) == bone and len(sequence.rotations[t]) == 1:
-                return sequence.rotations[t][0]
-        return None
-
+    names, binds, _ = _master_bones(store)
+    rotations: dict[str, np.ndarray] = {}
+    translations: dict[str, np.ndarray] = {}
+    offsets = 0
     for t, bone in enumerate(sequence.bone_indices):
         bone = int(bone)
+        if not 0 <= bone < len(names):
+            continue
         keys = sequence.rotations[t]
-        if len(keys) == 0 or not 0 <= bone < len(names):
-            continue
-        if any(tag in names[bone] for tag in ("Eye", "Iris", "Highlight", "Facial",
-                                             "Double", "Tongue")):
-            # 整个脸部骨架由单独的 *_facial_* 动画驱动；身体动画里这些轨道是被串块污染的，
-            # 照应用会让眼珠/眼白错位（chr0105 斗鸡眼、chr0107/0111/0502 只亮一只眼），
-            # 而且脸部皮肤和眼珠会各转各的、皮肤插进眼睛。
-            skipped += 1
-            continue
-        if names[bone].startswith("SC_"):
-            # SC_ 是控制骨：子骨已经写了同一个键时再转一次会把这段骨骼转两倍
-            # （SC_Head 与 AO_Head 共用 9° 的键，头实际转了 17.5°，chr0103 右眼被拉斜）。
-            for child, parent in enumerate(parents):
-                if parent != bone:
-                    continue
-                child_key = track_of(child)
-                if child_key is not None and np.allclose(
-                        np.asarray(child_key, dtype=np.float64),
-                        np.asarray(keys[0], dtype=np.float64), atol=0.01):
-                    skipped += 1
-                    child_skip = True
-                    break
+        if len(keys) > 1:
+            if _is_space_offset(keys, binds[bone]):
+                offsets += 1
             else:
-                child_skip = False
-            if child_skip:
-                continue
-        rotation = quat_matrix(_sample_keys(keys, frame, sequence.num_frames))
-        angle = _rotation_angle(rotation)
-        deviation = _rotation_angle(rotation.T @ binds[bone])
-        # 键接近单位旋转、绑定却转了 90° 以上：这条轨道表示「保持绑定姿势」。
-        # 以前用 angle > 1.0 把它排除，结果 AO_Hips 的绑定是 90°、键是 0.4°，
-        # 被当成绝对旋转覆盖掉，整条腿翻到身后（chr0104 没有腿）。
-        use_delta = angle < deviation
-        if len(keys) == 1 and deviation > 115.0 and _rotation_angle(binds[bone]) < 5.0:
-            # 绑定≈单位旋转、单键却差 115° 以上：偏移表串到了别的骨骼的键块（实测 SO_Spine2）
-            skipped += 1
-            continue
-        if (len(keys) == 1 and deviation > 90.0
-                and len(shared.get(tuple(np.round(np.asarray(keys[0], dtype=np.float64), 3)), [])) >= 2):
-            # 单键、离绑定 90° 以上，且同样的键被两条以上轨道共用：属于串块的键，跳过
-            skipped += 1
-            continue
-        if use_delta:
-            pose[names[bone]] = rotation @ binds[bone]
-            relative += 1
-        else:
-            pose[names[bone]] = rotation
+                rotations[names[bone]] = quat_matrix(
+                    _sample_keys(keys, frame, sequence.num_frames))
+        pos = sequence.positions[t]
+        if len(pos) > 1:
+            translations[names[bone]] = _sample_keys(pos, frame, sequence.num_frames)
     print(f"  动画 {anim.rsplit('/', 1)[-1]}：{len(sequence.bone_indices)} 轨 / "
-          f"{sequence.num_frames} 帧 / 自检 {sequence.quality:.2f} / "
-          f"增量 {relative} 轨 / 钳制 {skipped} 轨")
-    return pose
+          f"{sequence.num_frames} 帧 / 旋转自检 {sequence.quality:.2f} / "
+          f"丢弃 {sequence.dropped} 轨 / 空间常量 {offsets} 轨 / "
+          f"应用 {len(rotations)} 旋转 + {len(translations)} 位移")
+    return rotations, translations
 
 
 def _skeletal_items(store, asset: str, no_texture: bool, flip: str = "", pose=None,
-                    replace: bool = False):
+                    replace: bool = False, translations=None):
     import numpy as np
 
     from .ue4.skeletalmesh import parse_skeletal_mesh
@@ -655,7 +633,7 @@ def _skeletal_items(store, asset: str, no_texture: bool, flip: str = "", pose=No
     positions = mesh.positions
     if pose:
         try:
-            positions = mesh.posed_positions(pose, replace=replace)
+            positions = mesh.posed_positions(pose, replace=replace, translations=translations)
         except Exception as exc:  # noqa: BLE001 - 蒙皮失败时退回绑定姿势
             print(f"  [warn] 蒙皮失败 {asset.rsplit('/', 1)[-1]}: {exc}")
     items = []
@@ -683,7 +661,7 @@ def _skeletal_items(store, asset: str, no_texture: bool, flip: str = "", pose=No
     return items, mesh, positions
 
 
-def _head_attachment(mesh, pose, replace: bool):
+def _head_attachment(mesh, pose, replace: bool, translations=None):
     """头部骨骼的刚性变换 + 绑定位置的平移，供头部局部空间的头发/饰品跟随。
 
     取 SO_Head：脸部蒙皮几乎全部绑在它上面（SC_Head/AO_Head 只是它的父级），
@@ -695,7 +673,7 @@ def _head_attachment(mesh, pose, replace: bool):
     for bone in ("SO_Head", "AO_Head", "SC_Head"):
         if bone in names:
             i = names.index(bone)
-            posed = mesh.posed_globals(pose, replace)
+            posed = mesh.posed_globals(pose, replace, translations)
             bind = mesh.bind_matrices()
             transform = posed[i] @ np.linalg.inv(bind[i])
             place = np.eye(4)
@@ -705,7 +683,7 @@ def _head_attachment(mesh, pose, replace: bool):
 
 
 def _character_items(store, chr_id: str, no_texture: bool, flip: str = "", verbose: bool = True,
-                     pose=None, replace: bool = False):
+                     pose=None, replace: bool = False, translations=None):
     """加载身体/脸/头发/饰品（可按骨骼名摆姿势），返回 (items, 中心, 半径)。"""
     import numpy as np
 
@@ -722,14 +700,15 @@ def _character_items(store, chr_id: str, no_texture: bool, flip: str = "", verbo
         # 头发/饰品的顶点在头部局部空间，骨骼里没有身体头部骨骼，改用头部刚性变换跟随
         attached = asset.endswith(("_hair", "_orna"))
         mesh_items, mesh, posed = _skeletal_items(
-            store, asset, no_texture, flip, None if attached else pose, replace)
+            store, asset, no_texture, flip, None if attached else pose, replace,
+            None if attached else translations)
         if not mesh_items:
             continue
         if verbose:
             print(f"  {asset.rsplit('/', 1)[-1]}: {len(mesh.positions)} 顶点 / "
                   f"{len(mesh.sections)} 分段 / {len(mesh.bones)} 骨骼")
         if not attached:
-            head_matrix = _head_attachment(mesh, pose, replace)
+            head_matrix = _head_attachment(mesh, pose, replace, translations)
         if attached:
             for item in mesh_items:
                 item.model = head_matrix.astype(np.float32)
@@ -762,12 +741,13 @@ def cmd_character(args) -> int:
         chr_id = args.chr
         pose = _parse_pose(args.pose)
         replace = False
+        translations = None
         if args.anim:
-            # 实验性：_anim_pose 已把绑定旋转合进矩阵，这里直接替换局部旋转
-            pose = _anim_pose(store, args.anim, args.frame)
+            pose, translations = _anim_pose(store, args.anim, args.frame)
             replace = True
         items, center, radius = _character_items(store, chr_id, args.no_texture, args.flip_uv,
-                                                 pose=pose, replace=replace)
+                                                 pose=pose, replace=replace,
+                                                 translations=translations)
         if not items:
             raise SystemExit("没有可渲染的骨骼网格")
 
@@ -905,12 +885,13 @@ def cmd_scene(args) -> int:
         if args.character:
             pose = _parse_pose(args.pose)
             replace = False
+            translations = None
             if args.anim:
-                pose = _anim_pose(store, args.anim, args.frame)
+                pose, translations = _anim_pose(store, args.anim, args.frame)
                 replace = True
             char_items, character_center, character_radius = _character_items(
                 store, args.character, args.no_texture, args.flip_uv, verbose=False,
-                pose=pose, replace=replace)
+                pose=pose, replace=replace, translations=translations)
             if not char_items:
                 raise SystemExit(f"没有可渲染的角色: {args.character}")
             items.extend(char_items)

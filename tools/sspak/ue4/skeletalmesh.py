@@ -63,8 +63,9 @@ class SkeletalMesh:
         return _accumulate(self.bones, locals_)
 
     def posed_globals(self, rotations: dict[str, np.ndarray] | None = None,
-                      replace: bool = False) -> np.ndarray:
-        """按骨骼旋转求每根骨骼的全局矩阵。"""
+                      replace: bool = False,
+                      translations: dict[str, np.ndarray] | None = None) -> np.ndarray:
+        """按骨骼旋转/位移求每根骨骼的全局矩阵。"""
         index = {name: i for i, (name, _) in enumerate(self.bones)}
         locals_ = np.array([_transform_matrix(self.bind_pose[i]) for i in range(len(self.bones))],
                            dtype=np.float64)
@@ -79,19 +80,25 @@ class SkeletalMesh:
             else:
                 local[:3, :3] = np.asarray(rotation, dtype=np.float64) @ local[:3, :3]
             locals_[bone] = local
+        for name, translation in (translations or {}).items():
+            bone = index.get(name)
+            if bone is None:
+                continue
+            locals_[bone][:3, 3] = np.asarray(translation, dtype=np.float64)
         return _accumulate(self.bones, locals_)
 
     def posed_positions(self, rotations: dict[str, np.ndarray] | None = None,
-                        replace: bool = False) -> np.ndarray:
-        """按骨骼旋转重新蒙皮，返回顶点位置。
+                        replace: bool = False,
+                        translations: dict[str, np.ndarray] | None = None) -> np.ndarray:
+        """按骨骼旋转（以及有动画的位移）重新蒙皮，返回顶点位置。
 
         rotations 是「父空间、绕骨骼原点」的旋转；默认叠加在绑定姿势上。
         replace=True 时直接用旋转替换绑定姿势的旋转（动画键就是绝对局部旋转）。
-        rotations 为空时返回绑定姿势的顶点（应与 positions 一致）。
+        translations 给出时替换对应骨骼的局部平移；未给出的骨骼保留绑定位移。
         """
         if self.influence_bones is None or self.bind_pose is None:
             raise SkeletalMeshError("缺少蒙皮数据")
-        globals_ = self.posed_globals(rotations, replace)
+        globals_ = self.posed_globals(rotations, replace, translations)
         bind = self.bind_matrices()
         skin = globals_ @ np.linalg.inv(bind)             # (B,4,4)
 
