@@ -73,3 +73,9 @@ jobs:
           & $exe --help
           if ($LASTEXITCODE -ne 0) { throw "liveview --help 失败" }
           Get-Item $exe | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: liveview-windows-render
+          path: build-render/Release/liveview.exe
