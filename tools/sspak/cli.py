@@ -573,6 +573,27 @@ def _is_space_offset(keys, bind) -> bool:
     return deviation > 55.0 and spread < 35.0
 
 
+def _facial_bones(names, parents) -> set[int]:
+    """返回面部骨骼子树（GR_Facial 及其所有后代）的下标集合。
+
+    live/commu 的身体动画里 GR_Facial 的键平均偏离绑定 107°、整段变化 119°，
+    照直应用会把眼睛、眼睑转进头里（正面看脸是空白的）。面部由单独的
+    *_facial_* 序列驱动，身体动画应当忽略这棵子树。
+    """
+    facial = set()
+    for i, name in enumerate(names):
+        cur = i
+        for _ in range(64):
+            if names[cur] == "GR_Facial" or names[cur].startswith("GR_Facial"):
+                facial.add(i)
+                break
+            parent = parents[cur]
+            if parent < 0:
+                break
+            cur = parent
+    return facial
+
+
 def _anim_pose(store, anim: str, frame: int) -> tuple[dict, dict]:
     """把动画某一帧解成 ({骨骼名: 局部旋转}, {骨骼名: 局部位移})。
 
@@ -594,13 +615,19 @@ def _anim_pose(store, anim: str, frame: int) -> tuple[dict, dict]:
     except AnimSequenceError as exc:
         raise SystemExit(f"动画解析失败 {anim}: {exc}") from exc
 
-    names, binds, _ = _master_bones(store)
+    names, binds, parents = _master_bones(store)
+    facial = _facial_bones(names, parents)
     rotations: dict[str, np.ndarray] = {}
     translations: dict[str, np.ndarray] = {}
     offsets = 0
+    skipped_facial = 0
     for t, bone in enumerate(sequence.bone_indices):
         bone = int(bone)
         if not 0 <= bone < len(names):
+            continue
+        if bone in facial:
+            if len(sequence.rotations[t]) > 0:
+                skipped_facial += 1
             continue
         keys = sequence.rotations[t]
         if len(keys) > 1:
@@ -615,6 +642,7 @@ def _anim_pose(store, anim: str, frame: int) -> tuple[dict, dict]:
     print(f"  动画 {anim.rsplit('/', 1)[-1]}：{len(sequence.bone_indices)} 轨 / "
           f"{sequence.num_frames} 帧 / 旋转自检 {sequence.quality:.2f} / "
           f"丢弃 {sequence.dropped} 轨 / 空间常量 {offsets} 轨 / "
+          f"面部忽略 {skipped_facial} 轨 / "
           f"应用 {len(rotations)} 旋转 + {len(translations)} 位移")
     return rotations, translations
 
