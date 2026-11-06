@@ -594,7 +594,54 @@ def _facial_bones(names, parents) -> set[int]:
     return facial
 
 
-def _anim_pose(store, anim: str, frame: int) -> tuple[dict, dict]:
+_REST_OFFSETS: dict | None = None
+REFERENCE_IDLE = "/Game/Animation/Character/Commu/chr0101/A_chr0101_C_Wait_A_00"
+
+
+def _rest_offsets(store) -> dict:
+    """用参考待机动画标定每根骨骼的「静止朝向」（骨骼空间常量表）。
+
+    取待机里最接近绑定姿势的一帧作为该骨骼的静止朝向。偏移量是骨骼空间
+    常量（5 个角色的 AO_Neck 都是绕 Z 约 88°），所以一份表可以给所有动画用。
+    """
+    global _REST_OFFSETS
+    if _REST_OFFSETS is not None:
+        return _REST_OFFSETS
+    _REST_OFFSETS = {}
+    package = store.package(REFERENCE_IDLE)
+    if package is None:
+        return _REST_OFFSETS
+    from .ue4.anim import AnimSequenceError, _sample_keys, parse_animation, quat_matrix
+    import numpy as np
+
+    try:
+        idle = parse_animation(package)
+    except AnimSequenceError:
+        return _REST_OFFSETS
+    names, binds, _ = _master_bones(store)
+
+    def deviation(frame: int) -> float:
+        total = 0.0
+        for t, bone in enumerate(idle.bone_indices):
+            bone = int(bone)
+            if bone >= len(names) or len(idle.rotations[t]) < 2:
+                continue
+            k = quat_matrix(_sample_keys(idle.rotations[t], frame, idle.num_frames))
+            total += _angle_between(k, binds[bone])
+        return total
+
+    step = max(1, idle.num_frames // 12)
+    best = min(range(0, idle.num_frames, step), key=deviation)
+    for t, bone in enumerate(idle.bone_indices):
+        bone = int(bone)
+        if bone >= len(names) or len(idle.rotations[t]) < 2:
+            continue
+        _REST_OFFSETS[names[bone]] = quat_matrix(
+            _sample_keys(idle.rotations[t], best, idle.num_frames))
+    return _REST_OFFSETS
+
+
+def _anim_pose(store, anim: str, frame: int, space: bool = False) -> tuple[dict, dict]:
     """把动画某一帧解成 ({骨骼名: 局部旋转}, {骨骼名: 局部位移})。
 
     只用能自证的数据：
@@ -617,9 +664,11 @@ def _anim_pose(store, anim: str, frame: int) -> tuple[dict, dict]:
 
     names, binds, parents = _master_bones(store)
     facial = _facial_bones(names, parents)
+    offsets_table = _rest_offsets(store) if space else {}
     rotations: dict[str, np.ndarray] = {}
     translations: dict[str, np.ndarray] = {}
     offsets = 0
+    calibrated = 0
     skipped_facial = 0
     for t, bone in enumerate(sequence.bone_indices):
         bone = int(bone)
@@ -634,15 +683,21 @@ def _anim_pose(store, anim: str, frame: int) -> tuple[dict, dict]:
             if _is_space_offset(keys, binds[bone]):
                 offsets += 1
             else:
-                rotations[names[bone]] = quat_matrix(
-                    _sample_keys(keys, frame, sequence.num_frames))
+                k = quat_matrix(_sample_keys(keys, frame, sequence.num_frames))
+                rest = offsets_table.get(names[bone]) if offsets_table else None
+                if rest is not None:
+                    # 把「静止朝向」剥掉：动作 = 绑定⁻¹×键、静止 = 绑定⁻¹×参考，再合成
+                    b = binds[bone]
+                    k = b @ ((b.T @ rest).T @ (b.T @ k))
+                    calibrated += 1
+                rotations[names[bone]] = k
         pos = sequence.positions[t]
         if len(pos) > 1:
             translations[names[bone]] = _sample_keys(pos, frame, sequence.num_frames)
     print(f"  动画 {anim.rsplit('/', 1)[-1]}：{len(sequence.bone_indices)} 轨 / "
           f"{sequence.num_frames} 帧 / 旋转自检 {sequence.quality:.2f} / "
           f"丢弃 {sequence.dropped} 轨 / 空间常量 {offsets} 轨 / "
-          f"面部忽略 {skipped_facial} 轨 / "
+          f"面部忽略 {skipped_facial} 轨 / 静止标定 {calibrated} 轨 / "
           f"应用 {len(rotations)} 旋转 + {len(translations)} 位移")
     return rotations, translations
 
@@ -771,7 +826,8 @@ def cmd_character(args) -> int:
         replace = False
         translations = None
         if args.anim:
-            pose, translations = _anim_pose(store, args.anim, args.frame)
+            pose, translations = _anim_pose(store, args.anim, args.frame,
+                                            space=args.anim_space)
             replace = True
         items, center, radius = _character_items(store, chr_id, args.no_texture, args.flip_uv,
                                                  pose=pose, replace=replace,
@@ -915,7 +971,8 @@ def cmd_scene(args) -> int:
             replace = False
             translations = None
             if args.anim:
-                pose, translations = _anim_pose(store, args.anim, args.frame)
+                pose, translations = _anim_pose(store, args.anim, args.frame,
+                                                space=args.anim_space)
                 replace = True
             char_items, character_center, character_radius = _character_items(
                 store, args.character, args.no_texture, args.flip_uv, verbose=False,
@@ -1276,7 +1333,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_scene.add_argument("--character", help="把角色（绑定姿势）放进场景，例如 chr0101")
     p_scene.add_argument("--pose", action="append",
                          help="按骨骼名摆角色姿势：骨骼名:轴:角度（轴为 x/y/z），可重复")
-    p_scene.add_argument("--anim", help="实验性：把角色摆成 AnimSequence 的某一帧（只解旋转通道）")
+    p_scene.add_argument("--anim", help="实验性：把角色摆成 AnimSequence 的某一帧")
+    p_scene.add_argument("--anim-space", action="store_true",
+                         help="用参考待机标定每根骨骼的静止朝向，剥掉骨骼空间常量后再摆姿势")
     p_scene.add_argument("--frame", type=int, default=0, help="--anim 的帧号")
     p_scene.add_argument("--flip-uv", default="", choices=["", "none", "u", "v", "uv"],
                          help="翻转 UV 轴，用于排查贴图方向")
@@ -1313,7 +1372,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_character.add_argument("--pose", action="append",
                              help="按骨骼名摆姿势：骨骼名:轴:角度（轴为 x/y/z），可重复")
     p_character.add_argument("--anim",
-                             help="实验性：用 AnimSequence 的某一帧摆姿势（只解旋转通道）")
+                             help="实验性：用 AnimSequence 的某一帧摆姿势")
+    p_character.add_argument("--anim-space", action="store_true",
+                             help="用参考待机标定每根骨骼的静止朝向，剥掉骨骼空间常量后再摆姿势")
     p_character.add_argument("--frame", type=int, default=0, help="--anim 的帧号")
     p_character.add_argument("--flip-uv", default="", choices=["", "none", "u", "v", "uv"],
                              help="翻转 UV 轴，用于排查贴图方向")
