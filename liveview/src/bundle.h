@@ -33,8 +33,11 @@ struct Bundle {
     std::vector<CameraKey> keys;
 };
 
-// 读取文本包；失败时返回 false 并填充 error。
+// 读取文本包（窄路径）；失败时返回 false 并填充 error。
 bool LoadBundle(const std::string& path, Bundle* bundle, std::string* error);
+
+// 读取文本包（宽路径，支持中文目录）。
+bool LoadBundleW(const std::wstring& path, Bundle* bundle, std::string* error);
 
 // 按帧号线性插值；超出两端时钳制到端点。
 CameraKey SampleCamera(const Bundle& bundle, double frame);

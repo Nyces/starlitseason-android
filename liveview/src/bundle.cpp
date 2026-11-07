@@ -1,10 +1,16 @@
 #include "bundle.h"
 
 #include <algorithm>
-#include <cstdio>
-#include <cstdlib>
 #include <fstream>
 #include <sstream>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 
 namespace liveview {
 namespace {
@@ -21,18 +27,15 @@ bool SplitKeyValue(const std::string& line, std::string* key, std::string* rest)
     return true;
 }
 
-}  // namespace
-
-bool LoadBundle(const std::string& path, Bundle* bundle, std::string* error) {
-    std::ifstream input(path);
-    if (!input) {
-        *error = "无法打开文本包: " + path;
-        return false;
-    }
+bool ParseBundleText(const std::string& text, Bundle* bundle, std::string* error) {
+    std::istringstream input(text);
     bundle->keys.clear();
     std::string line;
     int version = 0;
     while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
         if (line.empty()) {
             continue;
         }
@@ -88,6 +91,43 @@ bool LoadBundle(const std::string& path, Bundle* bundle, std::string* error) {
     return true;
 }
 
+}  // namespace
+
+bool LoadBundle(const std::string& path, Bundle* bundle, std::string* error) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        *error = "无法打开文本包: " + path;
+        return false;
+    }
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    return ParseBundleText(buffer.str(), bundle, error);
+}
+
+bool LoadBundleW(const std::wstring& path, Bundle* bundle, std::string* error) {
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        *error = "无法打开文本包";
+        return false;
+    }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(handle, &size) || size.QuadPart <= 0) {
+        CloseHandle(handle);
+        *error = "文本包为空或读取失败";
+        return false;
+    }
+    std::string text(static_cast<size_t>(size.QuadPart), '\0');
+    DWORD read = 0;
+    const BOOL ok = ReadFile(handle, text.data(), static_cast<DWORD>(text.size()), &read, nullptr);
+    CloseHandle(handle);
+    if (!ok || read != static_cast<DWORD>(text.size())) {
+        *error = "读取文本包失败";
+        return false;
+    }
+    return ParseBundleText(text, bundle, error);
+}
+
 CameraKey SampleCamera(const Bundle& bundle, double frame) {
     if (bundle.keys.empty()) {
         return CameraKey{};
@@ -107,8 +147,10 @@ CameraKey SampleCamera(const Bundle& bundle, double frame) {
             CameraKey out;
             out.frame = static_cast<int64_t>(frame);
             for (int axis = 0; axis < 3; ++axis) {
-                out.position[axis] = left.position[axis] + (right.position[axis] - left.position[axis]) * t;
-                out.target[axis] = left.target[axis] + (right.target[axis] - left.target[axis]) * t;
+                out.position[axis] =
+                    left.position[axis] + (right.position[axis] - left.position[axis]) * t;
+                out.target[axis] =
+                    left.target[axis] + (right.target[axis] - left.target[axis]) * t;
             }
             return out;
         }

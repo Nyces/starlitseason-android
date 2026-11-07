@@ -33,6 +33,8 @@ FetchContent_MakeAvailable(zlib)
 
 add_executable(liveview
   src/main.cpp
+  src/app_window.cpp
+  src/commands.cpp
   src/bundle.cpp
   src/aes256.cpp
   src/pak.cpp
@@ -43,7 +45,9 @@ add_executable(liveview
 
 target_include_directories(liveview PRIVATE src)
 # zlib 不同版本的目标名不一样（zlibstatic / zlib），用生成表达式兜底
-target_link_libraries(liveview PRIVATE $<IF:$<TARGET_EXISTS:zlibstatic>,zlibstatic,zlib>)
+target_link_libraries(liveview PRIVATE
+  $<IF:$<TARGET_EXISTS:zlibstatic>,zlibstatic,zlib>
+  comdlg32 shell32 ole32 user32 gdi32 advapi32)
 
 if(MSVC)
   # /utf-8：源码和字符串字面量按 UTF-8 解释，否则中文对话框会乱码

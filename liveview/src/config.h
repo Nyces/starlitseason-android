@@ -1,4 +1,4 @@
-// 本机配置：游戏资源目录 + AES 密钥（保存在 %LOCALAPPDATA%\liveview\config.ini）。
+// 本机配置：游戏资源目录 + AES 密钥 + 上次用的相机包（%LOCALAPPDATA%\liveview\config.ini）。
 
 #pragma once
 
@@ -9,6 +9,7 @@ namespace liveview {
 struct Config {
     std::wstring game_dir;
     std::string key_hex;
+    std::wstring bundle_path;
 };
 
 std::wstring ConfigPath();
