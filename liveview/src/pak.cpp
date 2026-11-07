@@ -4,6 +4,8 @@
 #include <cstring>
 #include <vector>
 
+#include <zlib.h>
+
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -21,6 +23,14 @@ namespace {
 
 constexpr uint32_t kPakMagic = 0x5A6F12E1;
 constexpr int64_t kInfoTailScan = 2048;
+constexpr int64_t kEntryHeaderSize = 53;  // 未压缩条目数据前的固定头
+constexpr int32_t kMethodNone = 0;
+constexpr int32_t kMethodZlib = 1;
+constexpr uint8_t kFlagEncrypted = 0x01;
+
+int64_t Align16(int64_t value) {
+    return (value + 15) / 16 * 16;
+}
 
 #if defined(_WIN32)
 // 用 Win32 文件 API 而不是 ifstream：std::ifstream 在 libc++/mingw 下没有宽路径重载。
@@ -238,7 +248,11 @@ bool LoadPakIndex(const std::wstring& path, const std::vector<uint8_t>& key,
         return false;
     }
 
+    out->wide_path = path;
     out->path.clear();
+    for (wchar_t ch : path) {
+        out->path.push_back(ch < 0x80 ? static_cast<char>(ch) : '?');
+    }
     out->version = version;
     out->index_offset = index_offset;
     out->index_size = index_size;
@@ -294,6 +308,90 @@ bool LoadPakIndex(const std::wstring& path, const std::vector<uint8_t>& key,
     }
     out->index_extra = static_cast<int64_t>(index.size()) - static_cast<int64_t>(pos);
     (void)info_size;
+    return true;
+}
+
+const PakEntry* FindEntry(const PakInfo& pak, const std::string& name) {
+    for (const PakEntry& entry : pak.entries) {
+        if (entry.name == name) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+bool ReadEntry(const PakInfo& pak, const PakEntry& entry, const std::vector<uint8_t>& key,
+               std::vector<uint8_t>* out, std::string* error) {
+    FileReader file;
+    if (!file.Open(pak.wide_path)) {
+        *error = "无法打开 pak 文件";
+        return false;
+    }
+    const bool encrypted = (entry.flags & kFlagEncrypted) != 0;
+    if (encrypted && key.size() != 32) {
+        *error = "条目已加密但密钥缺失";
+        return false;
+    }
+
+    if (entry.method == kMethodNone) {
+        std::vector<uint8_t> data;
+        if (!file.Read(entry.offset + kEntryHeaderSize, entry.size, &data)) {
+            *error = "读取条目数据失败: " + entry.name;
+            return false;
+        }
+        if (encrypted) {
+            std::vector<uint8_t> buffer = data;
+            Aes256DecryptEcb(key.data(), buffer.data(), buffer.size());
+            data.assign(buffer.begin(), buffer.begin() + static_cast<size_t>(entry.size));
+        }
+        *out = std::move(data);
+        return true;
+    }
+
+    if (entry.method != kMethodZlib) {
+        *error = "暂不支持的压缩方式 " + std::to_string(entry.method) + ": " + entry.name;
+        return false;
+    }
+
+    out->clear();
+    out->reserve(static_cast<size_t>(entry.usize));
+    for (const std::pair<int64_t, int64_t>& block : entry.blocks) {
+        int64_t length = block.second - block.first;
+        if (encrypted) {
+            length = Align16(length);
+        }
+        if (length <= 0) {
+            continue;
+        }
+        std::vector<uint8_t> chunk;
+        if (!file.Read(entry.offset + block.first, length, &chunk)) {
+            *error = "读取压缩块失败: " + entry.name;
+            return false;
+        }
+        if (encrypted) {
+            Aes256DecryptEcb(key.data(), chunk.data(), chunk.size());
+        }
+
+        // 单块解压后的目标大小：常规为 block_size，最后一块可能更小
+        const int64_t remaining = entry.usize - static_cast<int64_t>(out->size());
+        const size_t capacity = static_cast<size_t>(
+            entry.block_size > 0 ? (entry.block_size < remaining ? entry.block_size : remaining)
+                                 : remaining);
+        std::vector<uint8_t> plain(capacity > 0 ? capacity : 1);
+        uLongf plain_size = static_cast<uLongf>(plain.size());
+        const int code = uncompress(plain.data(), &plain_size, chunk.data(),
+                                    static_cast<uLong>(chunk.size()));
+        if (code == Z_OK) {
+            out->insert(out->end(), plain.begin(), plain.begin() + plain_size);
+        } else if (code == Z_DATA_ERROR &&
+                   static_cast<int64_t>(chunk.size()) == static_cast<int64_t>(capacity)) {
+            // 块本身没被压缩（压缩后不小于原始大小），原样拷贝
+            out->insert(out->end(), chunk.begin(), chunk.end());
+        } else {
+            *error = "解压失败(zlib " + std::to_string(code) + "): " + entry.name;
+            return false;
+        }
+    }
     return true;
 }
 

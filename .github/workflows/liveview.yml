@@ -28,6 +28,15 @@ jobs:
         run: |
           $exe = "build/Release/liveview.exe"
           if (-not (Test-Path $exe)) { throw "未生成 liveview.exe" }
+          & $exe --selftest
+          if ($LASTEXITCODE -ne 0) { throw "liveview 自检失败" }
+          & $exe --help
+          if ($LASTEXITCODE -ne 0) { throw "liveview --help 失败" }
+          # 空目录里没有 pak，应当以非零退出并打印提示（验证 CLI 管线）
+          $empty = Join-Path $env:RUNNER_TEMP "nopak"
+          New-Item -ItemType Directory -Force -Path $empty | Out-Null
+          & $exe --paks $empty --key 0000000000000000000000000000000000000000000000000000000000000000
+          if ($LASTEXITCODE -eq 0) { throw "空目录却报告成功" }
           $bundle = Join-Path $env:RUNNER_TEMP "smoke.bundle"
           @(
             "#liveview-bundle 1",
@@ -70,6 +79,8 @@ jobs:
         run: |
           $exe = "build-render/Release/liveview.exe"
           if (-not (Test-Path $exe)) { throw "未生成启用了渲染的 liveview.exe" }
+          & $exe --selftest
+          if ($LASTEXITCODE -ne 0) { throw "liveview --selftest 失败" }
           & $exe --help
           if ($LASTEXITCODE -ne 0) { throw "liveview --help 失败" }
           Get-Item $exe | Select-Object Name, Length

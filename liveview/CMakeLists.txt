@@ -4,7 +4,8 @@
 # 本地没有 C++ 工具链时，构建由 GitHub Actions 完成（见 .github/workflows/liveview.yml）。
 
 cmake_minimum_required(VERSION 3.16)
-project(liveview LANGUAGES CXX)
+# 需要 C：FetchContent 拉进来的 zlib 是 C 项目
+project(liveview LANGUAGES C CXX)
 
 if(NOT WIN32)
   message(FATAL_ERROR "liveview 目前只支持 Windows（Win32 对话框 + pak 校验）")
@@ -18,6 +19,18 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# zlib：pak 条目按 64KB 分块压缩，解压要用 inflate。
+# 用 FetchContent 拉官方源码（Windows 上没有系统 zlib，也不装 vcpkg）。
+include(FetchContent)
+set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ZLIB_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(zlib
+  GIT_REPOSITORY https://github.com/madler/zlib.git
+  GIT_TAG v1.3.1
+  GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(zlib)
+
 add_executable(liveview
   src/main.cpp
   src/bundle.cpp
@@ -25,9 +38,12 @@ add_executable(liveview
   src/pak.cpp
   src/config.cpp
   src/dialogs.cpp
+  src/ue4package.cpp
 )
 
 target_include_directories(liveview PRIVATE src)
+# zlib 不同版本的目标名不一样（zlibstatic / zlib），用生成表达式兜底
+target_link_libraries(liveview PRIVATE $<IF:$<TARGET_EXISTS:zlibstatic>,zlibstatic,zlib>)
 
 if(MSVC)
   # /utf-8：源码和字符串字面量按 UTF-8 解释，否则中文对话框会乱码

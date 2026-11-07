@@ -26,7 +26,8 @@ struct PakEntry {
 };
 
 struct PakInfo {
-    std::string path;
+    std::wstring wide_path;  // 读条目时用的原始宽路径
+    std::string path;        // 供日志显示的窄路径
     int32_t version = 0;
     int64_t index_offset = 0;
     int64_t index_size = 0;
@@ -42,5 +43,14 @@ bool LoadPakIndex(const std::wstring& path, const std::vector<uint8_t>& key,
 
 // 把 64 位十六进制串（可带 0x）解析成 32 字节密钥。
 bool ParseHexKey(const std::string& text, std::vector<uint8_t>* key);
+
+// 按名字精确查找条目。
+const PakEntry* FindEntry(const PakInfo& pak, const std::string& name);
+
+// 读取并解压条目数据。
+// 未压缩条目：数据从 offset+53 开始；压缩条目：块偏移相对条目起点，
+// 加密时块长按 16 对齐后整体 AES-256-ECB 解密，再逐块 zlib 解压。
+bool ReadEntry(const PakInfo& pak, const PakEntry& entry, const std::vector<uint8_t>& key,
+               std::vector<uint8_t>* out, std::string* error);
 
 }  // namespace liveview
