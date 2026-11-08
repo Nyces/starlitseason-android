@@ -69,10 +69,27 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure (LIVEVIEW_RENDER=ON)
-        run: cmake -S liveview -B build-render -DCMAKE_BUILD_TYPE=Release -DLIVEVIEW_RENDER=ON
+        shell: pwsh
+        run: |
+          cmake -S liveview -B build-render -DCMAKE_BUILD_TYPE=Release -DLIVEVIEW_RENDER=ON 2>&1 | Tee-Object -FilePath configure-render.log
+          if ($LASTEXITCODE -ne 0) { throw "配置失败（exit $LASTEXITCODE）" }
 
       - name: Build
-        run: cmake --build build-render --config Release --parallel
+        shell: pwsh
+        run: |
+          cmake --build build-render --config Release --parallel 2>&1 | Tee-Object -FilePath build-render.log
+          if ($LASTEXITCODE -ne 0) { throw "构建失败（exit $LASTEXITCODE）" }
+
+      - name: Show build tail
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($f in @("configure-render.log", "build-render.log")) {
+            if (Test-Path $f) {
+              Write-Output "===== $f (tail) ====="
+              Get-Content $f -Tail 120
+            }
+          }
 
       - name: Check binary
         shell: pwsh

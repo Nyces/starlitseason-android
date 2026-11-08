@@ -80,8 +80,15 @@ if(LIVEVIEW_RENDER)
 
   # 着色器：构建期用 glslang 把 GLSL 编成 SPIR-V，再嵌进可执行文件。
   # 这样运行时不需要外部 .spv 文件，也不依赖 Vulkan SDK。
+  # glslang 默认会去 add_subdirectory(External) 里的 SPIRV-Tools/SPIRV-Headers
+  # 子模块，但 FetchContent 拉下来的是没有子模块的浅克隆，必须关掉；
+  # 我们的 GLSL 也不需要 spirv-opt / HLSL / PCH。
+  set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
   set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
   set(ENABLE_SPIRV ON CACHE BOOL "" FORCE)
+  set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+  set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+  set(ENABLE_PCH OFF CACHE BOOL "" FORCE)
   set(ENABLE_GLSLANG_BINARIES ON CACHE BOOL "" FORCE)
   set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
   set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
