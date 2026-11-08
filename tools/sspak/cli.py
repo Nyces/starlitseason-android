@@ -1378,8 +1378,8 @@ def _show_animation(store, anim: str, step: int, verbose: bool = True):
 
 
 def _show_camera_keys(store, sequence_asset: str, binding_name: str,
-                      duration: float, fps: float):
-    """按固定帧率采样相机轨。"""
+                      duration: float, fps: float, character_binding: str = ""):
+    """按固定帧率采样相机轨，并顺带取角色站位（角色相机的瞄准点）。"""
     from .ue4.sequence import camera_pose, parse_level_sequence
 
     package = store.package(sequence_asset)
@@ -1395,6 +1395,15 @@ def _show_camera_keys(store, sequence_asset: str, binding_name: str,
         raise SystemExit(f"序列里没有相机绑定: {sequence_asset}")
     tick_fps = info.tick_fps or info.display_fps or 1.0
 
+    # 角色站位：角色跟拍相机（CamCharaA）的环绕中心就是该角色在舞台上的位置
+    character_target = None
+    if character_binding:
+        character = next((b for b in info.bindings if b.name == character_binding), None)
+        if character is not None:
+            pose = camera_pose(character, 0.0)
+            if pose is not None:
+                character_target = pose.target
+
     keys = []
     count = max(1, int(round(duration * fps)) + 1)
     for i in range(count):
@@ -1403,7 +1412,7 @@ def _show_camera_keys(store, sequence_asset: str, binding_name: str,
         if pose is None:
             continue
         keys.append((int(round(frame)), pose.position, pose.target))
-    return keys, tick_fps, binding.name
+    return keys, tick_fps, binding.name, character_target
 
 
 def cmd_live_show(args) -> int:
@@ -1417,16 +1426,19 @@ def cmd_live_show(args) -> int:
         anim_fps = float(args.anim_fps)
         animation, num_frames = _show_animation(store, args.anim, args.anim_step)
         duration = max(0.0, (num_frames - 1) / anim_fps)
-        camera_keys, tick_fps, binding_name = _show_camera_keys(
-            store, args.sequence, args.binding, duration, args.camera_fps)
+        camera_keys, tick_fps, binding_name, character_target = _show_camera_keys(
+            store, args.sequence, args.binding, duration, args.camera_fps,
+            args.character_binding)
         stages = _show_stage_meshes(store, args.map)
         skins = _show_skin_meshes(store, args.chr)
 
-        # 角色落位：相机环绕中心就是舞台中心，脚底贴到主地面（实测 z≈0.1）。
-        # 角色自身朝 +Y（脸的正面），第一关键帧机位在 +Y 侧，正好面向观众。
-        if camera_keys:
-            target = camera_keys[0][2]
-            offset = (float(target[0]), float(target[1]), float(args.character_z))
+        # 角色落位：优先用角色跟拍相机的瞄准点（= 角色在舞台上的位置），
+        # 没有该绑定时退回播放相机的首个瞄准点。脚底贴到主地面（实测 z≈0.1）。
+        anchor = character_target
+        if anchor is None and camera_keys:
+            anchor = camera_keys[0][2]
+        if anchor is not None:
+            offset = (float(anchor[0]), float(anchor[1]), float(args.character_z))
         else:
             offset = (0.0, 0.0, float(args.character_z))
 
@@ -1729,6 +1741,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.add_argument("--sequence", default="Sequence/Live/Sng001/LS_Sng001_Common_Camera",
                         help="相机 LevelSequence 资源路径（不含扩展名）")
     p_show.add_argument("--binding", default="CamAllA", help="相机绑定名")
+    p_show.add_argument("--character-binding", default="CamCharaA",
+                        help="角色跟拍相机绑定名（用它的瞄准点作为角色站位）")
     p_show.add_argument("--anim-fps", type=float, default=60.0, help="动画原始帧率")
     p_show.add_argument("--anim-step", type=int, default=2, help="动画采样步长（2 = 30fps）")
     p_show.add_argument("--camera-fps", type=float, default=30.0, help="相机采样帧率")
