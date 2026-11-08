@@ -16,5 +16,6 @@ string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${hex}")
 file(WRITE "${OUTPUT}"
   "// 由 CMake 自动生成，请勿手改。\n"
   "#pragma once\n"
-  "static const unsigned char ${NAME}[] = {${bytes}};\n"
+  "// 4 字节对齐：Vulkan 要求 pCode 指向按 4 字节对齐的 SPIR-V。\n"
+  "alignas(4) static const unsigned char ${NAME}[] = {${bytes}};\n"
   "static const unsigned int ${NAME}_size = ${byte_length}u;\n")
