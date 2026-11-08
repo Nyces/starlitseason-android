@@ -26,6 +26,7 @@
 #include "bundle.h"
 #include "commands.h"
 #include "pak.h"
+#include "show.h"
 
 #ifdef LIVEVIEW_RENDER
 #include "render_vulkan.h"
@@ -44,7 +45,8 @@ void PrintUsage() {
         "  liveview <bundle>                          打印包信息与首末关键帧\n"
         "  liveview <bundle> --at <帧>                输出该帧插值后的机位\n"
         "  liveview <bundle> --play <秒>              按 tick 频率逐帧推进并打印机位\n"
-        "  liveview <bundle> --render[=秒]            打开窗口按时间轴播放（需渲染后端）\n");
+        "  liveview <bundle> --render[=秒]            打开窗口按时间轴播放（需渲染后端）\n"
+        "  liveview --show <演出包> [--play]          打印演出包统计；--play 直接播放\n");
 }
 
 void PrintPose(const liveview::Bundle& bundle, double frame) {
@@ -235,6 +237,57 @@ int RunBundleCommand(int argc, char** argv) {
     return 0;
 }
 
+int RunShowCommand(int argc, char** argv) {
+    if (argc < 3) {
+        PrintUsage();
+        return 1;
+    }
+    liveview::Show show;
+    std::string error;
+    if (!show.Load(FromAnsi(argv[2]), &error)) {
+        std::fprintf(stderr, "读取演出包失败: %s\n", error.c_str());
+        return 1;
+    }
+
+    std::printf("演出包\n");
+    std::printf("  时长        %.3f 秒\n", show.duration);
+    std::printf("  相机 tick   %.1f fps，关键帧 %zu 个\n", show.camera_tick_fps,
+                show.camera_keys.size());
+    std::printf("  动画        %.1f fps，%zu 根骨骼，%zu 帧\n", show.anim_fps,
+                show.anim_bones.size(), show.poses.size());
+    std::printf("  角色落位    (%.2f, %.2f, %.2f)\n", show.character_offset[0],
+                show.character_offset[1], show.character_offset[2]);
+    std::printf("  舞台        %zu 个网格，%zu 顶点，%zu 三角\n", show.stages.size(),
+                show.StageVertexCount(), show.StageTriangleCount());
+    std::printf("  蒙皮        %zu 个网格，%zu 顶点，%zu 三角\n", show.skins.size(),
+                show.SkinVertexCount(), show.SkinTriangleCount());
+    for (size_t i = 0; i < show.skins.size(); ++i) {
+        const liveview::ShowSkin& skin = show.skins[i];
+        std::printf("    [%zu] 骨骼 %zu，跟随 %s\n", i, skin.bones.size(),
+                    skin.attach_bone.empty() ? "-" : skin.attach_bone.c_str());
+    }
+
+    bool play = false;
+    for (int i = 3; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--play") == 0) {
+            play = true;
+        } else {
+            PrintUsage();
+            return 1;
+        }
+    }
+
+    if (play) {
+#ifdef LIVEVIEW_RENDER
+        return liveview::RunShow(show);
+#else
+        std::fprintf(stderr, "本构建未启用渲染后端（需用 -DLIVEVIEW_RENDER=ON 重新构建）\n");
+        return 1;
+#endif
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -257,6 +310,9 @@ int main(int argc, char** argv) {
     }
     if (std::strcmp(argv[1], "--paks") == 0) {
         return RunPaksCommand(argc, argv);
+    }
+    if (std::strcmp(argv[1], "--show") == 0) {
+        return RunShowCommand(argc, argv);
     }
     return RunBundleCommand(argc, argv);
 }

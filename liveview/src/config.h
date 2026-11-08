@@ -10,6 +10,7 @@ struct Config {
     std::wstring game_dir;
     std::string key_hex;
     std::wstring bundle_path;
+    std::wstring show_path;   // 演出包（*.lvs）
 };
 
 std::wstring ConfigPath();

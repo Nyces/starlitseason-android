@@ -83,6 +83,35 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "liveview --selftest 失败" }
           & $exe --help
           if ($LASTEXITCODE -ne 0) { throw "liveview --help 失败" }
+
+          # 用 Python 造一个最小演出包，验证 C++ 侧的二进制读取（CI 没有游戏资源）
+          $script = @'
+          import struct
+          f = open("smoke.lvs", "wb")
+          f.write(b"LVS2")
+          f.write(struct.pack("<I", 2))
+          f.write(struct.pack("<ddd", 24000.0, 60.0, 1.0))
+          f.write(struct.pack("<3f", 0.0, 0.0, 0.0))
+          f.write(struct.pack("<I", 2))
+          for frame in (0, 24000):
+              f.write(struct.pack("<q", frame))
+              f.write(struct.pack("<3f", 0.0, -500.0, 120.0))
+              f.write(struct.pack("<3f", 0.0, 0.0, 100.0))
+          f.write(struct.pack("<I", 0))
+          f.write(struct.pack("<I", 0))
+          f.write(struct.pack("<II", 1, 2))
+          f.write(struct.pack("<H", 1) + b"A")
+          for frame in (0, 60):
+              f.write(struct.pack("<q", frame))
+              f.write(struct.pack("<4f", 0.0, 0.0, 0.0, 1.0))
+              f.write(bytes([1, 0]))
+          f.close()
+          '@
+          $script | python -
+          & $exe --show smoke.lvs
+          if ($LASTEXITCODE -ne 0) { throw "liveview --show 读取失败" }
+          & $exe --show smoke.lvs --nope
+          if ($LASTEXITCODE -ne 1) { throw "--show 未识别参数应返回 1" }
           Get-Item $exe | Select-Object Name, Length
 
       - name: Upload artifact

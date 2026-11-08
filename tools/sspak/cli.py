@@ -1135,6 +1135,321 @@ def cmd_live_bundle(args) -> int:
             pak.close()
 
 
+def _material_average_color(store, material, default, cache):
+    """材质基础色贴图的平均颜色（线性 0..1），解析失败时用默认色。"""
+    import numpy as np
+
+    if not material:
+        return default
+    if material in cache:
+        return cache[material]
+    color = default
+    texture = None
+    try:
+        _, texture = _material_texture(store, material)
+    except Exception:  # noqa: BLE001 - 贴图解码失败不影响几何导出
+        texture = None
+    if texture is not None and getattr(texture, "size", 0) > 0:
+        # 隔行取样就够了，整张大图求均值太慢
+        sample = texture[::4, ::4]
+        mask = sample[:, :, 3] > 8
+        if bool(mask.any()):
+            rgb = sample[:, :, :3][mask].astype(np.float64).mean(axis=0) / 255.0
+            color = tuple(float(v) for v in rgb)
+    cache[material] = color
+    return color
+
+
+def _show_stage_meshes(store, map_path: str, verbose: bool = True):
+    """把关卡里的静态网格烘成世界坐标的演出网格。"""
+    import numpy as np
+
+    from .ue4.level import parse_level
+    from .ue4.show import StageMesh
+    from .ue4.staticmesh import parse_static_mesh
+    from .render import _smooth_normals
+
+    package = store.package(map_path)
+    if package is None:
+        raise SystemExit(f"未找到地图: {map_path}")
+    placed = parse_level(package)
+    if verbose:
+        print(f"关卡 {map_path}：静态网格 actor {len(placed)} 个")
+
+    cache: dict[str, object] = {}
+    colors: dict[str, tuple[float, float, float]] = {}
+    meshes = []
+    skipped = 0
+    for entry in placed:
+        if entry.mesh not in cache:
+            mesh_package = store.package(entry.mesh)
+            mesh = None
+            if mesh_package is not None:
+                export = mesh_package.find_export("StaticMesh")
+                if export is not None:
+                    try:
+                        mesh = parse_static_mesh(mesh_package.export_bytes(export),
+                                                 mesh_package)
+                    except Exception:  # noqa: BLE001
+                        mesh = None
+            cache[entry.mesh] = mesh
+        mesh = cache[entry.mesh]
+        if mesh is None or len(mesh.indices) == 0:
+            skipped += 1
+            continue
+
+        placement = _placement_matrix(entry.location, entry.rotation, entry.scale)
+        rotation = placement[:3, :3]
+        positions = (mesh.positions @ rotation.T + placement[:3, 3]).astype(np.float32)
+        normals = _smooth_normals(mesh.positions, mesh.indices)
+        normal_matrix = np.linalg.inv(rotation).T
+        normals = normals @ normal_matrix.T
+        length = np.linalg.norm(normals, axis=1, keepdims=True)
+        length[length == 0] = 1.0
+        normals = (normals / length).astype(np.float32)
+
+        vertex_colors = np.full((len(positions), 3), 0.55, np.float32)
+        kept: list[np.ndarray] = []
+        sections = mesh.sections or [None]
+        for section in sections:
+            if section is None:
+                indices, slot_index = mesh.indices, 0
+            else:
+                start = section.first_index
+                count = section.num_triangles * 3
+                indices, slot_index = mesh.indices[start:start + count], section.material_index
+            if len(indices) == 0:
+                continue
+            material = None
+            if entry.materials and slot_index < len(entry.materials):
+                material = entry.materials[slot_index]
+            if not material and slot_index < len(mesh.material_slots):
+                material = mesh.material_slots[slot_index]
+            if material and "outline" in material.lower():
+                continue
+            kept.append(indices)
+            color = _material_average_color(store, material, (0.55, 0.55, 0.6), colors)
+            vertex_colors[np.unique(indices)] = color
+        if not kept:
+            continue
+        indices = np.concatenate(kept).astype(np.uint32)
+        meshes.append(StageMesh(positions=positions, normals=normals,
+                                colors=vertex_colors, indices=indices))
+    if verbose:
+        total = sum(len(m.positions) for m in meshes)
+        print(f"  舞台网格 {len(meshes)} 个 / 顶点 {total:,}（跳过 {skipped} 个 actor）")
+    return meshes
+
+
+def _show_skin_meshes(store, chr_id: str, verbose: bool = True):
+    """把角色的身体/脸/头发/饰品导成蒙皮网格（头发与饰品跟随 SO_Head）。"""
+    import numpy as np
+
+    from .ue4.show import SkinMesh
+    from .ue4.skeletalmesh import parse_skeletal_mesh
+    from .render import _smooth_normals
+
+    candidates = [
+        f"Model/Character/Body/Priv/chr_body_priv001_{chr_id}/Mesh/SK_chr_body_priv001_{chr_id}_a",
+        f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_face",
+        f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_hair",
+        f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_orna",
+    ]
+    colors: dict[str, tuple[float, float, float]] = {}
+    meshes = []
+    for asset in candidates:
+        package = store.package(asset)
+        if package is None:
+            continue
+        try:
+            mesh = parse_skeletal_mesh(package)
+        except Exception as exc:  # noqa: BLE001
+            if verbose:
+                print(f"  [warn] 骨骼网格解析失败 {asset.rsplit('/', 1)[-1]}: {exc}")
+            continue
+        if mesh.influence_bones is None or mesh.influence_weights is None:
+            if verbose:
+                print(f"  [warn] {asset.rsplit('/', 1)[-1]} 缺少蒙皮权重，跳过")
+            continue
+
+        normals = _smooth_normals(mesh.positions, mesh.indices)
+        vertex_colors = np.full((len(mesh.positions), 3), 0.62, np.float32)
+        kept: list[np.ndarray] = []
+        for section in mesh.sections:
+            start = section.base_index
+            count = section.num_triangles * 3
+            indices = mesh.indices[start:start + count]
+            if len(indices) == 0:
+                continue
+            slot = (mesh.material_slots[section.material_index]
+                    if section.material_index < len(mesh.material_slots) else None)
+            if slot and "outline" in slot.lower():
+                continue
+            kept.append(indices)
+            color = _material_average_color(store, slot, (0.62, 0.58, 0.55), colors)
+            vertex_colors[np.unique(indices)] = color
+        if not kept:
+            continue
+        indices = np.concatenate(kept).astype(np.uint32)
+        attach = "SO_Head" if asset.endswith(("_hair", "_orna")) else ""
+        # 权重为 0 的槽位里可能残留 0xFFFF（无影响的哨兵值），钳到 0 号骨骼，
+        # 否则 C++ 侧按骨骼下标取矩阵会越界。
+        bone_indices = mesh.influence_bones.astype(np.int32).copy()
+        weights = mesh.influence_weights.astype(np.float32).copy()
+        bone_indices[weights <= 0.0] = 0
+        meshes.append(SkinMesh(
+            bones=mesh.bones, bind_pose=mesh.bind_pose,
+            positions=mesh.positions, normals=normals, colors=vertex_colors,
+            bone_indices=bone_indices.astype(np.uint16),
+            weights=weights,
+            indices=indices, attach_bone=attach))
+        if verbose:
+            print(f"  {asset.rsplit('/', 1)[-1]}: {len(mesh.positions)} 顶点 / "
+                  f"{len(indices) // 3} 三角 / {len(mesh.bones)} 骨骼")
+    return meshes
+
+
+def _show_animation(store, anim: str, step: int, verbose: bool = True):
+    """逐帧采样动画，返回 (Animation, 原始总帧数, 帧率)。"""
+    import numpy as np
+
+    from .ue4.anim import _sample_keys, parse_animation, quat_matrix
+    from .ue4.show import Animation, quat_from_matrix
+
+    package = store.package(anim)
+    if package is None:
+        raise SystemExit(f"未找到动画: {anim}")
+    try:
+        sequence = parse_animation(package)
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(f"动画解析失败 {anim}: {exc}") from exc
+
+    names, binds, parents = _master_bones(store)
+    facial = _facial_bones(names, parents)
+    tracks: list[tuple[str, np.ndarray | None, np.ndarray | None]] = []
+    seen: set[str] = set()
+    space_offsets = 0
+    for t, bone in enumerate(sequence.bone_indices):
+        bone = int(bone)
+        if not 0 <= bone < len(names) or bone in facial:
+            continue
+        name = names[bone]
+        if name in seen:
+            continue
+        rotation = None
+        keys = sequence.rotations[t]
+        if len(keys) > 1:
+            if _is_space_offset(keys, binds[bone]):
+                space_offsets += 1
+            else:
+                rotation = keys
+        position = sequence.positions[t] if len(sequence.positions[t]) > 1 else None
+        if rotation is None and position is None:
+            continue
+        seen.add(name)
+        tracks.append((name, rotation, position))
+
+    step = max(1, step)
+    frames = list(range(0, sequence.num_frames, step))
+    if frames[-1] != sequence.num_frames - 1:
+        frames.append(sequence.num_frames - 1)
+
+    quats = np.zeros((len(frames), len(tracks), 4), np.float32)
+    quats[:, :, 3] = 1.0
+    has_rotation = np.zeros((len(frames), len(tracks)), bool)
+    translations = np.full((len(frames), len(tracks), 3), np.nan, np.float32)
+    for row, frame in enumerate(frames):
+        for column, (_, rotation, position) in enumerate(tracks):
+            if rotation is not None:
+                quats[row, column] = quat_from_matrix(
+                    quat_matrix(_sample_keys(rotation, frame, sequence.num_frames)))
+                has_rotation[row, column] = True
+            if position is not None:
+                translations[row, column] = _sample_keys(
+                    position, frame, sequence.num_frames)
+    if verbose:
+        print(f"  动画 {anim.rsplit('/', 1)[-1]}：{len(tracks)} 根骨骼 / "
+              f"{sequence.num_frames} 帧 -> 采样 {len(frames)} 帧 "
+              f"（空间常量 {space_offsets} 轨）")
+    animation = Animation(bone_names=[t[0] for t in tracks], frames=frames,
+                          quats=quats, has_rotation=has_rotation,
+                          translations=translations)
+    return animation, sequence.num_frames
+
+
+def _show_camera_keys(store, sequence_asset: str, binding_name: str,
+                      duration: float, fps: float):
+    """按固定帧率采样相机轨。"""
+    from .ue4.sequence import camera_pose, parse_level_sequence
+
+    package = store.package(sequence_asset)
+    if package is None:
+        raise SystemExit(f"未找到序列: {sequence_asset}")
+    info = parse_level_sequence(package)
+    binding = next((b for b in info.bindings if b.name == binding_name), None)
+    if binding is None:
+        binding = next((b for b in info.bindings
+                        if any(t.class_name == "LiveCameraMovementTrack" for t in b.tracks)),
+                       info.bindings[0] if info.bindings else None)
+    if binding is None:
+        raise SystemExit(f"序列里没有相机绑定: {sequence_asset}")
+    tick_fps = info.tick_fps or info.display_fps or 1.0
+
+    keys = []
+    count = max(1, int(round(duration * fps)) + 1)
+    for i in range(count):
+        frame = (i / fps) * tick_fps
+        pose = camera_pose(binding, frame)
+        if pose is None:
+            continue
+        keys.append((int(round(frame)), pose.position, pose.target))
+    return keys, tick_fps, binding.name
+
+
+def cmd_live_show(args) -> int:
+    """导出 liveview 直接播放的演出包（相机 + 舞台 + 角色 + 动画）。"""
+    paks = _open_all(args)
+    try:
+        from .ue4.content import ContentStore
+        from .ue4.show import ShowWriter
+
+        store = ContentStore(paks)
+        anim_fps = float(args.anim_fps)
+        animation, num_frames = _show_animation(store, args.anim, args.anim_step)
+        duration = max(0.0, (num_frames - 1) / anim_fps)
+        camera_keys, tick_fps, binding_name = _show_camera_keys(
+            store, args.sequence, args.binding, duration, args.camera_fps)
+        stages = _show_stage_meshes(store, args.map)
+        skins = _show_skin_meshes(store, args.chr)
+
+        # 角色落位：相机环绕中心就是舞台中心，脚底贴到主地面（实测 z≈0.1）。
+        # 角色自身朝 +Y（脸的正面），第一关键帧机位在 +Y 侧，正好面向观众。
+        if camera_keys:
+            target = camera_keys[0][2]
+            offset = (float(target[0]), float(target[1]), float(args.character_z))
+        else:
+            offset = (0.0, 0.0, float(args.character_z))
+
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        writer = ShowWriter(args.out)
+        try:
+            writer.timeline(tick_fps, anim_fps, duration, offset)
+            writer.camera(camera_keys)
+            writer.stage(stages)
+            writer.skins(skins)
+            writer.animation(animation)
+        finally:
+            writer.close()
+        print(f"已写出演出包 {args.out}")
+        print(f"  时长 {duration:.2f}s  相机 {binding_name} {len(camera_keys)} 关键帧  "
+              f"舞台 {len(stages)} 网格  蒙皮 {len(skins)} 网格  "
+              f"动画 {len(animation.bone_names)} 骨骼 × {len(animation.frames)} 帧")
+        return 0
+    finally:
+        for pak in paks:
+            pak.close()
+
+
 def cmd_sequence(args) -> int:
     """列出 LevelSequence 的绑定、轨道与区段范围。"""
     from .ue4.sequence import (SequenceError, camera_pose, parse_level_sequence,
@@ -1403,6 +1718,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_bundle.add_argument("--end", type=int, default=None, help="结束帧")
     p_bundle.add_argument("--step", type=int, default=240, help="采样步长（帧）")
     p_bundle.set_defaults(func=cmd_live_bundle)
+
+    p_show = sub.add_parser("live-show", help="导出 liveview 直接播放的演出包（相机+舞台+角色）")
+    p_show.add_argument("--out", required=True, help="输出演出包路径（*.lvs）")
+    p_show.add_argument("--chr", default="chr0101", help="角色 ID")
+    p_show.add_argument("--anim", default="Animation/Character/Live/Sng001/A_sng001_D_Pos01",
+                        help="舞蹈动画资源路径（不含扩展名）")
+    p_show.add_argument("--map", default="Maps/Game/Stage/LEVEL_Stg111_Map",
+                        help="舞台地图资源路径（不含扩展名）")
+    p_show.add_argument("--sequence", default="Sequence/Live/Sng001/LS_Sng001_Common_Camera",
+                        help="相机 LevelSequence 资源路径（不含扩展名）")
+    p_show.add_argument("--binding", default="CamAllA", help="相机绑定名")
+    p_show.add_argument("--anim-fps", type=float, default=60.0, help="动画原始帧率")
+    p_show.add_argument("--anim-step", type=int, default=2, help="动画采样步长（2 = 30fps）")
+    p_show.add_argument("--camera-fps", type=float, default=30.0, help="相机采样帧率")
+    p_show.add_argument("--character-z", type=float, default=0.0,
+                        help="角色脚底的世界 Z（舞台主地面）")
+    p_show.set_defaults(func=cmd_live_show)
 
     return parser
 

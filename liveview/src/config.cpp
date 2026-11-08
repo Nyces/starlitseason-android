@@ -15,6 +15,7 @@ constexpr wchar_t kSection[] = L"liveview";
 constexpr wchar_t kKeyDir[] = L"game_dir";
 constexpr wchar_t kKeyAes[] = L"aes_key";
 constexpr wchar_t kKeyBundle[] = L"bundle_path";
+constexpr wchar_t kKeyShow[] = L"show_path";
 
 std::wstring BaseDirectory() {
     wchar_t buffer[MAX_PATH * 2];
@@ -54,6 +55,7 @@ bool LoadConfig(Config* config) {
         config->key_hex.push_back(ch < 0x80 ? static_cast<char>(ch) : '?');
     }
     config->bundle_path = ReadValue(path, kKeyBundle);
+    config->show_path = ReadValue(path, kKeyShow);
     return !config->game_dir.empty() || !config->key_hex.empty();
 }
 
@@ -66,7 +68,9 @@ bool SaveConfig(const Config& config) {
         WritePrivateProfileStringW(kSection, kKeyAes, key.c_str(), path.c_str());
     const BOOL ok_bundle = WritePrivateProfileStringW(kSection, kKeyBundle,
                                                       config.bundle_path.c_str(), path.c_str());
-    return ok_dir != FALSE && ok_key != FALSE && ok_bundle != FALSE;
+    const BOOL ok_show = WritePrivateProfileStringW(kSection, kKeyShow,
+                                                    config.show_path.c_str(), path.c_str());
+    return ok_dir != FALSE && ok_key != FALSE && ok_bundle != FALSE && ok_show != FALSE;
 }
 
 }  // namespace liveview

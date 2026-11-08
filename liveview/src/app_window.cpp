@@ -27,6 +27,7 @@
 #include "config.h"
 #include "dialogs.h"
 #include "pak.h"
+#include "show.h"
 
 #ifdef LIVEVIEW_RENDER
 #include "render_vulkan.h"
@@ -58,6 +59,10 @@ enum ControlId {
     kIdBundleEdit,
     kIdBundleBrowse,
     kIdPlay,
+    kIdShowLabel,
+    kIdShowEdit,
+    kIdShowBrowse,
+    kIdShowPlay,
     kIdClearLog,
     kIdLog,
 };
@@ -90,6 +95,10 @@ struct AppState {
     HWND bundle_edit = nullptr;
     HWND bundle_browse = nullptr;
     HWND play = nullptr;
+    HWND show_label = nullptr;
+    HWND show_edit = nullptr;
+    HWND show_browse = nullptr;
+    HWND show_play = nullptr;
 
     HWND clear_log = nullptr;
     HWND log = nullptr;
@@ -163,6 +172,7 @@ void SaveCurrentConfig(AppState* state) {
     config.game_dir = GetText(state->dir_edit);
     config.key_hex = NarrowAscii(GetText(state->key_edit));
     config.bundle_path = GetText(state->bundle_edit);
+    config.show_path = GetText(state->show_edit);
     SaveConfig(config);
 }
 
@@ -264,8 +274,8 @@ void LayoutControls(AppState* state, int width, int height) {
     Place(state->dump, width - margin - 12 - button_width, inner_y, button_width, row_height);
     y += asset_height + gap;
 
-    // 分组：播放
-    const int play_height = 56;
+    // 分组：播放（相机包 + 完整演出）
+    const int play_height = 84;
     Place(state->group_play, margin, y, width - margin * 2, play_height);
     inner_y = y + 22;
     const int small_button = 72;
@@ -276,6 +286,11 @@ void LayoutControls(AppState* state, int width, int height) {
     const int browse_x = inner_x + (bundle_width > 80 ? bundle_width : 80) + gap;
     Place(state->bundle_browse, browse_x, inner_y, small_button, row_height);
     Place(state->play, browse_x + small_button + gap, inner_y, small_button, row_height);
+    inner_y += row_height + gap;
+    Place(state->show_label, margin + 12, inner_y + 4, 60, 18);
+    Place(state->show_edit, inner_x, inner_y, bundle_width > 80 ? bundle_width : 80, row_height);
+    Place(state->show_browse, browse_x, inner_y, small_button, row_height);
+    Place(state->show_play, browse_x + small_button + gap, inner_y, small_button, row_height);
     y += play_height + gap;
 
     // 日志
@@ -386,6 +401,33 @@ void OnPlay(AppState* state) {
 #endif
 }
 
+void OnPlayShow(AppState* state) {
+    const std::wstring path = GetText(state->show_edit);
+    if (path.empty()) {
+        AppendLog(state, L"[错误] 请先选择演出包（*.lvs，由 sspak live-show 生成）");
+        return;
+    }
+    Show show;
+    std::string error;
+    if (!show.Load(path, &error)) {
+        AppendLog(state, L"[错误] 读取演出包失败：" + WidenUtf8(error));
+        return;
+    }
+    AppendLog(state, L"演出包：" + path);
+    AppendLog(state, L"  时长 " + std::to_wstring(static_cast<int>(show.duration + 0.5)) +
+                         L" 秒，舞台 " + std::to_wstring(show.StageTriangleCount()) +
+                         L" 三角，角色 " + std::to_wstring(show.SkinTriangleCount()) +
+                         L" 三角，动画 " + std::to_wstring(show.anim_bones.size()) + L" 骨骼");
+    SaveCurrentConfig(state);
+#ifdef LIVEVIEW_RENDER
+    AppendLog(state, L"打开演出窗口（ESC 退出）…");
+    const int code = RunShow(show);
+    AppendLog(state, L"演出窗口已关闭，退出码 " + std::to_wstring(code));
+#else
+    AppendLog(state, L"本构建未启用渲染后端：需用 -DLIVEVIEW_RENDER=ON 重新构建");
+#endif
+}
+
 void OnCommand(AppState* state, int id) {
     switch (id) {
         case kIdDirBrowse: {
@@ -422,6 +464,17 @@ void OnCommand(AppState* state, int id) {
         }
         case kIdPlay:
             OnPlay(state);
+            return;
+        case kIdShowBrowse: {
+            std::wstring path = GetText(state->show_edit);
+            if (PickOpenFile(&path, L"演出包 (*.lvs)\0*.lvs\0所有文件\0*.*\0")) {
+                SetText(state->show_edit, path);
+                SaveCurrentConfig(state);
+            }
+            return;
+        }
+        case kIdShowPlay:
+            OnPlayShow(state);
             return;
         case kIdClearLog:
             ClearLog(state);
@@ -468,6 +521,13 @@ void CreateControls(AppState* state) {
     state->bundle_browse = MakeControl(state, L"BUTTON", L"浏览…", BS_PUSHBUTTON | WS_TABSTOP,
                                        kIdBundleBrowse);
     state->play = MakeControl(state, L"BUTTON", L"播放", BS_PUSHBUTTON | WS_TABSTOP, kIdPlay);
+    state->show_label = MakeControl(state, L"STATIC", L"演出包", SS_LEFT, kIdShowLabel);
+    state->show_edit = MakeControl(state, L"EDIT", L"",
+                                   WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kIdShowEdit);
+    state->show_browse = MakeControl(state, L"BUTTON", L"浏览…", BS_PUSHBUTTON | WS_TABSTOP,
+                                     kIdShowBrowse);
+    state->show_play = MakeControl(state, L"BUTTON", L"播放演出", BS_PUSHBUTTON | WS_TABSTOP,
+                                   kIdShowPlay);
 
     state->clear_log = MakeControl(state, L"BUTTON", L"清空日志", BS_PUSHBUTTON | WS_TABSTOP,
                                    kIdClearLog);
@@ -486,6 +546,25 @@ void LoadConfigIntoControls(AppState* state) {
     SetText(state->dir_edit, config.game_dir);
     SetText(state->key_edit, std::wstring(config.key_hex.begin(), config.key_hex.end()));
     SetText(state->bundle_edit, config.bundle_path);
+
+    // 演出包没配置时，默认用可执行文件旁边的 sng001.lvs，这样双击打开就能直接播。
+    std::wstring show_path = config.show_path;
+    if (show_path.empty()) {
+        wchar_t exe[MAX_PATH * 2] = {0};
+        const DWORD length = GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
+        if (length > 0 && length < MAX_PATH * 2) {
+            std::wstring candidate(exe, length);
+            const size_t slash = candidate.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) {
+                candidate.resize(slash + 1);
+            }
+            candidate += L"sng001.lvs";
+            if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                show_path = candidate;
+            }
+        }
+    }
+    SetText(state->show_edit, show_path);
     if (!config.game_dir.empty() || !config.key_hex.empty()) {
         AppendLog(state, L"已读取上次的目录与密钥，可直接点「校验 pak 索引」");
     }
@@ -514,6 +593,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
             LayoutControls(created, client.right - client.left, client.bottom - client.top);
             LoadConfigIntoControls(created);
             AppendLog(created, L"选择游戏资源目录、填入 AES 密钥，然后点「校验 pak 索引」。");
+            // 已经配好演出包时，打开软件就自动开始播放（延迟一点等窗口画完）
+            if (!GetText(created->show_edit).empty()) {
+                SetTimer(window, 1, 600, nullptr);
+            }
             return 0;
         }
         case WM_SIZE: {
@@ -525,7 +608,17 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         case WM_GETMINMAXINFO: {
             auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
             info->ptMinTrackSize.x = 760;
-            info->ptMinTrackSize.y = 560;
+            info->ptMinTrackSize.y = 620;
+            return 0;
+        }
+        case WM_TIMER: {
+            if (wparam == 1) {
+                KillTimer(window, 1);
+                if (state != nullptr && !GetText(state->show_edit).empty()) {
+                    PostMessageW(window, WM_COMMAND,
+                                 MAKEWPARAM(kIdShowPlay, BN_CLICKED), 0);
+                }
+            }
             return 0;
         }
         case WM_COMMAND: {

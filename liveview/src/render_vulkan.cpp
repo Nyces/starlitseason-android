@@ -20,7 +20,9 @@
 
 #include <vulkan/vulkan.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -28,6 +30,10 @@
 #include <vector>
 
 #include "render_vulkan.h"
+
+#include "scene_frag_spirv.h"
+#include "scene_vert_spirv.h"
+#include "show.h"
 
 namespace liveview {
 namespace {
@@ -47,6 +53,7 @@ PFN_vkDestroyInstance g_vkDestroyInstance = nullptr;
 PFN_vkEnumeratePhysicalDevices g_vkEnumeratePhysicalDevices = nullptr;
 PFN_vkEnumerateDeviceExtensionProperties g_vkEnumerateDeviceExtensionProperties = nullptr;
 PFN_vkGetPhysicalDeviceProperties g_vkGetPhysicalDeviceProperties = nullptr;
+PFN_vkGetPhysicalDeviceMemoryProperties g_vkGetPhysicalDeviceMemoryProperties = nullptr;
 PFN_vkGetPhysicalDeviceQueueFamilyProperties g_vkGetPhysicalDeviceQueueFamilyProperties = nullptr;
 PFN_vkGetPhysicalDeviceSurfaceSupportKHR g_vkGetPhysicalDeviceSurfaceSupportKHR = nullptr;
 PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR g_vkGetPhysicalDeviceSurfaceCapabilitiesKHR = nullptr;
@@ -84,6 +91,39 @@ PFN_vkCreateFence g_vkCreateFence = nullptr;
 PFN_vkDestroyFence g_vkDestroyFence = nullptr;
 PFN_vkWaitForFences g_vkWaitForFences = nullptr;
 PFN_vkResetFences g_vkResetFences = nullptr;
+
+// 网格渲染需要的入口
+PFN_vkCreateBuffer g_vkCreateBuffer = nullptr;
+PFN_vkDestroyBuffer g_vkDestroyBuffer = nullptr;
+PFN_vkGetBufferMemoryRequirements g_vkGetBufferMemoryRequirements = nullptr;
+PFN_vkBindBufferMemory g_vkBindBufferMemory = nullptr;
+PFN_vkCreateImage g_vkCreateImage = nullptr;
+PFN_vkDestroyImage g_vkDestroyImage = nullptr;
+PFN_vkGetImageMemoryRequirements g_vkGetImageMemoryRequirements = nullptr;
+PFN_vkBindImageMemory g_vkBindImageMemory = nullptr;
+PFN_vkAllocateMemory g_vkAllocateMemory = nullptr;
+PFN_vkFreeMemory g_vkFreeMemory = nullptr;
+PFN_vkMapMemory g_vkMapMemory = nullptr;
+PFN_vkUnmapMemory g_vkUnmapMemory = nullptr;
+PFN_vkCreateShaderModule g_vkCreateShaderModule = nullptr;
+PFN_vkDestroyShaderModule g_vkDestroyShaderModule = nullptr;
+PFN_vkCreateDescriptorSetLayout g_vkCreateDescriptorSetLayout = nullptr;
+PFN_vkDestroyDescriptorSetLayout g_vkDestroyDescriptorSetLayout = nullptr;
+PFN_vkCreatePipelineLayout g_vkCreatePipelineLayout = nullptr;
+PFN_vkDestroyPipelineLayout g_vkDestroyPipelineLayout = nullptr;
+PFN_vkCreateGraphicsPipelines g_vkCreateGraphicsPipelines = nullptr;
+PFN_vkDestroyPipeline g_vkDestroyPipeline = nullptr;
+PFN_vkCreateDescriptorPool g_vkCreateDescriptorPool = nullptr;
+PFN_vkDestroyDescriptorPool g_vkDestroyDescriptorPool = nullptr;
+PFN_vkAllocateDescriptorSets g_vkAllocateDescriptorSets = nullptr;
+PFN_vkUpdateDescriptorSets g_vkUpdateDescriptorSets = nullptr;
+PFN_vkCmdBindPipeline g_vkCmdBindPipeline = nullptr;
+PFN_vkCmdBindVertexBuffers g_vkCmdBindVertexBuffers = nullptr;
+PFN_vkCmdBindIndexBuffer g_vkCmdBindIndexBuffer = nullptr;
+PFN_vkCmdBindDescriptorSets g_vkCmdBindDescriptorSets = nullptr;
+PFN_vkCmdDrawIndexed g_vkCmdDrawIndexed = nullptr;
+PFN_vkCmdSetViewport g_vkCmdSetViewport = nullptr;
+PFN_vkCmdSetScissor g_vkCmdSetScissor = nullptr;
 
 // ---- 窗口状态 ----
 HWND g_window = nullptr;
@@ -163,6 +203,250 @@ bool CreateRenderWindow(std::string* error) {
     return true;
 }
 
+// ---- 仿射变换（3×3 + 平移），CPU 蒙皮用 ----
+
+struct Affine {
+    float a[9];   // 行主序 3×3：p' = a · p
+    float t[3];
+};
+
+Affine IdentityAffine() {
+    Affine m{};
+    m.a[0] = 1.0f;
+    m.a[4] = 1.0f;
+    m.a[8] = 1.0f;
+    return m;
+}
+
+Affine Multiply(const Affine& left, const Affine& right) {
+    Affine out{};
+    for (int row = 0; row < 3; ++row) {
+        for (int column = 0; column < 3; ++column) {
+            float sum = 0.0f;
+            for (int k = 0; k < 3; ++k) {
+                sum += left.a[row * 3 + k] * right.a[k * 3 + column];
+            }
+            out.a[row * 3 + column] = sum;
+        }
+        float translation = left.t[row];
+        for (int k = 0; k < 3; ++k) {
+            translation += left.a[row * 3 + k] * right.t[k];
+        }
+        out.t[row] = translation;
+    }
+    return out;
+}
+
+Affine Inverse(const Affine& m) {
+    const float a0 = m.a[0], a1 = m.a[1], a2 = m.a[2];
+    const float a3 = m.a[3], a4 = m.a[4], a5 = m.a[5];
+    const float a6 = m.a[6], a7 = m.a[7], a8 = m.a[8];
+    const float det = a0 * (a4 * a8 - a5 * a7) - a1 * (a3 * a8 - a5 * a6) +
+                      a2 * (a3 * a7 - a4 * a6);
+    if (std::fabs(det) < 1e-12f) {
+        return IdentityAffine();
+    }
+    const float inv_det = 1.0f / det;
+    Affine out{};
+    out.a[0] = (a4 * a8 - a5 * a7) * inv_det;
+    out.a[1] = (a2 * a7 - a1 * a8) * inv_det;
+    out.a[2] = (a1 * a5 - a2 * a4) * inv_det;
+    out.a[3] = (a5 * a6 - a3 * a8) * inv_det;
+    out.a[4] = (a0 * a8 - a2 * a6) * inv_det;
+    out.a[5] = (a2 * a3 - a0 * a5) * inv_det;
+    out.a[6] = (a3 * a7 - a4 * a6) * inv_det;
+    out.a[7] = (a1 * a6 - a0 * a7) * inv_det;
+    out.a[8] = (a0 * a4 - a1 * a3) * inv_det;
+    for (int row = 0; row < 3; ++row) {
+        out.t[row] = -(out.a[row * 3 + 0] * m.t[0] + out.a[row * 3 + 1] * m.t[1] +
+                       out.a[row * 3 + 2] * m.t[2]);
+    }
+    return out;
+}
+
+void QuatToMatrix(const float q[4], float out[9]) {
+    const float x = q[0], y = q[1], z = q[2], w = q[3];
+    out[0] = 1.0f - 2.0f * (y * y + z * z);
+    out[1] = 2.0f * (x * y - z * w);
+    out[2] = 2.0f * (x * z + y * w);
+    out[3] = 2.0f * (x * y + z * w);
+    out[4] = 1.0f - 2.0f * (x * x + z * z);
+    out[5] = 2.0f * (y * z - x * w);
+    out[6] = 2.0f * (x * z - y * w);
+    out[7] = 2.0f * (y * z + x * w);
+    out[8] = 1.0f - 2.0f * (x * x + y * y);
+}
+
+// 与 Python 侧 _transform_matrix 一致：旋转矩阵按列乘缩放。
+Affine FromBone(const float quat[4], const float translation[3], const float scale[3]) {
+    Affine out{};
+    float rotation[9];
+    QuatToMatrix(quat, rotation);
+    for (int row = 0; row < 3; ++row) {
+        out.a[row * 3 + 0] = rotation[row * 3 + 0] * scale[0];
+        out.a[row * 3 + 1] = rotation[row * 3 + 1] * scale[1];
+        out.a[row * 3 + 2] = rotation[row * 3 + 2] * scale[2];
+        out.t[row] = translation[row];
+    }
+    return out;
+}
+
+void TransformPoint(const Affine& m, const float p[3], float out[3]) {
+    for (int row = 0; row < 3; ++row) {
+        out[row] = m.a[row * 3 + 0] * p[0] + m.a[row * 3 + 1] * p[1] +
+                   m.a[row * 3 + 2] * p[2] + m.t[row];
+    }
+}
+
+void TransformDirection(const Affine& m, const float n[3], float out[3]) {
+    for (int row = 0; row < 3; ++row) {
+        out[row] = m.a[row * 3 + 0] * n[0] + m.a[row * 3 + 1] * n[1] +
+                   m.a[row * 3 + 2] * n[2];
+    }
+}
+
+// ---- 4×4 矩阵（列主序），相机用 ----
+
+struct Mat4 {
+    float m[16];
+};
+
+Mat4 MultiplyMat4(const Mat4& left, const Mat4& right) {
+    Mat4 out{};
+    for (int column = 0; column < 4; ++column) {
+        for (int row = 0; row < 4; ++row) {
+            float sum = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                sum += left.m[k * 4 + row] * right.m[column * 4 + k];
+            }
+            out.m[column * 4 + row] = sum;
+        }
+    }
+    return out;
+}
+
+Mat4 PerspectiveVulkan(float fov_degrees, float aspect, float near_plane, float far_plane) {
+    Mat4 out{};
+    const float f = 1.0f / std::tan(fov_degrees * 3.14159265358979323846f / 360.0f);
+    out.m[0] = f / (aspect > 0.0f ? aspect : 1.0f);
+    out.m[5] = -f;   // Vulkan 的 Y 轴朝下，这里翻一次
+    out.m[10] = far_plane / (near_plane - far_plane);
+    out.m[11] = far_plane * near_plane / (near_plane - far_plane);
+    out.m[14] = -1.0f;
+    return out;
+}
+
+Mat4 LookAtVulkan(const float eye[3], const float target[3]) {
+    float forward[3] = {target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]};
+    const float length = std::sqrt(forward[0] * forward[0] + forward[1] * forward[1] +
+                                   forward[2] * forward[2]);
+    if (length > 1e-8f) {
+        forward[0] /= length;
+        forward[1] /= length;
+        forward[2] /= length;
+    } else {
+        forward[0] = 1.0f;
+    }
+    const float up[3] = {0.0f, 0.0f, 1.0f};
+    float right[3] = {forward[1] * up[2] - forward[2] * up[1],
+                      forward[2] * up[0] - forward[0] * up[2],
+                      forward[0] * up[1] - forward[1] * up[0]};
+    const float right_length = std::sqrt(right[0] * right[0] + right[1] * right[1] +
+                                         right[2] * right[2]);
+    if (right_length > 1e-8f) {
+        right[0] /= right_length;
+        right[1] /= right_length;
+        right[2] /= right_length;
+    } else {
+        right[0] = 1.0f;
+    }
+    const float true_up[3] = {right[1] * forward[2] - right[2] * forward[1],
+                              right[2] * forward[0] - right[0] * forward[2],
+                              right[0] * forward[1] - right[1] * forward[0]};
+
+    Mat4 out{};
+    out.m[0] = right[0];
+    out.m[4] = right[1];
+    out.m[8] = right[2];
+    out.m[12] = -(right[0] * eye[0] + right[1] * eye[1] + right[2] * eye[2]);
+    out.m[1] = true_up[0];
+    out.m[5] = true_up[1];
+    out.m[9] = true_up[2];
+    out.m[13] = -(true_up[0] * eye[0] + true_up[1] * eye[1] + true_up[2] * eye[2]);
+    out.m[2] = -forward[0];
+    out.m[6] = -forward[1];
+    out.m[10] = -forward[2];
+    out.m[14] = forward[0] * eye[0] + forward[1] * eye[1] + forward[2] * eye[2];
+    out.m[15] = 1.0f;
+    return out;
+}
+
+// 与着色器里的 CameraBlock 一致（std140）。
+struct CameraUniform {
+    float view_projection[16];
+    float light_direction[4];
+};
+
+uint32_t FindMemoryType(VkPhysicalDevice device, uint32_t type_bits,
+                        VkMemoryPropertyFlags properties) {
+    VkPhysicalDeviceMemoryProperties memory{};
+    g_vkGetPhysicalDeviceMemoryProperties(device, &memory);
+    for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+        if ((type_bits & (1u << i)) != 0 &&
+            (memory.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+    return UINT32_MAX;
+}
+
+// 一段绘制：索引缓冲里的区间 + 用哪套顶点缓冲。
+struct DrawRange {
+    uint32_t first_index = 0;
+    uint32_t index_count = 0;
+    int32_t vertex_offset = 0;
+    bool skinned = false;
+};
+
+struct SkinCpu {
+    std::vector<int32_t> anim_bone;     // 网格骨骼 -> 动画骨骼下标（-1 表示不驱动）
+    std::vector<Affine> bind_global;    // 绑定姿势全局矩阵
+    std::vector<Affine> bind_inverse;   // 绑定姿势全局矩阵的逆
+    Affine attach_model;                // 头发/饰品每帧更新的跟随矩阵
+    uint32_t vertex_offset = 0;         // 在动态顶点缓冲里的起始顶点
+    uint32_t vertex_count = 0;
+};
+
+// 演出包在 GPU 上的资源（全部 host-visible，量小，省掉暂存拷贝）。
+struct ShowGpu {
+    VkBuffer stage_vertices = VK_NULL_HANDLE;
+    VkDeviceMemory stage_memory = VK_NULL_HANDLE;
+    void* stage_mapped = nullptr;
+    size_t stage_vertex_count = 0;
+
+    VkBuffer skin_vertices = VK_NULL_HANDLE;
+    VkDeviceMemory skin_memory = VK_NULL_HANDLE;
+    void* skin_mapped = nullptr;
+    size_t skin_vertex_count = 0;
+
+    VkBuffer indices = VK_NULL_HANDLE;
+    VkDeviceMemory index_memory = VK_NULL_HANDLE;
+    void* index_mapped = nullptr;
+    size_t index_count = 0;
+
+    std::vector<DrawRange> draws;
+    std::vector<SkinCpu> skins;
+    int32_t head_skin = -1;      // 提供 SO_Head 的蒙皮网格
+    int32_t head_bone = -1;
+    float bounds_lo[3] = {0.0f, 0.0f, 0.0f};
+    float bounds_hi[3] = {0.0f, 0.0f, 0.0f};
+
+    bool Upload(VkDevice device, VkPhysicalDevice physical, const Show& show,
+                std::string* error);
+    void Destroy(VkDevice device);
+    void Update(const Show& show, double seconds);
+};
+
 struct Renderer {
     HWND window = nullptr;
     HINSTANCE hinstance = nullptr;
@@ -188,9 +472,27 @@ struct Renderer {
     std::vector<VkSemaphore> render_finished;
     std::vector<VkFence> in_flight;
 
+    // 深度缓冲（跟随交换链重建）
+    VkImage depth_image = VK_NULL_HANDLE;
+    VkDeviceMemory depth_memory = VK_NULL_HANDLE;
+    VkImageView depth_view = VK_NULL_HANDLE;
+
+    // 网格渲染管线
+    VkDescriptorSetLayout descriptor_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkBuffer camera_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory camera_memory = VK_NULL_HANDLE;
+    void* camera_mapped = nullptr;
+
+    ShowGpu show_gpu;
+
     bool Init(HWND target, std::string* error);
     void Shutdown();
     bool DrawFrame(const float* color, std::string* error);
+    bool DrawShowFrame(const Show& show, double seconds, std::string* error);
 
 private:
     bool LoadGlobalFunctions(std::string* error);
@@ -205,6 +507,17 @@ private:
     bool RecreateSwapchain(std::string* error);
     void DestroySwapchainResources();
     bool RecordCommandBuffer(uint32_t image_index, const float* color);
+    bool CreateDepthResources(std::string* error);
+    void DestroyDepthResources();
+    bool CreateShowPipeline(std::string* error);
+    void DestroyShowPipeline();
+    bool CreateCameraBuffer(std::string* error);
+    void DestroyCameraBuffer();
+    bool CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer* buffer,
+                      VkDeviceMemory* memory, void** mapped, const char* what,
+                      std::string* error);
+    void DestroyBuffer(VkBuffer* buffer, VkDeviceMemory* memory, void** mapped);
+    bool RecordShowCommandBuffer(uint32_t image_index);
 };
 
 #define LOAD_INSTANCE_FN(name)                                                        \
@@ -243,6 +556,7 @@ bool Renderer::LoadInstanceFunctions(std::string* error) {
     LOAD_INSTANCE_FN(vkEnumeratePhysicalDevices);
     LOAD_INSTANCE_FN(vkEnumerateDeviceExtensionProperties);
     LOAD_INSTANCE_FN(vkGetPhysicalDeviceProperties);
+    LOAD_INSTANCE_FN(vkGetPhysicalDeviceMemoryProperties);
     LOAD_INSTANCE_FN(vkGetPhysicalDeviceQueueFamilyProperties);
     LOAD_INSTANCE_FN(vkGetPhysicalDeviceSurfaceSupportKHR);
     LOAD_INSTANCE_FN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
@@ -283,6 +597,38 @@ bool Renderer::LoadDeviceFunctions(std::string* error) {
     LOAD_DEVICE_FN(vkDestroyFence);
     LOAD_DEVICE_FN(vkWaitForFences);
     LOAD_DEVICE_FN(vkResetFences);
+
+    LOAD_DEVICE_FN(vkCreateBuffer);
+    LOAD_DEVICE_FN(vkDestroyBuffer);
+    LOAD_DEVICE_FN(vkGetBufferMemoryRequirements);
+    LOAD_DEVICE_FN(vkBindBufferMemory);
+    LOAD_DEVICE_FN(vkCreateImage);
+    LOAD_DEVICE_FN(vkDestroyImage);
+    LOAD_DEVICE_FN(vkGetImageMemoryRequirements);
+    LOAD_DEVICE_FN(vkBindImageMemory);
+    LOAD_DEVICE_FN(vkAllocateMemory);
+    LOAD_DEVICE_FN(vkFreeMemory);
+    LOAD_DEVICE_FN(vkMapMemory);
+    LOAD_DEVICE_FN(vkUnmapMemory);
+    LOAD_DEVICE_FN(vkCreateShaderModule);
+    LOAD_DEVICE_FN(vkDestroyShaderModule);
+    LOAD_DEVICE_FN(vkCreateDescriptorSetLayout);
+    LOAD_DEVICE_FN(vkDestroyDescriptorSetLayout);
+    LOAD_DEVICE_FN(vkCreatePipelineLayout);
+    LOAD_DEVICE_FN(vkDestroyPipelineLayout);
+    LOAD_DEVICE_FN(vkCreateGraphicsPipelines);
+    LOAD_DEVICE_FN(vkDestroyPipeline);
+    LOAD_DEVICE_FN(vkCreateDescriptorPool);
+    LOAD_DEVICE_FN(vkDestroyDescriptorPool);
+    LOAD_DEVICE_FN(vkAllocateDescriptorSets);
+    LOAD_DEVICE_FN(vkUpdateDescriptorSets);
+    LOAD_DEVICE_FN(vkCmdBindPipeline);
+    LOAD_DEVICE_FN(vkCmdBindVertexBuffers);
+    LOAD_DEVICE_FN(vkCmdBindIndexBuffer);
+    LOAD_DEVICE_FN(vkCmdBindDescriptorSets);
+    LOAD_DEVICE_FN(vkCmdDrawIndexed);
+    LOAD_DEVICE_FN(vkCmdSetViewport);
+    LOAD_DEVICE_FN(vkCmdSetScissor);
     return true;
 }
 
@@ -402,37 +748,54 @@ bool Renderer::CreateDeviceObject(std::string* error) {
 }
 
 bool Renderer::CreateRenderPass(std::string* error) {
-    VkAttachmentDescription attachment{};
-    attachment.format = surface_format.format;
-    attachment.samples = VK_SAMPLE_COUNT_1_BIT;
-    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkAttachmentDescription attachments[2]{};
+    attachments[0].format = surface_format.format;
+    attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    attachments[1].format = VK_FORMAT_D32_SFLOAT;
+    attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
     VkAttachmentReference color_reference{};
     color_reference.attachment = 0;
     color_reference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
+    VkAttachmentReference depth_reference{};
+    depth_reference.attachment = 1;
+    depth_reference.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments = &color_reference;
+    subpass.pDepthStencilAttachment = &depth_reference;
 
     VkSubpassDependency dependency{};
     dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
     dependency.dstSubpass = 0;
-    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
     dependency.srcAccessMask = 0;
-    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
     VkRenderPassCreateInfo create_info{};
     create_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    create_info.attachmentCount = 1;
-    create_info.pAttachments = &attachment;
+    create_info.attachmentCount = 2;
+    create_info.pAttachments = attachments;
     create_info.subpassCount = 1;
     create_info.pSubpasses = &subpass;
     create_info.dependencyCount = 1;
@@ -444,6 +807,370 @@ bool Renderer::CreateRenderPass(std::string* error) {
         return false;
     }
     return true;
+}
+
+bool Renderer::CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer* buffer,
+                            VkDeviceMemory* memory, void** mapped, const char* what,
+                            std::string* error) {
+    VkBufferCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = size > 0 ? size : 1;
+    buffer_info.usage = usage;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (g_vkCreateBuffer(device, &buffer_info, nullptr, buffer) != VK_SUCCESS) {
+        *error = std::string("创建缓冲失败：") + what;
+        return false;
+    }
+
+    VkMemoryRequirements requirements{};
+    g_vkGetBufferMemoryRequirements(device, *buffer, &requirements);
+    const uint32_t type = FindMemoryType(physical_device, requirements.memoryTypeBits,
+                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (type == UINT32_MAX) {
+        *error = std::string("找不到可映射的显存类型：") + what;
+        return false;
+    }
+
+    VkMemoryAllocateInfo allocate_info{};
+    allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate_info.allocationSize = requirements.size;
+    allocate_info.memoryTypeIndex = type;
+    if (g_vkAllocateMemory(device, &allocate_info, nullptr, memory) != VK_SUCCESS) {
+        *error = std::string("分配缓冲内存失败：") + what;
+        return false;
+    }
+    if (g_vkBindBufferMemory(device, *buffer, *memory, 0) != VK_SUCCESS) {
+        *error = std::string("绑定缓冲内存失败：") + what;
+        return false;
+    }
+    if (mapped != nullptr) {
+        *mapped = nullptr;
+        if (g_vkMapMemory(device, *memory, 0, VK_WHOLE_SIZE, 0, mapped) != VK_SUCCESS) {
+            *error = std::string("映射缓冲内存失败：") + what;
+            return false;
+        }
+    }
+    return true;
+}
+
+void Renderer::DestroyBuffer(VkBuffer* buffer, VkDeviceMemory* memory, void** mapped) {
+    if (*mapped != nullptr && g_vkUnmapMemory != nullptr) {
+        g_vkUnmapMemory(device, *memory);
+        *mapped = nullptr;
+    }
+    if (*buffer != VK_NULL_HANDLE && g_vkDestroyBuffer != nullptr) {
+        g_vkDestroyBuffer(device, *buffer, nullptr);
+        *buffer = VK_NULL_HANDLE;
+    }
+    if (*memory != VK_NULL_HANDLE && g_vkFreeMemory != nullptr) {
+        g_vkFreeMemory(device, *memory, nullptr);
+        *memory = VK_NULL_HANDLE;
+    }
+}
+
+bool Renderer::CreateDepthResources(std::string* error) {
+    DestroyDepthResources();
+
+    VkImageCreateInfo image_info{};
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = VK_FORMAT_D32_SFLOAT;
+    image_info.extent.width = extent.width;
+    image_info.extent.height = extent.height;
+    image_info.extent.depth = 1;
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (g_vkCreateImage(device, &image_info, nullptr, &depth_image) != VK_SUCCESS) {
+        *error = "创建深度图像失败";
+        return false;
+    }
+
+    VkMemoryRequirements requirements{};
+    g_vkGetImageMemoryRequirements(device, depth_image, &requirements);
+    const uint32_t type = FindMemoryType(physical_device, requirements.memoryTypeBits,
+                                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type == UINT32_MAX) {
+        *error = "找不到深度图像的显存类型";
+        return false;
+    }
+    VkMemoryAllocateInfo allocate_info{};
+    allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate_info.allocationSize = requirements.size;
+    allocate_info.memoryTypeIndex = type;
+    if (g_vkAllocateMemory(device, &allocate_info, nullptr, &depth_memory) != VK_SUCCESS) {
+        *error = "分配深度图像内存失败";
+        return false;
+    }
+    if (g_vkBindImageMemory(device, depth_image, depth_memory, 0) != VK_SUCCESS) {
+        *error = "绑定深度图像内存失败";
+        return false;
+    }
+
+    VkImageViewCreateInfo view_info{};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = depth_image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = VK_FORMAT_D32_SFLOAT;
+    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    view_info.subresourceRange.baseMipLevel = 0;
+    view_info.subresourceRange.levelCount = 1;
+    view_info.subresourceRange.baseArrayLayer = 0;
+    view_info.subresourceRange.layerCount = 1;
+    if (g_vkCreateImageView(device, &view_info, nullptr, &depth_view) != VK_SUCCESS) {
+        *error = "创建深度图像视图失败";
+        return false;
+    }
+    return true;
+}
+
+void Renderer::DestroyDepthResources() {
+    if (device != VK_NULL_HANDLE) {
+        if (g_vkDestroyImageView != nullptr && depth_view != VK_NULL_HANDLE) {
+            g_vkDestroyImageView(device, depth_view, nullptr);
+        }
+        if (g_vkDestroyImage != nullptr && depth_image != VK_NULL_HANDLE) {
+            g_vkDestroyImage(device, depth_image, nullptr);
+        }
+        if (g_vkFreeMemory != nullptr && depth_memory != VK_NULL_HANDLE) {
+            g_vkFreeMemory(device, depth_memory, nullptr);
+        }
+    }
+    depth_view = VK_NULL_HANDLE;
+    depth_image = VK_NULL_HANDLE;
+    depth_memory = VK_NULL_HANDLE;
+}
+
+bool Renderer::CreateCameraBuffer(std::string* error) {
+    if (camera_buffer != VK_NULL_HANDLE) {
+        return true;
+    }
+    return CreateBuffer(sizeof(CameraUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                        &camera_buffer, &camera_memory, &camera_mapped, "相机 uniform",
+                        error);
+}
+
+void Renderer::DestroyCameraBuffer() {
+    DestroyBuffer(&camera_buffer, &camera_memory, &camera_mapped);
+}
+
+bool Renderer::CreateShowPipeline(std::string* error) {
+    if (!CreateCameraBuffer(error)) {
+        return false;
+    }
+
+    VkDescriptorSetLayoutBinding binding{};
+    binding.binding = 0;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    binding.descriptorCount = 1;
+    binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutCreateInfo layout_info{};
+    layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layout_info.bindingCount = 1;
+    layout_info.pBindings = &binding;
+    if (g_vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &descriptor_layout) !=
+        VK_SUCCESS) {
+        *error = "创建描述符布局失败";
+        return false;
+    }
+
+    VkPipelineLayoutCreateInfo pipeline_layout_info{};
+    pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipeline_layout_info.setLayoutCount = 1;
+    pipeline_layout_info.pSetLayouts = &descriptor_layout;
+    if (g_vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr, &pipeline_layout) !=
+        VK_SUCCESS) {
+        *error = "创建管线布局失败";
+        return false;
+    }
+
+    VkDescriptorPoolSize pool_size{};
+    pool_size.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    pool_size.descriptorCount = 1;
+    VkDescriptorPoolCreateInfo pool_info{};
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes = &pool_size;
+    if (g_vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool) != VK_SUCCESS) {
+        *error = "创建描述符池失败";
+        return false;
+    }
+
+    VkDescriptorSetAllocateInfo set_info{};
+    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_info.descriptorPool = descriptor_pool;
+    set_info.descriptorSetCount = 1;
+    set_info.pSetLayouts = &descriptor_layout;
+    if (g_vkAllocateDescriptorSets(device, &set_info, &descriptor_set) != VK_SUCCESS) {
+        *error = "分配描述符集失败";
+        return false;
+    }
+
+    VkDescriptorBufferInfo buffer_info{};
+    buffer_info.buffer = camera_buffer;
+    buffer_info.offset = 0;
+    buffer_info.range = sizeof(CameraUniform);
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = descriptor_set;
+    write.dstBinding = 0;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    write.descriptorCount = 1;
+    write.pBufferInfo = &buffer_info;
+    g_vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+
+    VkShaderModule vertex_module = VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo shader_info{};
+    shader_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    shader_info.codeSize = kSceneVertexSpirv_size;
+    shader_info.pCode = reinterpret_cast<const uint32_t*>(kSceneVertexSpirv);
+    if (g_vkCreateShaderModule(device, &shader_info, nullptr, &vertex_module) != VK_SUCCESS) {
+        *error = "创建顶点着色器模块失败";
+        return false;
+    }
+    VkShaderModule fragment_module = VK_NULL_HANDLE;
+    shader_info.codeSize = kSceneFragmentSpirv_size;
+    shader_info.pCode = reinterpret_cast<const uint32_t*>(kSceneFragmentSpirv);
+    if (g_vkCreateShaderModule(device, &shader_info, nullptr, &fragment_module) != VK_SUCCESS) {
+        g_vkDestroyShaderModule(device, vertex_module, nullptr);
+        *error = "创建片元着色器模块失败";
+        return false;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vertex_module;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fragment_module;
+    stages[1].pName = "main";
+
+    VkVertexInputBindingDescription vertex_binding{};
+    vertex_binding.binding = 0;
+    vertex_binding.stride = static_cast<uint32_t>(sizeof(ShowVertex));
+    vertex_binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription attributes[3]{};
+    attributes[0].location = 0;
+    attributes[0].binding = 0;
+    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributes[0].offset = static_cast<uint32_t>(offsetof(ShowVertex, position));
+    attributes[1].location = 1;
+    attributes[1].binding = 0;
+    attributes[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributes[1].offset = static_cast<uint32_t>(offsetof(ShowVertex, normal));
+    attributes[2].location = 2;
+    attributes[2].binding = 0;
+    attributes[2].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributes[2].offset = static_cast<uint32_t>(offsetof(ShowVertex, color));
+
+    VkPipelineVertexInputStateCreateInfo vertex_input{};
+    vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertex_input.vertexBindingDescriptionCount = 1;
+    vertex_input.pVertexBindingDescriptions = &vertex_binding;
+    vertex_input.vertexAttributeDescriptionCount = 3;
+    vertex_input.pVertexAttributeDescriptions = attributes;
+
+    VkPipelineInputAssemblyStateCreateInfo input_assembly{};
+    input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewport_state{};
+    viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewport_state.viewportCount = 1;
+    viewport_state.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rasterizer{};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;   // 描边壳/双面布料都有，干脆不剔除
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo depth_stencil{};
+    depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depth_stencil.depthTestEnable = VK_TRUE;
+    depth_stencil.depthWriteEnable = VK_TRUE;
+    depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState blend_attachment{};
+    blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    blend_attachment.blendEnable = VK_FALSE;
+
+    VkPipelineColorBlendStateCreateInfo color_blend{};
+    color_blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    color_blend.attachmentCount = 1;
+    color_blend.pAttachments = &blend_attachment;
+
+    const VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT,
+                                              VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{};
+    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dynamic_states;
+
+    VkGraphicsPipelineCreateInfo pipeline_info{};
+    pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipeline_info.stageCount = 2;
+    pipeline_info.pStages = stages;
+    pipeline_info.pVertexInputState = &vertex_input;
+    pipeline_info.pInputAssemblyState = &input_assembly;
+    pipeline_info.pViewportState = &viewport_state;
+    pipeline_info.pRasterizationState = &rasterizer;
+    pipeline_info.pMultisampleState = &multisample;
+    pipeline_info.pDepthStencilState = &depth_stencil;
+    pipeline_info.pColorBlendState = &color_blend;
+    pipeline_info.pDynamicState = &dynamic;
+    pipeline_info.layout = pipeline_layout;
+    pipeline_info.renderPass = render_pass;
+    pipeline_info.subpass = 0;
+
+    const VkResult result = g_vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                                        &pipeline_info, nullptr, &pipeline);
+    g_vkDestroyShaderModule(device, vertex_module, nullptr);
+    g_vkDestroyShaderModule(device, fragment_module, nullptr);
+    if (result != VK_SUCCESS) {
+        *error = "创建图形管线失败（" + ResultText(result) + "）";
+        return false;
+    }
+    return true;
+}
+
+void Renderer::DestroyShowPipeline() {
+    if (device != VK_NULL_HANDLE) {
+        if (g_vkDestroyPipeline != nullptr && pipeline != VK_NULL_HANDLE) {
+            g_vkDestroyPipeline(device, pipeline, nullptr);
+        }
+        if (g_vkDestroyDescriptorPool != nullptr && descriptor_pool != VK_NULL_HANDLE) {
+            g_vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
+        }
+        if (g_vkDestroyPipelineLayout != nullptr && pipeline_layout != VK_NULL_HANDLE) {
+            g_vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
+        }
+        if (g_vkDestroyDescriptorSetLayout != nullptr && descriptor_layout != VK_NULL_HANDLE) {
+            g_vkDestroyDescriptorSetLayout(device, descriptor_layout, nullptr);
+        }
+    }
+    DestroyCameraBuffer();
+    pipeline = VK_NULL_HANDLE;
+    descriptor_pool = VK_NULL_HANDLE;
+    descriptor_set = VK_NULL_HANDLE;
+    pipeline_layout = VK_NULL_HANDLE;
+    descriptor_layout = VK_NULL_HANDLE;
 }
 
 bool Renderer::CreateCommandResources(std::string* error) {
@@ -519,6 +1246,8 @@ void Renderer::DestroySwapchainResources() {
             g_vkDestroySwapchainKHR(device, swapchain, nullptr);
         }
     }
+    // 帧缓冲销毁后才能释放深度附件
+    DestroyDepthResources();
     framebuffers.clear();
     image_views.clear();
     images.clear();
@@ -630,6 +1359,11 @@ bool Renderer::CreateSwapchain(std::string* error) {
     g_vkGetSwapchainImagesKHR(device, swapchain, &actual_count, images.data());
     image_count = actual_count;
 
+    // 深度附件必须与颜色附件同尺寸
+    if (!CreateDepthResources(error)) {
+        return false;
+    }
+
     image_views.resize(actual_count);
     framebuffers.resize(actual_count);
 
@@ -654,8 +1388,9 @@ bool Renderer::CreateSwapchain(std::string* error) {
         VkFramebufferCreateInfo framebuffer_info{};
         framebuffer_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         framebuffer_info.renderPass = render_pass;
-        framebuffer_info.attachmentCount = 1;
-        framebuffer_info.pAttachments = &image_views[i];
+        const VkImageView attachments[2] = {image_views[i], depth_view};
+        framebuffer_info.attachmentCount = 2;
+        framebuffer_info.pAttachments = attachments;
         framebuffer_info.width = extent.width;
         framebuffer_info.height = extent.height;
         framebuffer_info.layers = 1;
@@ -777,6 +1512,9 @@ bool Renderer::Init(HWND target, std::string* error) {
     if (!CreateSwapchain(error)) {
         return false;
     }
+    if (!CreateShowPipeline(error)) {
+        return false;
+    }
     return true;
 }
 
@@ -786,6 +1524,8 @@ void Renderer::Shutdown() {
             g_vkDeviceWaitIdle(device);
         }
         DestroySwapchainResources();
+        show_gpu.Destroy();
+        DestroyShowPipeline();
         if (g_vkDestroyRenderPass != nullptr && render_pass != VK_NULL_HANDLE) {
             g_vkDestroyRenderPass(device, render_pass, nullptr);
         }
@@ -845,11 +1585,13 @@ bool Renderer::RecordCommandBuffer(uint32_t image_index, const float* color) {
         return false;
     }
 
-    VkClearValue clear_value{};
-    clear_value.color.float32[0] = color[0];
-    clear_value.color.float32[1] = color[1];
-    clear_value.color.float32[2] = color[2];
-    clear_value.color.float32[3] = 1.0f;
+    VkClearValue clear_values[2]{};
+    clear_values[0].color.float32[0] = color[0];
+    clear_values[0].color.float32[1] = color[1];
+    clear_values[0].color.float32[2] = color[2];
+    clear_values[0].color.float32[3] = 1.0f;
+    clear_values[1].depthStencil.depth = 1.0f;
+    clear_values[1].depthStencil.stencil = 0;
 
     VkRenderPassBeginInfo pass_info{};
     pass_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -858,8 +1600,8 @@ bool Renderer::RecordCommandBuffer(uint32_t image_index, const float* color) {
     pass_info.renderArea.offset.x = 0;
     pass_info.renderArea.offset.y = 0;
     pass_info.renderArea.extent = extent;
-    pass_info.clearValueCount = 1;
-    pass_info.pClearValues = &clear_value;
+    pass_info.clearValueCount = 2;
+    pass_info.pClearValues = clear_values;
 
     g_vkCmdBeginRenderPass(command, &pass_info, VK_SUBPASS_CONTENTS_INLINE);
     g_vkCmdEndRenderPass(command);
@@ -944,7 +1686,671 @@ bool Renderer::DrawFrame(const float* color, std::string* error) {
     return true;
 }
 
+bool CreateHostBuffer(VkDevice device, VkPhysicalDevice physical, VkDeviceSize size,
+                      VkBufferUsageFlags usage, VkBuffer* buffer, VkDeviceMemory* memory,
+                      void** mapped, const char* what, std::string* error) {
+    VkBufferCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = size > 0 ? size : 1;
+    buffer_info.usage = usage;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (g_vkCreateBuffer(device, &buffer_info, nullptr, buffer) != VK_SUCCESS) {
+        *error = std::string("创建缓冲失败：") + what;
+        return false;
+    }
+    VkMemoryRequirements requirements{};
+    g_vkGetBufferMemoryRequirements(device, *buffer, &requirements);
+    const uint32_t type = FindMemoryType(physical, requirements.memoryTypeBits,
+                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (type == UINT32_MAX) {
+        *error = std::string("找不到可映射的显存类型：") + what;
+        return false;
+    }
+    VkMemoryAllocateInfo allocate_info{};
+    allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate_info.allocationSize = requirements.size;
+    allocate_info.memoryTypeIndex = type;
+    if (g_vkAllocateMemory(device, &allocate_info, nullptr, memory) != VK_SUCCESS) {
+        *error = std::string("分配缓冲内存失败：") + what;
+        return false;
+    }
+    if (g_vkBindBufferMemory(device, *buffer, *memory, 0) != VK_SUCCESS) {
+        *error = std::string("绑定缓冲内存失败：") + what;
+        return false;
+    }
+    *mapped = nullptr;
+    if (size > 0 && g_vkMapMemory(device, *memory, 0, VK_WHOLE_SIZE, 0, mapped) != VK_SUCCESS) {
+        *error = std::string("映射缓冲内存失败：") + what;
+        return false;
+    }
+    return true;
+}
+
+void ComputeGlobals(const ShowSkin& skin, const SkinCpu& cpu,
+                    const std::vector<ShowBonePose>& pose,
+                    std::vector<Affine>* globals) {
+    const size_t count = skin.bones.size();
+    globals->resize(count);
+    for (size_t i = 0; i < count; ++i) {
+        const ShowBone& bone = skin.bones[i];
+        float quat[4] = {bone.rotation[0], bone.rotation[1], bone.rotation[2],
+                         bone.rotation[3]};
+        float translation[3] = {bone.translation[0], bone.translation[1],
+                                bone.translation[2]};
+        const int32_t anim = cpu.anim_bone[i];
+        if (anim >= 0 && static_cast<size_t>(anim) < pose.size()) {
+            const ShowBonePose& sampled = pose[static_cast<size_t>(anim)];
+            if (sampled.has_rotation) {
+                std::copy(sampled.rotation, sampled.rotation + 4, quat);
+            }
+            if (sampled.has_translation) {
+                std::copy(sampled.translation, sampled.translation + 3, translation);
+            }
+        }
+        const Affine local = FromBone(quat, translation, bone.scale);
+        const int32_t parent = bone.parent;
+        (*globals)[i] = (parent >= 0 && static_cast<size_t>(parent) < i)
+                            ? Multiply((*globals)[static_cast<size_t>(parent)], local)
+                            : local;
+    }
+}
+
+bool ShowGpu::Upload(VkDevice device, VkPhysicalDevice physical, const Show& show,
+                     std::string* error) {
+    Destroy(device);
+
+    size_t stage_vertices_total = 0;
+    size_t index_total = 0;
+    for (const ShowStage& stage : show.stages) {
+        stage_vertices_total += stage.vertices.size();
+        index_total += stage.indices.size();
+    }
+    size_t skin_vertices_total = 0;
+    for (const ShowSkin& skin : show.skins) {
+        skin_vertices_total += skin.vertices.size();
+        index_total += skin.indices.size();
+    }
+    stage_vertex_count = stage_vertices_total;
+    skin_vertex_count = skin_vertices_total;
+    index_count = index_total;
+
+    if (!CreateHostBuffer(device, physical,
+                          static_cast<VkDeviceSize>(stage_vertex_count) * sizeof(ShowVertex),
+                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &stage_vertices, &stage_memory,
+                          &stage_mapped, "舞台顶点", error)) {
+        return false;
+    }
+    if (!CreateHostBuffer(device, physical,
+                          static_cast<VkDeviceSize>(skin_vertex_count) * sizeof(ShowVertex),
+                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &skin_vertices, &skin_memory,
+                          &skin_mapped, "角色顶点", error)) {
+        return false;
+    }
+    if (!CreateHostBuffer(device, physical,
+                          static_cast<VkDeviceSize>(index_count) * sizeof(uint32_t),
+                          VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &indices, &index_memory,
+                          &index_mapped, "索引", error)) {
+        return false;
+    }
+
+    ShowVertex* stage_out = static_cast<ShowVertex*>(stage_mapped);
+    ShowVertex* skin_out = static_cast<ShowVertex*>(skin_mapped);
+    uint32_t* index_out = static_cast<uint32_t*>(index_mapped);
+
+    size_t vertex_at = 0;
+    size_t index_at = 0;
+    draws.clear();
+    for (const ShowStage& stage : show.stages) {
+        if (!stage.vertices.empty()) {
+            std::memcpy(stage_out + vertex_at, stage.vertices.data(),
+                        stage.vertices.size() * sizeof(ShowVertex));
+        }
+        const uint32_t first_index = static_cast<uint32_t>(index_at);
+        if (!stage.indices.empty()) {
+            std::memcpy(index_out + index_at, stage.indices.data(),
+                        stage.indices.size() * sizeof(uint32_t));
+        }
+        index_at += stage.indices.size();
+        DrawRange range;
+        range.first_index = first_index;
+        range.index_count = static_cast<uint32_t>(stage.indices.size());
+        range.vertex_offset = static_cast<int32_t>(vertex_at);
+        range.skinned = false;
+        draws.push_back(range);
+        vertex_at += stage.vertices.size();
+    }
+
+    skins.clear();
+    skins.resize(show.skins.size());
+    size_t skin_vertex_at = 0;
+    for (size_t s = 0; s < show.skins.size(); ++s) {
+        const ShowSkin& skin = show.skins[s];
+        const uint32_t first_index = static_cast<uint32_t>(index_at);
+        if (!skin.indices.empty()) {
+            std::memcpy(index_out + index_at, skin.indices.data(),
+                        skin.indices.size() * sizeof(uint32_t));
+        }
+        index_at += skin.indices.size();
+        DrawRange range;
+        range.first_index = first_index;
+        range.index_count = static_cast<uint32_t>(skin.indices.size());
+        range.vertex_offset = static_cast<int32_t>(skin_vertex_at);
+        range.skinned = true;
+        draws.push_back(range);
+
+        SkinCpu& cpu = skins[s];
+        cpu.vertex_offset = static_cast<uint32_t>(skin_vertex_at);
+        cpu.vertex_count = static_cast<uint32_t>(skin.vertices.size());
+        skin_vertex_at += skin.vertices.size();
+
+        const size_t bone_count = skin.bones.size();
+        cpu.anim_bone.assign(bone_count, -1);
+        for (size_t i = 0; i < bone_count; ++i) {
+            for (size_t a = 0; a < show.anim_bones.size(); ++a) {
+                if (show.anim_bones[a] == skin.bones[i].name) {
+                    cpu.anim_bone[i] = static_cast<int32_t>(a);
+                    break;
+                }
+            }
+        }
+
+        std::vector<Affine> locals(bone_count);
+        for (size_t i = 0; i < bone_count; ++i) {
+            const ShowBone& bone = skin.bones[i];
+            locals[i] = FromBone(bone.rotation, bone.translation, bone.scale);
+        }
+        cpu.bind_global.resize(bone_count);
+        cpu.bind_inverse.resize(bone_count);
+        for (size_t i = 0; i < bone_count; ++i) {
+            const int32_t parent = skin.bones[i].parent;
+            cpu.bind_global[i] = (parent >= 0 && static_cast<size_t>(parent) < i)
+                                     ? Multiply(cpu.bind_global[static_cast<size_t>(parent)],
+                                                locals[i])
+                                     : locals[i];
+            cpu.bind_inverse[i] = Inverse(cpu.bind_global[i]);
+        }
+
+        // 初始填入绑定姿势，保证第一帧渲染前缓冲里有合法数据
+        ShowVertex* dst = skin_out + cpu.vertex_offset;
+        for (size_t v = 0; v < skin.vertices.size(); ++v) {
+            const ShowSkinVertex& src = skin.vertices[v];
+            dst[v].position[0] = src.position[0] + show.character_offset[0];
+            dst[v].position[1] = src.position[1] + show.character_offset[1];
+            dst[v].position[2] = src.position[2] + show.character_offset[2];
+            std::copy(src.normal, src.normal + 3, dst[v].normal);
+            std::copy(src.color, src.color + 3, dst[v].color);
+        }
+    }
+
+    head_skin = -1;
+    head_bone = -1;
+    const char* head_names[3] = {"SO_Head", "AO_Head", "SC_Head"};
+    for (int h = 0; h < 3 && head_skin < 0; ++h) {
+        for (size_t s = 0; s < show.skins.size() && head_skin < 0; ++s) {
+            if (!show.skins[s].attach_bone.empty()) {
+                continue;
+            }
+            for (size_t i = 0; i < show.skins[s].bones.size(); ++i) {
+                if (show.skins[s].bones[i].name == head_names[h]) {
+                    head_skin = static_cast<int32_t>(s);
+                    head_bone = static_cast<int32_t>(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    // 场景包围盒（只看舞台与非跟随网格，头发是头部局部坐标，不能算进去）
+    bool has_bounds = false;
+    for (const ShowStage& stage : show.stages) {
+        for (const ShowVertex& vertex : stage.vertices) {
+            for (int i = 0; i < 3; ++i) {
+                if (!has_bounds) {
+                    bounds_lo[i] = bounds_hi[i] = vertex.position[i];
+                } else {
+                    bounds_lo[i] = std::min(bounds_lo[i], vertex.position[i]);
+                    bounds_hi[i] = std::max(bounds_hi[i], vertex.position[i]);
+                }
+            }
+            has_bounds = true;
+        }
+    }
+    for (size_t s = 0; s < show.skins.size(); ++s) {
+        if (!show.skins[s].attach_bone.empty()) {
+            continue;
+        }
+        for (const ShowSkinVertex& vertex : show.skins[s].vertices) {
+            for (int i = 0; i < 3; ++i) {
+                const float value = vertex.position[i] + show.character_offset[i];
+                if (!has_bounds) {
+                    bounds_lo[i] = bounds_hi[i] = value;
+                } else {
+                    bounds_lo[i] = std::min(bounds_lo[i], value);
+                    bounds_hi[i] = std::max(bounds_hi[i], value);
+                }
+            }
+            has_bounds = true;
+        }
+    }
+    if (!has_bounds) {
+        for (int i = 0; i < 3; ++i) {
+            bounds_lo[i] = -100.0f;
+            bounds_hi[i] = 100.0f;
+        }
+    }
+    return true;
+}
+
+void ShowGpu::Destroy(VkDevice device) {
+    auto release = [device](VkBuffer* buffer, VkDeviceMemory* memory, void** mapped) {
+        if (device == VK_NULL_HANDLE) {
+            return;
+        }
+        if (*mapped != nullptr && g_vkUnmapMemory != nullptr) {
+            g_vkUnmapMemory(device, *memory);
+            *mapped = nullptr;
+        }
+        if (*buffer != VK_NULL_HANDLE && g_vkDestroyBuffer != nullptr) {
+            g_vkDestroyBuffer(device, *buffer, nullptr);
+            *buffer = VK_NULL_HANDLE;
+        }
+        if (*memory != VK_NULL_HANDLE && g_vkFreeMemory != nullptr) {
+            g_vkFreeMemory(device, *memory, nullptr);
+            *memory = VK_NULL_HANDLE;
+        }
+    };
+    release(&stage_vertices, &stage_memory, &stage_mapped);
+    release(&skin_vertices, &skin_memory, &skin_mapped);
+    release(&indices, &index_memory, &index_mapped);
+    draws.clear();
+    skins.clear();
+    stage_vertex_count = 0;
+    skin_vertex_count = 0;
+    index_count = 0;
+    head_skin = -1;
+    head_bone = -1;
+}
+
+void ShowGpu::Update(const Show& show, double seconds) {
+    if (skin_vertex_count == 0) {
+        return;
+    }
+    const std::vector<ShowBonePose> pose = show.SamplePose(seconds);
+
+    // 头发/饰品跟随头部：用提供 SO_Head 的网格算刚性跟随矩阵
+    Affine head_model = IdentityAffine();
+    if (head_skin >= 0 && head_bone >= 0 &&
+        static_cast<size_t>(head_skin) < show.skins.size()) {
+        const ShowSkin& skin = show.skins[static_cast<size_t>(head_skin)];
+        const SkinCpu& cpu = skins[static_cast<size_t>(head_skin)];
+        std::vector<Affine> globals;
+        ComputeGlobals(skin, cpu, pose, &globals);
+        const Affine transform = Multiply(
+            globals[static_cast<size_t>(head_bone)],
+            cpu.bind_inverse[static_cast<size_t>(head_bone)]);
+        Affine place = IdentityAffine();
+        const Affine& bind = cpu.bind_global[static_cast<size_t>(head_bone)];
+        std::copy(bind.t, bind.t + 3, place.t);
+        head_model = Multiply(transform, place);
+    }
+
+    const float ox = show.character_offset[0];
+    const float oy = show.character_offset[1];
+    const float oz = show.character_offset[2];
+    ShowVertex* out = static_cast<ShowVertex*>(skin_mapped);
+
+    for (size_t s = 0; s < show.skins.size(); ++s) {
+        const ShowSkin& skin = show.skins[s];
+        SkinCpu& cpu = skins[s];
+        ShowVertex* dst = out + cpu.vertex_offset;
+
+        if (!skin.attach_bone.empty()) {
+            for (size_t v = 0; v < skin.vertices.size(); ++v) {
+                const ShowSkinVertex& src = skin.vertices[v];
+                float position[3];
+                float normal[3];
+                TransformPoint(head_model, src.position, position);
+                TransformDirection(head_model, src.normal, normal);
+                const float length = std::sqrt(normal[0] * normal[0] +
+                                               normal[1] * normal[1] +
+                                               normal[2] * normal[2]);
+                if (length > 1e-8f) {
+                    normal[0] /= length;
+                    normal[1] /= length;
+                    normal[2] /= length;
+                }
+                dst[v].position[0] = position[0] + ox;
+                dst[v].position[1] = position[1] + oy;
+                dst[v].position[2] = position[2] + oz;
+                std::copy(normal, normal + 3, dst[v].normal);
+                std::copy(src.color, src.color + 3, dst[v].color);
+            }
+            continue;
+        }
+
+        std::vector<Affine> globals;
+        ComputeGlobals(skin, cpu, pose, &globals);
+        std::vector<Affine> skinned(skin.bones.size());
+        for (size_t i = 0; i < skin.bones.size(); ++i) {
+            skinned[i] = Multiply(globals[i], cpu.bind_inverse[i]);
+        }
+
+        for (size_t v = 0; v < skin.vertices.size(); ++v) {
+            const ShowSkinVertex& src = skin.vertices[v];
+            float position[3] = {0.0f, 0.0f, 0.0f};
+            float normal[3] = {0.0f, 0.0f, 0.0f};
+            for (int k = 0; k < 4; ++k) {
+                const float weight = src.weights[k];
+                if (weight <= 0.0f) {
+                    continue;
+                }
+                const size_t bone = src.bones[k];
+                if (bone >= skinned.size()) {
+                    continue;
+                }
+                float moved[3];
+                float turned[3];
+                TransformPoint(skinned[bone], src.position, moved);
+                TransformDirection(skinned[bone], src.normal, turned);
+                for (int i = 0; i < 3; ++i) {
+                    position[i] += moved[i] * weight;
+                    normal[i] += turned[i] * weight;
+                }
+            }
+            const float length = std::sqrt(normal[0] * normal[0] + normal[1] * normal[1] +
+                                           normal[2] * normal[2]);
+            if (length > 1e-8f) {
+                normal[0] /= length;
+                normal[1] /= length;
+                normal[2] /= length;
+            }
+            dst[v].position[0] = position[0] + ox;
+            dst[v].position[1] = position[1] + oy;
+            dst[v].position[2] = position[2] + oz;
+            std::copy(normal, normal + 3, dst[v].normal);
+            std::copy(src.color, src.color + 3, dst[v].color);
+        }
+    }
+}
+
+bool Renderer::RecordShowCommandBuffer(uint32_t image_index) {
+    VkCommandBuffer command = command_buffers[frame_index];
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (g_vkBeginCommandBuffer(command, &begin_info) != VK_SUCCESS) {
+        return false;
+    }
+
+    VkClearValue clear_values[2]{};
+    clear_values[0].color.float32[0] = 0.02f;
+    clear_values[0].color.float32[1] = 0.025f;
+    clear_values[0].color.float32[2] = 0.032f;
+    clear_values[0].color.float32[3] = 1.0f;
+    clear_values[1].depthStencil.depth = 1.0f;
+    clear_values[1].depthStencil.stencil = 0;
+
+    VkRenderPassBeginInfo pass_info{};
+    pass_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    pass_info.renderPass = render_pass;
+    pass_info.framebuffer = framebuffers[image_index];
+    pass_info.renderArea.offset.x = 0;
+    pass_info.renderArea.offset.y = 0;
+    pass_info.renderArea.extent = extent;
+    pass_info.clearValueCount = 2;
+    pass_info.pClearValues = clear_values;
+    g_vkCmdBeginRenderPass(command, &pass_info, VK_SUBPASS_CONTENTS_INLINE);
+
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = static_cast<float>(extent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    g_vkCmdSetViewport(command, 0, 1, &viewport);
+    VkRect2D scissor{};
+    scissor.offset.x = 0;
+    scissor.offset.y = 0;
+    scissor.extent = extent;
+    g_vkCmdSetScissor(command, 0, 1, &scissor);
+
+    g_vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    g_vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1,
+                              &descriptor_set, 0, nullptr);
+    const VkDeviceSize offset = 0;
+    g_vkCmdBindIndexBuffer(command, show_gpu.indices, 0, VK_INDEX_TYPE_UINT32);
+
+    VkBuffer bound = VK_NULL_HANDLE;
+    for (const DrawRange& draw : show_gpu.draws) {
+        if (draw.index_count == 0) {
+            continue;
+        }
+        VkBuffer wanted = draw.skinned ? show_gpu.skin_vertices : show_gpu.stage_vertices;
+        if (wanted != bound) {
+            g_vkCmdBindVertexBuffers(command, 0, 1, &wanted, &offset);
+            bound = wanted;
+        }
+        g_vkCmdDrawIndexed(command, draw.index_count, 1, draw.first_index,
+                           draw.vertex_offset, 0);
+    }
+
+    g_vkCmdEndRenderPass(command);
+    return g_vkEndCommandBuffer(command) == VK_SUCCESS;
+}
+
+bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* error) {
+    if (g_window_resized) {
+        g_window_resized = false;
+        RECT client{};
+        GetClientRect(window, &client);
+        if (client.right - client.left > 0 && client.bottom - client.top > 0) {
+            if (!RecreateSwapchain(error)) {
+                return false;
+            }
+        }
+    }
+
+    // 顶点缓冲与 uniform 每帧都由 CPU 重写，等上一帧彻底画完再写。
+    if (g_vkDeviceWaitIdle(device) != VK_SUCCESS) {
+        *error = "等待设备空闲失败";
+        return false;
+    }
+
+    const ShowCameraPose pose = show.SampleCamera(seconds);
+    const float radius = 0.5f * std::sqrt(
+        (show_gpu.bounds_hi[0] - show_gpu.bounds_lo[0]) *
+            (show_gpu.bounds_hi[0] - show_gpu.bounds_lo[0]) +
+        (show_gpu.bounds_hi[1] - show_gpu.bounds_lo[1]) *
+            (show_gpu.bounds_hi[1] - show_gpu.bounds_lo[1]) +
+        (show_gpu.bounds_hi[2] - show_gpu.bounds_lo[2]) *
+            (show_gpu.bounds_hi[2] - show_gpu.bounds_lo[2]));
+    const float near_plane = std::max(radius * 0.002f, 0.05f);
+    const float far_plane = radius * 30.0f + 100.0f;
+    const float aspect = extent.height > 0
+                             ? static_cast<float>(extent.width) / static_cast<float>(extent.height)
+                             : 1.0f;
+
+    const Mat4 view = LookAtVulkan(pose.position, pose.target);
+    const Mat4 projection = PerspectiveVulkan(45.0f, aspect, near_plane, far_plane);
+    const Mat4 view_projection = MultiplyMat4(projection, view);
+
+    CameraUniform uniform{};
+    std::memcpy(uniform.view_projection, view_projection.m, sizeof(uniform.view_projection));
+    uniform.light_direction[0] = 0.25f;
+    uniform.light_direction[1] = 0.55f;
+    uniform.light_direction[2] = 0.80f;
+    uniform.light_direction[3] = 0.0f;
+    std::memcpy(camera_mapped, &uniform, sizeof(uniform));
+
+    show_gpu.Update(show, seconds);
+
+    if (g_vkWaitForFences(device, 1, &in_flight[frame_index], VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        *error = "等待帧栅栏失败";
+        return false;
+    }
+
+    uint32_t image_index = 0;
+    const VkResult acquire_result = g_vkAcquireNextImageKHR(
+        device, swapchain, UINT64_MAX, image_available[frame_index], VK_NULL_HANDLE, &image_index);
+    if (acquire_result == VK_ERROR_OUT_OF_DATE_KHR) {
+        return RecreateSwapchain(error);
+    }
+    if (acquire_result != VK_SUCCESS && acquire_result != VK_SUBOPTIMAL_KHR) {
+        *error = "获取交换链图像失败（" + ResultText(acquire_result) + "）";
+        return false;
+    }
+
+    if (g_vkResetFences(device, 1, &in_flight[frame_index]) != VK_SUCCESS) {
+        *error = "重置帧栅栏失败";
+        return false;
+    }
+    if (!RecordShowCommandBuffer(image_index)) {
+        *error = "录制演出命令缓冲失败";
+        return false;
+    }
+
+    VkSubmitInfo submit_info{};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.waitSemaphoreCount = 1;
+    submit_info.pWaitSemaphores = &image_available[frame_index];
+    const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    submit_info.pWaitDstStageMask = &wait_stage;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &command_buffers[frame_index];
+    submit_info.signalSemaphoreCount = 1;
+    submit_info.pSignalSemaphores = &render_finished[frame_index];
+
+    if (g_vkQueueSubmit(queue, 1, &submit_info, in_flight[frame_index]) != VK_SUCCESS) {
+        *error = "提交演出命令失败";
+        return false;
+    }
+
+    VkPresentInfoKHR present_info{};
+    present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    present_info.waitSemaphoreCount = 1;
+    present_info.pWaitSemaphores = &render_finished[frame_index];
+    present_info.swapchainCount = 1;
+    present_info.pSwapchains = &swapchain;
+    present_info.pImageIndices = &image_index;
+
+    const VkResult present_result = g_vkQueuePresentKHR(queue, &present_info);
+    frame_index = (frame_index + 1) % kFramesInFlight;
+
+    if (present_result == VK_ERROR_OUT_OF_DATE_KHR || present_result == VK_SUBOPTIMAL_KHR) {
+        return RecreateSwapchain(error);
+    }
+    if (present_result != VK_SUCCESS) {
+        *error = "呈现演出画面失败（" + ResultText(present_result) + "）";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
+
+int RunShow(const Show& show) {
+    if (show.camera_keys.empty()) {
+        std::fprintf(stderr, "演出包里没有相机轨，无法播放\n");
+        return 1;
+    }
+    if (show.poses.empty()) {
+        std::fprintf(stderr, "演出包里没有动画数据，无法播放\n");
+        return 1;
+    }
+    double duration = show.duration;
+    if (duration <= 0.0) {
+        duration = static_cast<double>(show.poses.back().frame) / show.anim_fps;
+    }
+    if (duration <= 0.0) {
+        std::fprintf(stderr, "演出时长为 0，无法播放\n");
+        return 1;
+    }
+
+    std::string error;
+    if (!CreateRenderWindow(&error)) {
+        MessageBoxA(nullptr, error.c_str(), "liveview", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
+    Renderer renderer;
+    if (!renderer.Init(g_window, &error)) {
+        MessageBoxA(g_window, error.c_str(), "liveview", MB_OK | MB_ICONERROR);
+        renderer.Shutdown();
+        DestroyWindow(g_window);
+        return 1;
+    }
+    if (!renderer.show_gpu.Upload(renderer.device, renderer.physical_device, show, &error)) {
+        MessageBoxA(g_window, error.c_str(), "liveview", MB_OK | MB_ICONERROR);
+        renderer.Shutdown();
+        DestroyWindow(g_window);
+        return 1;
+    }
+
+    std::printf("演出：%.2fs  相机 %zu 关键帧  舞台 %zu 三角  角色 %zu 三角  动画 %zu 骨骼\n",
+                duration, show.camera_keys.size(), show.StageTriangleCount(),
+                show.SkinTriangleCount(), show.anim_bones.size());
+    std::printf("ESC 或关闭窗口结束\n");
+    std::fflush(stdout);
+
+    LARGE_INTEGER frequency{};
+    LARGE_INTEGER start{};
+    LARGE_INTEGER now{};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+
+    MSG message{};
+    bool running = true;
+    double title_time = -1.0;
+
+    while (running) {
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            if (message.message == WM_QUIT) {
+                running = false;
+                break;
+            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        if (!running) {
+            break;
+        }
+
+        RECT client{};
+        GetClientRect(g_window, &client);
+        if (client.right - client.left <= 0 || client.bottom - client.top <= 0) {
+            Sleep(10);
+            continue;
+        }
+
+        QueryPerformanceCounter(&now);
+        const double elapsed = static_cast<double>(now.QuadPart - start.QuadPart) /
+                               static_cast<double>(frequency.QuadPart);
+        double seconds = elapsed;
+        while (seconds > duration) {
+            seconds -= duration;
+        }
+
+        if (!renderer.DrawShowFrame(show, seconds, &error)) {
+            MessageBoxA(g_window, error.c_str(), "liveview", MB_OK | MB_ICONERROR);
+            break;
+        }
+
+        if (elapsed - title_time >= 0.25) {
+            title_time = elapsed;
+            char title[160];
+            std::snprintf(title, sizeof(title), "liveview show  %.1f / %.1f s", seconds,
+                          duration);
+            SetWindowTextA(g_window, title);
+        }
+    }
+
+    renderer.Shutdown();
+    if (g_window != nullptr && IsWindow(g_window)) {
+        DestroyWindow(g_window);
+    }
+    return 0;
+}
 
 int RunRender(const Bundle& bundle, double seconds) {
     if (bundle.tick_fps <= 0.0) {

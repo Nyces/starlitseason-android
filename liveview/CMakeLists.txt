@@ -36,6 +36,7 @@ add_executable(liveview
   src/app_window.cpp
   src/commands.cpp
   src/bundle.cpp
+  src/show.cpp
   src/aes256.cpp
   src/pak.cpp
   src/config.cpp
@@ -76,4 +77,54 @@ if(LIVEVIEW_RENDER)
     LIVEVIEW_RENDER=1
     VK_NO_PROTOTYPES
     VK_USE_PLATFORM_WIN32_KHR)
+
+  # 着色器：构建期用 glslang 把 GLSL 编成 SPIR-V，再嵌进可执行文件。
+  # 这样运行时不需要外部 .spv 文件，也不依赖 Vulkan SDK。
+  set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+  set(ENABLE_SPIRV ON CACHE BOOL "" FORCE)
+  set(ENABLE_GLSLANG_BINARIES ON CACHE BOOL "" FORCE)
+  set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+  set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(glslang
+    GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+    GIT_TAG vulkan-sdk-1.3.296.0
+    GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(glslang)
+
+  set(LIVEVIEW_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
+  set(LIVEVIEW_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+  file(MAKE_DIRECTORY ${LIVEVIEW_GENERATED_DIR})
+  set(LIVEVIEW_VERT_HEADER ${LIVEVIEW_GENERATED_DIR}/scene_vert_spirv.h)
+  set(LIVEVIEW_FRAG_HEADER ${LIVEVIEW_GENERATED_DIR}/scene_frag_spirv.h)
+  set(LIVEVIEW_EMBED ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake)
+
+  add_custom_command(
+    OUTPUT ${LIVEVIEW_VERT_HEADER}
+    COMMAND glslang-standalone -V --target-env vulkan1.0
+            -o ${LIVEVIEW_GENERATED_DIR}/scene.vert.spv ${LIVEVIEW_SHADER_DIR}/scene.vert
+    COMMAND ${CMAKE_COMMAND}
+            -DINPUT=${LIVEVIEW_GENERATED_DIR}/scene.vert.spv
+            -DOUTPUT=${LIVEVIEW_VERT_HEADER}
+            -DNAME=kSceneVertexSpirv
+            -P ${LIVEVIEW_EMBED}
+    DEPENDS ${LIVEVIEW_SHADER_DIR}/scene.vert ${LIVEVIEW_EMBED}
+    COMMENT "编译 scene.vert -> SPIR-V")
+
+  add_custom_command(
+    OUTPUT ${LIVEVIEW_FRAG_HEADER}
+    COMMAND glslang-standalone -V --target-env vulkan1.0
+            -o ${LIVEVIEW_GENERATED_DIR}/scene.frag.spv ${LIVEVIEW_SHADER_DIR}/scene.frag
+    COMMAND ${CMAKE_COMMAND}
+            -DINPUT=${LIVEVIEW_GENERATED_DIR}/scene.frag.spv
+            -DOUTPUT=${LIVEVIEW_FRAG_HEADER}
+            -DNAME=kSceneFragmentSpirv
+            -P ${LIVEVIEW_EMBED}
+    DEPENDS ${LIVEVIEW_SHADER_DIR}/scene.frag ${LIVEVIEW_EMBED}
+    COMMENT "编译 scene.frag -> SPIR-V")
+
+  add_custom_target(liveview_shaders DEPENDS ${LIVEVIEW_VERT_HEADER} ${LIVEVIEW_FRAG_HEADER})
+  add_dependencies(liveview_shaders glslang-standalone)
+  add_dependencies(liveview liveview_shaders)
+  target_include_directories(liveview PRIVATE ${LIVEVIEW_GENERATED_DIR})
 endif()
