@@ -1524,7 +1524,7 @@ void Renderer::Shutdown() {
             g_vkDeviceWaitIdle(device);
         }
         DestroySwapchainResources();
-        show_gpu.Destroy();
+        show_gpu.Destroy(device);
         DestroyShowPipeline();
         if (g_vkDestroyRenderPass != nullptr && render_pass != VK_NULL_HANDLE) {
             g_vkDestroyRenderPass(device, render_pass, nullptr);
