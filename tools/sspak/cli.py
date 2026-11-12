@@ -1135,37 +1135,115 @@ def cmd_live_bundle(args) -> int:
             pak.close()
 
 
-def _material_average_color(store, material, default, cache):
-    """材质基础色贴图的平均颜色（线性 0..1），解析失败时用默认色。"""
+def _shrink_texture(image, limit: int):
+    """把贴图最长边缩到 limit（RGBA8，行序自上而下）——块平均，不依赖 PIL。"""
     import numpy as np
 
-    if not material:
-        return default
-    if material in cache:
-        return cache[material]
-    color = default
-    texture = None
-    try:
-        _, texture = _material_texture(store, material)
-    except Exception:  # noqa: BLE001 - 贴图解码失败不影响几何导出
-        texture = None
-    if texture is not None and getattr(texture, "size", 0) > 0:
-        # 隔行取样就够了，整张大图求均值太慢
-        sample = texture[::4, ::4]
-        mask = sample[:, :, 3] > 8
-        if bool(mask.any()):
-            rgb = sample[:, :, :3][mask].astype(np.float64).mean(axis=0) / 255.0
-            color = tuple(float(v) for v in rgb)
-    cache[material] = color
-    return color
+    if image is None:
+        return None
+    pixels = np.ascontiguousarray(image[:, :, :4], dtype=np.uint8)
+    height, width = pixels.shape[:2]
+    step = 1
+    while max(width // step, height // step) > limit:
+        step *= 2
+    if step == 1:
+        return pixels
+    usable_h = (height // step) * step
+    usable_w = (width // step) * step
+    blocks = pixels[:usable_h, :usable_w].astype(np.uint16).reshape(
+        usable_h // step, step, usable_w // step, step, 4)
+    return blocks.mean(axis=(1, 3)).astype(np.uint8)
 
 
-def _show_stage_meshes(store, map_path: str, verbose: bool = True):
-    """把关卡里的静态网格烘成世界坐标的演出网格。"""
+class ShowMaterialLibrary:
+    """把材质名解析成 Toon 参数 + 贴图表下标。
+
+    同名材质与同内容贴图只存一份：舞台与角色共用一张表，索引在演出包里通用。
+    """
+
+    def __init__(self, store):
+        self.store = store
+        self.textures: list = []
+        self.materials: list = []
+        self._material_index: dict[tuple, int] = {}
+        self._texture_index: dict[tuple, int] = {}
+
+    def add_texture(self, image, limit: int) -> int:
+        import hashlib
+        import numpy as np
+
+        if image is None:
+            return -1
+        image = _shrink_texture(image, limit)
+        key = (limit, hashlib.blake2b(np.ascontiguousarray(image).tobytes(),
+                                      digest_size=16).digest())
+        if key in self._texture_index:
+            return self._texture_index[key]
+        self.textures.append(image)
+        index = len(self.textures) - 1
+        self._texture_index[key] = index
+        return index
+
+    def resolve(self, material: str | None, fallback_color=(0.78, 0.76, 0.72),
+                limit: int = 1024) -> int:
+        """返回材质下标；-1 表示这一层不画（腮红等纯叠色层）。"""
+        import numpy as np
+
+        from .ue4.show import BLEND_MODES, MaterialData
+
+        key = (material or "", limit)
+        if key in self._material_index:
+            return self._material_index[key]
+
+        try:
+            toon = _toon_params(self.store, material) if material else ToonMaterial()
+        except Exception:  # noqa: BLE001 - 单个材质解析失败不该毁掉整包导出
+            toon = ToonMaterial()
+        if toon.skip:
+            self._material_index[key] = -1
+            return -1
+
+        if toon.outline:
+            # 描边材质在网格里是外扩壳，只刷一遍线色
+            pixel = np.full((1, 1, 4), 255, np.uint8)
+            pixel[0, 0, :3] = [int(min(max(c, 0.0), 1.0) * 255.0) for c in toon.outline_color]
+            data = MaterialData(base_texture=self.add_texture(pixel, limit),
+                                unlit=True, outline=True,
+                                outline_width=float(toon.outline_width))
+        else:
+            base = self.add_texture(toon.texture, limit)
+            if base < 0:
+                pixel = np.full((1, 1, 4), 255, np.uint8)
+                pixel[0, 0, :3] = [int(min(max(c, 0.0), 1.0) * 255.0)
+                                   for c in fallback_color]
+                base = self.add_texture(pixel, limit)
+            data = MaterialData(
+                base_texture=base,
+                sphere_texture=self.add_texture(toon.sphere, limit),
+                shadow_texture=self.add_texture(toon.shadow_map, limit),
+                shadow_tint=tuple(float(v) for v in toon.shadow),
+                threshold=float(toon.threshold),
+                blend=tuple(float(v) for v in toon.blend),
+                add=tuple(float(v) for v in toon.add),
+                rim_scale=float(toon.rim_scale),
+                sphere_blend=tuple(float(v) for v in toon.sphere_blend),
+                sphere_pow=float(toon.sphere_pow),
+                sphere_boost=float(toon.sphere_boost),
+                blend_mode=BLEND_MODES.get(toon.blend_mode, 0),
+                unlit=bool(toon.unlit))
+        self.materials.append(data)
+        index = len(self.materials) - 1
+        self._material_index[key] = index
+        return index
+
+
+def _show_stage_meshes(store, map_path: str, library: ShowMaterialLibrary,
+                       verbose: bool = True):
+    """把关卡里的静态网格烘成世界坐标的演出网格（带 UV 与分段材质）。"""
     import numpy as np
 
     from .ue4.level import parse_level
-    from .ue4.show import StageMesh
+    from .ue4.show import MeshSection, StageMesh
     from .ue4.staticmesh import parse_static_mesh
     from .render import _smooth_normals
 
@@ -1177,7 +1255,6 @@ def _show_stage_meshes(store, map_path: str, verbose: bool = True):
         print(f"关卡 {map_path}：静态网格 actor {len(placed)} 个")
 
     cache: dict[str, object] = {}
-    colors: dict[str, tuple[float, float, float]] = {}
     meshes = []
     skipped = 0
     for entry in placed:
@@ -1208,10 +1285,10 @@ def _show_stage_meshes(store, map_path: str, verbose: bool = True):
         length[length == 0] = 1.0
         normals = (normals / length).astype(np.float32)
 
-        vertex_colors = np.full((len(positions), 3), 0.55, np.float32)
         kept: list[np.ndarray] = []
-        sections = mesh.sections or [None]
-        for section in sections:
+        sections: list = []
+        index_at = 0
+        for section in mesh.sections or [None]:
             if section is None:
                 indices, slot_index = mesh.indices, 0
             else:
@@ -1225,27 +1302,31 @@ def _show_stage_meshes(store, map_path: str, verbose: bool = True):
                 material = entry.materials[slot_index]
             if not material and slot_index < len(mesh.material_slots):
                 material = mesh.material_slots[slot_index]
-            if material and "outline" in material.lower():
+            # 舞台贴图只用 256 边长：构件多，贴图数量远比角色大
+            material_index = library.resolve(material, (0.55, 0.55, 0.6), limit=256)
+            if material_index < 0:
                 continue
             kept.append(indices)
-            color = _material_average_color(store, material, (0.55, 0.55, 0.6), colors)
-            vertex_colors[np.unique(indices)] = color
+            count = int(len(indices))
+            sections.append(MeshSection(index_at, count, material_index))
+            index_at += count
         if not kept:
             continue
         indices = np.concatenate(kept).astype(np.uint32)
-        meshes.append(StageMesh(positions=positions, normals=normals,
-                                colors=vertex_colors, indices=indices))
+        meshes.append(StageMesh(positions=positions, normals=normals, indices=indices,
+                                uvs=mesh.uvs, sections=sections))
     if verbose:
         total = sum(len(m.positions) for m in meshes)
         print(f"  舞台网格 {len(meshes)} 个 / 顶点 {total:,}（跳过 {skipped} 个 actor）")
     return meshes
 
 
-def _show_skin_meshes(store, chr_id: str, verbose: bool = True):
+def _show_skin_meshes(store, chr_id: str, library: ShowMaterialLibrary,
+                      verbose: bool = True):
     """把角色的身体/脸/头发/饰品导成蒙皮网格（头发与饰品跟随 SO_Head）。"""
     import numpy as np
 
-    from .ue4.show import SkinMesh
+    from .ue4.show import MeshSection, SkinMesh
     from .ue4.skeletalmesh import parse_skeletal_mesh
     from .render import _smooth_normals
 
@@ -1255,7 +1336,6 @@ def _show_skin_meshes(store, chr_id: str, verbose: bool = True):
         f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_hair",
         f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_orna",
     ]
-    colors: dict[str, tuple[float, float, float]] = {}
     meshes = []
     for asset in candidates:
         package = store.package(asset)
@@ -1273,8 +1353,9 @@ def _show_skin_meshes(store, chr_id: str, verbose: bool = True):
             continue
 
         normals = _smooth_normals(mesh.positions, mesh.indices)
-        vertex_colors = np.full((len(mesh.positions), 3), 0.62, np.float32)
         kept: list[np.ndarray] = []
+        sections: list = []
+        index_at = 0
         for section in mesh.sections:
             start = section.base_index
             count = section.num_triangles * 3
@@ -1283,11 +1364,13 @@ def _show_skin_meshes(store, chr_id: str, verbose: bool = True):
                 continue
             slot = (mesh.material_slots[section.material_index]
                     if section.material_index < len(mesh.material_slots) else None)
-            if slot and "outline" in slot.lower():
+            material_index = library.resolve(slot, (0.62, 0.58, 0.55), limit=1024)
+            if material_index < 0:
                 continue
             kept.append(indices)
-            color = _material_average_color(store, slot, (0.62, 0.58, 0.55), colors)
-            vertex_colors[np.unique(indices)] = color
+            count = int(len(indices))
+            sections.append(MeshSection(index_at, count, material_index))
+            index_at += count
         if not kept:
             continue
         indices = np.concatenate(kept).astype(np.uint32)
@@ -1299,10 +1382,11 @@ def _show_skin_meshes(store, chr_id: str, verbose: bool = True):
         bone_indices[weights <= 0.0] = 0
         meshes.append(SkinMesh(
             bones=mesh.bones, bind_pose=mesh.bind_pose,
-            positions=mesh.positions, normals=normals, colors=vertex_colors,
+            positions=mesh.positions, normals=normals,
             bone_indices=bone_indices.astype(np.uint16),
             weights=weights,
-            indices=indices, attach_bone=attach))
+            indices=indices, attach_bone=attach,
+            uvs=mesh.uvs, sections=sections))
         if verbose:
             print(f"  {asset.rsplit('/', 1)[-1]}: {len(mesh.positions)} 顶点 / "
                   f"{len(indices) // 3} 三角 / {len(mesh.bones)} 骨骼")
@@ -1429,8 +1513,9 @@ def cmd_live_show(args) -> int:
         camera_keys, tick_fps, binding_name, character_target = _show_camera_keys(
             store, args.sequence, args.binding, duration, args.camera_fps,
             args.character_binding)
-        stages = _show_stage_meshes(store, args.map)
-        skins = _show_skin_meshes(store, args.chr)
+        library = ShowMaterialLibrary(store)
+        stages = _show_stage_meshes(store, args.map, library)
+        skins = _show_skin_meshes(store, args.chr, library)
 
         # 角色落位：优先用角色跟拍相机的瞄准点（= 角色在舞台上的位置），
         # 没有该绑定时退回播放相机的首个瞄准点。脚底贴到主地面（实测 z≈0.1）。
@@ -1447,6 +1532,8 @@ def cmd_live_show(args) -> int:
         try:
             writer.timeline(tick_fps, anim_fps, duration, offset)
             writer.camera(camera_keys)
+            writer.textures(library.textures)
+            writer.materials(library.materials)
             writer.stage(stages)
             writer.skins(skins)
             writer.animation(animation)
@@ -1455,7 +1542,8 @@ def cmd_live_show(args) -> int:
         print(f"已写出演出包 {args.out}")
         print(f"  时长 {duration:.2f}s  相机 {binding_name} {len(camera_keys)} 关键帧  "
               f"舞台 {len(stages)} 网格  蒙皮 {len(skins)} 网格  "
-              f"动画 {len(animation.bone_names)} 骨骼 × {len(animation.frames)} 帧")
+              f"动画 {len(animation.bone_names)} 骨骼 × {len(animation.frames)} 帧  "
+              f"材质 {len(library.materials)} 个  贴图 {len(library.textures)} 张")
         return 0
     finally:
         for pak in paks:

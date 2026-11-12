@@ -275,6 +275,8 @@ int RunShowCommand(int argc, char** argv) {
                 show.StageVertexCount(), show.StageTriangleCount());
     std::printf("  蒙皮        %zu 个网格，%zu 顶点，%zu 三角\n", show.skins.size(),
                 show.SkinVertexCount(), show.SkinTriangleCount());
+    std::printf("  材质        %zu 个，贴图 %zu 张\n", show.materials.size(),
+                show.textures.size());
     for (size_t i = 0; i < show.skins.size(); ++i) {
         const liveview::ShowSkin& skin = show.skins[i];
         std::printf("    [%zu] 骨骼 %zu，跟随 %s\n", i, skin.bones.size(),

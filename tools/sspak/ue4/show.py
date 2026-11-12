@@ -9,8 +9,8 @@ CPU 线性混合蒙皮与渲染。
 
 格式（全部小端）：
 
-    char[4] "LVS2"
-    u32     version = 2
+    char[4] "LVS3"
+    u32     version = 3
 
     --- 时间轴 ---
     f64 camera_tick_fps        // 相机轨的 tick 频率
@@ -20,11 +20,29 @@ CPU 线性混合蒙皮与渲染。
     u32 camera_key_count
         key_count × { i64 frame; f32 position[3]; f32 target[3] }
 
+    --- 贴图（RGBA8，zlib 压缩；渲染器上传时解压） ---
+    u32 texture_count
+        texture_count × { u32 width; u32 height; u32 data_size; u8 data[data_size] }
+
+    --- 材质（Toon 参数，对应 Python 预览器的 SceneItem） ---
+    u32 material_count
+        material_count × {
+            i32 base_texture; i32 sphere_texture; i32 shadow_texture   // -1 = 没有
+            f32 shadow_tint[3]; f32 threshold
+            f32 blend[3]; f32 add[3]; f32 rim_scale
+            f32 sphere_blend[3]; f32 sphere_pow; f32 sphere_boost
+            f32 outline_width                      // >0 = 描边壳，顶点沿法线外扩
+            u8  blend_mode    // 0 opaque / 1 masked / 2 additive / 3 translucent / 4 modulate
+            u8  unlit; u8 outline; u8 pad
+        }
+
     --- 舞台 ---
     u32 stage_count
         stage_count × {
             u32 vertex_count
-                vertex_count × { f32 position[3]; f32 normal[3]; f32 color[3] }
+                vertex_count × { f32 position[3]; f32 normal[3]; f32 uv[2] }
+            u32 section_count
+                section_count × { u32 first_index; u32 index_count; i32 material }
             u32 index_count; index_count × u32
         }
 
@@ -36,8 +54,10 @@ CPU 线性混合蒙皮与渲染。
                 bone_count × { u16 name_len; char name[name_len];
                                i32 parent; f32 quat[4]; f32 translation[3]; f32 scale[3] }
             u32 vertex_count
-                vertex_count × { f32 position[3]; f32 normal[3]; f32 color[3];
+                vertex_count × { f32 position[3]; f32 normal[3]; f32 uv[2];
                                  u16 bone_index[4]; f32 weight[4] }
+            u32 section_count
+                section_count × { u32 first_index; u32 index_count; i32 material }
             u32 index_count; index_count × u32
         }
 
@@ -55,12 +75,16 @@ CPU 线性混合蒙皮与渲染。
 from __future__ import annotations
 
 import struct
+import zlib
 from dataclasses import dataclass, field
 
 import numpy as np
 
-SHOW_MAGIC = b"LVS2"
-SHOW_VERSION = 2
+SHOW_MAGIC = b"LVS3"
+SHOW_VERSION = 3
+
+# 混合模式在包里的编号（与 C++ 侧 ShowMaterial::blend_mode 一致）
+BLEND_MODES = {"opaque": 0, "masked": 1, "additive": 2, "translucent": 3, "modulate": 4}
 
 
 def quat_from_matrix(matrix: np.ndarray) -> tuple[float, float, float, float]:
@@ -98,11 +122,19 @@ def quat_from_matrix(matrix: np.ndarray) -> tuple[float, float, float, float]:
 
 
 @dataclass
+class MeshSection:
+    first_index: int                 # 在本网格索引数组里的起点
+    index_count: int
+    material: int = -1               # 材质下标，-1 = 没有材质
+
+
+@dataclass
 class StageMesh:
     positions: np.ndarray            # (N,3) float32，世界坐标
     normals: np.ndarray              # (N,3) float32
-    colors: np.ndarray               # (N,3) float32
     indices: np.ndarray              # (M,) uint32
+    uvs: np.ndarray | None = None    # (N,2) float32
+    sections: list[MeshSection] = field(default_factory=list)
 
 
 @dataclass
@@ -111,11 +143,33 @@ class SkinMesh:
     bind_pose: np.ndarray            # (B,10) 四元数 xyzw + 平移 + 缩放
     positions: np.ndarray            # (N,3) 绑定姿势
     normals: np.ndarray              # (N,3)
-    colors: np.ndarray               # (N,3) float32
     bone_indices: np.ndarray         # (N,4) uint16
     weights: np.ndarray              # (N,4) float32
     indices: np.ndarray              # (M,) uint32
     attach_bone: str = ""            # 非空时整块网格跟随该骨骼（头发/饰品）
+    uvs: np.ndarray | None = None    # (N,2) float32
+    sections: list[MeshSection] = field(default_factory=list)
+
+
+@dataclass
+class MaterialData:
+    """一个材质的 Toon 参数（与 Python 预览器的 SceneItem 同义）。"""
+
+    base_texture: int = -1
+    sphere_texture: int = -1
+    shadow_texture: int = -1
+    shadow_tint: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    threshold: float = 0.47
+    blend: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    add: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    rim_scale: float = 7.5
+    sphere_blend: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    sphere_pow: float = 1.0
+    sphere_boost: float = 1.0
+    outline_width: float = 0.0        # >0 时顶点沿法线外扩（描边壳）
+    blend_mode: int = 0
+    unlit: bool = False
+    outline: bool = False
 
 
 @dataclass
@@ -192,6 +246,51 @@ class ShowWriter:
             self._f32v(position)
             self._f32v(target)
 
+    def textures(self, images: list[np.ndarray]) -> None:
+        """写贴图表：(H, W, 4) uint8 的 RGBA8，逐张 zlib 压缩。"""
+        self._u32(len(images))
+        for image in images:
+            pixels = np.ascontiguousarray(image[:, :, :4], dtype=np.uint8)
+            height, width = pixels.shape[:2]
+            data = zlib.compress(pixels.tobytes(), 6)
+            self._u32(width)
+            self._u32(height)
+            self._u32(len(data))
+            self._raw(data)
+
+    def materials(self, materials: list[MaterialData]) -> None:
+        self._u32(len(materials))
+        for material in materials:
+            self._i32(material.base_texture)
+            self._i32(material.sphere_texture)
+            self._i32(material.shadow_texture)
+            self._f32v(material.shadow_tint)
+            self._f32(material.threshold)
+            self._f32v(material.blend)
+            self._f32v(material.add)
+            self._f32(material.rim_scale)
+            self._f32v(material.sphere_blend)
+            self._f32(material.sphere_pow)
+            self._f32(material.sphere_boost)
+            self._f32(material.outline_width)
+            self._u8(material.blend_mode & 0xFF)
+            self._u8(1 if material.unlit else 0)
+            self._u8(1 if material.outline else 0)
+            self._u8(0)
+
+    def _sections(self, sections: list[MeshSection]) -> None:
+        self._u32(len(sections))
+        for section in sections:
+            self._u32(section.first_index)
+            self._u32(section.index_count)
+            self._i32(section.material)
+
+    @staticmethod
+    def _uvs(mesh, count: int) -> np.ndarray:
+        if mesh.uvs is None:
+            return np.zeros((count, 2), np.float32)
+        return np.asarray(mesh.uvs, dtype=np.float32).reshape(count, 2)
+
     def stage(self, meshes: list[StageMesh]) -> None:
         self._u32(len(meshes))
         for mesh in meshes:
@@ -200,9 +299,10 @@ class ShowWriter:
             packed = np.hstack([
                 np.asarray(mesh.positions, dtype=np.float32).reshape(count, 3),
                 np.asarray(mesh.normals, dtype=np.float32).reshape(count, 3),
-                np.asarray(mesh.colors, dtype=np.float32).reshape(count, 3),
+                self._uvs(mesh, count),
             ]).astype("<f4")
             self._raw(packed.tobytes())
+            self._sections(mesh.sections)
             self._u32(len(mesh.indices))
             self._u32v(mesh.indices)
 
@@ -219,12 +319,14 @@ class ShowWriter:
                 self._f32v(mesh.bind_pose[index][7:10])
             count = len(mesh.positions)
             self._u32(count)
+            uvs = self._uvs(mesh, count)
             for i in range(count):
                 self._f32v(mesh.positions[i])
                 self._f32v(mesh.normals[i])
-                self._f32v(mesh.colors[i])
+                self._f32v(uvs[i])
                 self._raw(np.asarray(mesh.bone_indices[i], dtype="<u2").tobytes())
                 self._f32v(mesh.weights[i])
+            self._sections(mesh.sections)
             self._u32(len(mesh.indices))
             self._u32v(mesh.indices)
 

@@ -130,6 +130,10 @@ PFN_vkCmdSetViewport g_vkCmdSetViewport = nullptr;
 PFN_vkCmdSetScissor g_vkCmdSetScissor = nullptr;
 PFN_vkCmdPipelineBarrier g_vkCmdPipelineBarrier = nullptr;
 PFN_vkCmdCopyImageToBuffer g_vkCmdCopyImageToBuffer = nullptr;
+PFN_vkCmdCopyBufferToImage g_vkCmdCopyBufferToImage = nullptr;
+PFN_vkCmdPushConstants g_vkCmdPushConstants = nullptr;
+PFN_vkCreateSampler g_vkCreateSampler = nullptr;
+PFN_vkDestroySampler g_vkDestroySampler = nullptr;
 
 // ---- 窗口状态 ----
 HWND g_window = nullptr;
@@ -418,7 +422,24 @@ double NowSeconds() {
 // 与着色器里的 CameraBlock 一致（std140）。
 struct CameraUniform {
     float view_projection[16];
+    float view[16];
     float light_direction[4];
+    float eye_position[4];
+};
+
+// 与 scene.frag 里的 MaterialBlock 一致（push constant，96 字节）。
+struct MaterialPush {
+    float shadow_tint[4];   // rgb 阴影色，w 明暗阈值
+    float blend[4];         // rgb 配色乘，w 边缘光指数
+    float add[4];           // rgb 配色加，w 阴影强度
+    float sphere[4];        // rgb 球面贴图乘色，w 取幂
+    float params[4];        // x 无光照，y 抠像阈值，z 球面强度，w 有球面贴图
+    float outline[4];       // x 外扩宽度（0 = 不扩）
+};
+
+// 一个材质在 GPU 上的资源：描述符集（内部引用贴图视图）。
+struct MaterialGpu {
+    VkDescriptorSet set = VK_NULL_HANDLE;
 };
 
 // 提前声明：离屏截图目标在 CreateShowPipeline 里创建，而实现放在文件后半部。
@@ -445,6 +466,8 @@ struct DrawRange {
     uint32_t index_count = 0;
     int32_t vertex_offset = 0;
     bool skinned = false;
+    int32_t material = -1;
+    int32_t pass = 0;   // 0 不透明/抠像，1 半透明，2 描边
 };
 
 struct SkinCpu {
@@ -473,7 +496,7 @@ struct ShowGpu {
     void* index_mapped = nullptr;
     size_t index_count = 0;
 
-    std::vector<DrawRange> draws;
+    std::vector<DrawRange> passes[3];   // 0 不透明/抠像，1 半透明，2 描边
     std::vector<SkinCpu> skins;
     int32_t head_skin = -1;      // 提供 SO_Head 的蒙皮网格
     int32_t head_bone = -1;
@@ -520,11 +543,25 @@ struct Renderer {
     VkDescriptorSetLayout descriptor_layout = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline pipeline_blended = VK_NULL_HANDLE;   // 半透明/叠加材质
+    VkPipeline pipeline_outline = VK_NULL_HANDLE;   // 描边壳：正面剔除 + 法线外扩
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkBuffer camera_buffer = VK_NULL_HANDLE;
     VkDeviceMemory camera_memory = VK_NULL_HANDLE;
     void* camera_mapped = nullptr;
+
+    // 材质资源（贴图 + 描述符集），演出包上传后创建
+    std::vector<MaterialGpu> materials_gpu;
+    std::vector<MaterialPush> material_push;   // 每个材质的 push constant 预烘焙值
+    std::vector<VkImage> texture_images;
+    std::vector<VkDeviceMemory> texture_memory;
+    std::vector<VkImageView> texture_views;
+    VkSampler sampler = VK_NULL_HANDLE;
+    // 材质缺贴图时的 1×1 白色占位
+    VkImage white_image = VK_NULL_HANDLE;
+    VkDeviceMemory white_memory = VK_NULL_HANDLE;
+    VkImageView white_view = VK_NULL_HANDLE;
 
     ShowGpu show_gpu;
     uint64_t frames_drawn = 0;   // 用于节流诊断日志
@@ -534,6 +571,8 @@ struct Renderer {
     VkShaderModule fragment_module = VK_NULL_HANDLE;
     VkRenderPass offscreen_pass = VK_NULL_HANDLE;
     VkPipeline offscreen_pipeline = VK_NULL_HANDLE;
+    VkPipeline offscreen_blended = VK_NULL_HANDLE;
+    VkPipeline offscreen_outline = VK_NULL_HANDLE;
     VkImage offscreen_color = VK_NULL_HANDLE;
     VkDeviceMemory offscreen_color_memory = VK_NULL_HANDLE;
     VkImageView offscreen_color_view = VK_NULL_HANDLE;
@@ -565,6 +604,8 @@ struct Renderer {
     void Shutdown();
     bool DrawFrame(const float* color, std::string* error);
     bool DrawShowFrame(const Show& show, double seconds, std::string* error);
+    // 上传材质贴图并分配描述符集（演出包 Upload 之后调用）
+    bool CreateMaterialResources(const Show& show, std::string* error);
 
 private:
     bool LoadGlobalFunctions(std::string* error);
@@ -582,6 +623,14 @@ private:
     bool CreateDepthResources(std::string* error);
     void DestroyDepthResources();
     bool CreateShowPipeline(std::string* error);
+    // 按渲染通道建三套管线：不透明、混合、描边
+    bool CreateShowPipelines(VkRenderPass pass, VkPipeline* opaque, VkPipeline* blended,
+                             VkPipeline* outline, std::string* error);
+    bool CreateTextureImage(const ShowTexture& texture, VkImage* image,
+                            VkDeviceMemory* memory, VkImageView* view, std::string* error);
+    void DestroyMaterialResources();
+    // 按 pass 顺序画舞台 + 角色（pipelines[0] 不透明，[1] 混合，[2] 描边）
+    void DrawShowGeometry(VkCommandBuffer command, const VkPipeline* pipelines);
     bool CreateOffscreenTarget(std::string* error);
     void DestroyOffscreenTarget();
     void DestroyShowPipeline();
@@ -706,6 +755,10 @@ bool Renderer::LoadDeviceFunctions(std::string* error) {
     LOAD_DEVICE_FN(vkCmdSetScissor);
     LOAD_DEVICE_FN(vkCmdPipelineBarrier);
     LOAD_DEVICE_FN(vkCmdCopyImageToBuffer);
+    LOAD_DEVICE_FN(vkCmdCopyBufferToImage);
+    LOAD_DEVICE_FN(vkCmdPushConstants);
+    LOAD_DEVICE_FN(vkCreateSampler);
+    LOAD_DEVICE_FN(vkDestroySampler);
     return true;
 }
 
@@ -1086,67 +1139,45 @@ bool Renderer::CreateShowPipeline(std::string* error) {
         return false;
     }
 
-    VkDescriptorSetLayoutBinding binding{};
-    binding.binding = 0;
-    binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    binding.descriptorCount = 1;
-    binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    // 描述符：0 相机 UBO，1/2/3 基础色 / 球面贴图 / 阴影遮罩
+    VkDescriptorSetLayoutBinding bindings[4]{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    for (int i = 1; i < 4; ++i) {
+        bindings[i].binding = static_cast<uint32_t>(i);
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
 
     VkDescriptorSetLayoutCreateInfo layout_info{};
     layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layout_info.bindingCount = 1;
-    layout_info.pBindings = &binding;
+    layout_info.bindingCount = 4;
+    layout_info.pBindings = bindings;
     if (g_vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &descriptor_layout) !=
         VK_SUCCESS) {
         *error = "创建描述符布局失败";
         return false;
     }
 
+    VkPushConstantRange push_range{};
+    push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    push_range.offset = 0;
+    push_range.size = static_cast<uint32_t>(sizeof(MaterialPush));
+
     VkPipelineLayoutCreateInfo pipeline_layout_info{};
     pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pipeline_layout_info.setLayoutCount = 1;
     pipeline_layout_info.pSetLayouts = &descriptor_layout;
+    pipeline_layout_info.pushConstantRangeCount = 1;
+    pipeline_layout_info.pPushConstantRanges = &push_range;
     if (g_vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr, &pipeline_layout) !=
         VK_SUCCESS) {
         *error = "创建管线布局失败";
         return false;
     }
-
-    VkDescriptorPoolSize pool_size{};
-    pool_size.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    pool_size.descriptorCount = 1;
-    VkDescriptorPoolCreateInfo pool_info{};
-    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool_info.maxSets = 1;
-    pool_info.poolSizeCount = 1;
-    pool_info.pPoolSizes = &pool_size;
-    if (g_vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool) != VK_SUCCESS) {
-        *error = "创建描述符池失败";
-        return false;
-    }
-
-    VkDescriptorSetAllocateInfo set_info{};
-    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    set_info.descriptorPool = descriptor_pool;
-    set_info.descriptorSetCount = 1;
-    set_info.pSetLayouts = &descriptor_layout;
-    if (g_vkAllocateDescriptorSets(device, &set_info, &descriptor_set) != VK_SUCCESS) {
-        *error = "分配描述符集失败";
-        return false;
-    }
-
-    VkDescriptorBufferInfo buffer_info{};
-    buffer_info.buffer = camera_buffer;
-    buffer_info.offset = 0;
-    buffer_info.range = sizeof(CameraUniform);
-    VkWriteDescriptorSet write{};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = descriptor_set;
-    write.dstBinding = 0;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    write.descriptorCount = 1;
-    write.pBufferInfo = &buffer_info;
-    g_vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 
     VkShaderModuleCreateInfo shader_info{};
     shader_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -1164,6 +1195,24 @@ bool Renderer::CreateShowPipeline(std::string* error) {
         return false;
     }
 
+    if (!CreateShowPipelines(render_pass, &pipeline, &pipeline_blended, &pipeline_outline,
+                             error)) {
+        return false;
+    }
+    // 着色器模块留着，离屏截图的管线还要复用。
+    // 截图目标建不起来不影响正常播放，只记一条日志。
+    std::string offscreen_error;
+    if (!CreateOffscreenTarget(&offscreen_error)) {
+        LogText("[render] 离屏截图目标创建失败：" + offscreen_error);
+        DestroyOffscreenTarget();
+    }
+    return true;
+}
+
+// 按渲染通道建三套管线：不透明（含抠像）、混合、描边。
+// 窗口与离屏截图共用同一套状态，避免两边逐渐走偏。
+bool Renderer::CreateShowPipelines(VkRenderPass pass, VkPipeline* opaque, VkPipeline* blended,
+                                   VkPipeline* outline, std::string* error) {
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -1190,8 +1239,8 @@ bool Renderer::CreateShowPipeline(std::string* error) {
     attributes[1].offset = static_cast<uint32_t>(offsetof(ShowVertex, normal));
     attributes[2].location = 2;
     attributes[2].binding = 0;
-    attributes[2].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributes[2].offset = static_cast<uint32_t>(offsetof(ShowVertex, color));
+    attributes[2].format = VK_FORMAT_R32G32_SFLOAT;
+    attributes[2].offset = static_cast<uint32_t>(offsetof(ShowVertex, uv));
 
     VkPipelineVertexInputStateCreateInfo vertex_input{};
     vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -1209,32 +1258,9 @@ bool Renderer::CreateShowPipeline(std::string* error) {
     viewport_state.viewportCount = 1;
     viewport_state.scissorCount = 1;
 
-    VkPipelineRasterizationStateCreateInfo rasterizer{};
-    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
-    rasterizer.cullMode = VK_CULL_MODE_NONE;   // 描边壳/双面布料都有，干脆不剔除
-    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rasterizer.lineWidth = 1.0f;
-
     VkPipelineMultisampleStateCreateInfo multisample{};
     multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo depth_stencil{};
-    depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depth_stencil.depthTestEnable = VK_TRUE;
-    depth_stencil.depthWriteEnable = VK_TRUE;
-    depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendAttachmentState blend_attachment{};
-    blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    blend_attachment.blendEnable = VK_FALSE;
-
-    VkPipelineColorBlendStateCreateInfo color_blend{};
-    color_blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    color_blend.attachmentCount = 1;
-    color_blend.pAttachments = &blend_attachment;
 
     const VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT,
                                               VK_DYNAMIC_STATE_SCISSOR};
@@ -1243,39 +1269,75 @@ bool Renderer::CreateShowPipeline(std::string* error) {
     dynamic.dynamicStateCount = 2;
     dynamic.pDynamicStates = dynamic_states;
 
-    VkGraphicsPipelineCreateInfo pipeline_info{};
-    pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pipeline_info.stageCount = 2;
-    pipeline_info.pStages = stages;
-    pipeline_info.pVertexInputState = &vertex_input;
-    pipeline_info.pInputAssemblyState = &input_assembly;
-    pipeline_info.pViewportState = &viewport_state;
-    pipeline_info.pRasterizationState = &rasterizer;
-    pipeline_info.pMultisampleState = &multisample;
-    pipeline_info.pDepthStencilState = &depth_stencil;
-    pipeline_info.pColorBlendState = &color_blend;
-    pipeline_info.pDynamicState = &dynamic;
-    pipeline_info.layout = pipeline_layout;
-    pipeline_info.renderPass = render_pass;
-    pipeline_info.subpass = 0;
+    auto build = [&](VkPipeline* target, VkCullModeFlags cull, bool blend,
+                     bool depth_write) -> bool {
+        VkPipelineRasterizationStateCreateInfo rasterizer{};
+        rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizer.cullMode = cull;
+        rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterizer.lineWidth = 1.0f;
 
-    const VkResult result = g_vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
-                                                        &pipeline_info, nullptr, &pipeline);
-    if (result != VK_SUCCESS) {
-        *error = "创建图形管线失败（" + ResultText(result) + "）";
+        VkPipelineDepthStencilStateCreateInfo depth_stencil{};
+        depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depth_stencil.depthTestEnable = VK_TRUE;
+        depth_stencil.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE;
+        depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+        VkPipelineColorBlendAttachmentState attachment{};
+        attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                    VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        attachment.blendEnable = blend ? VK_TRUE : VK_FALSE;
+        attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        attachment.colorBlendOp = VK_BLEND_OP_ADD;
+        attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+
+        VkPipelineColorBlendStateCreateInfo color_blend{};
+        color_blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        color_blend.attachmentCount = 1;
+        color_blend.pAttachments = &attachment;
+
+        VkGraphicsPipelineCreateInfo pipeline_info{};
+        pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipeline_info.stageCount = 2;
+        pipeline_info.pStages = stages;
+        pipeline_info.pVertexInputState = &vertex_input;
+        pipeline_info.pInputAssemblyState = &input_assembly;
+        pipeline_info.pViewportState = &viewport_state;
+        pipeline_info.pRasterizationState = &rasterizer;
+        pipeline_info.pMultisampleState = &multisample;
+        pipeline_info.pDepthStencilState = &depth_stencil;
+        pipeline_info.pColorBlendState = &color_blend;
+        pipeline_info.pDynamicState = &dynamic;
+        pipeline_info.layout = pipeline_layout;
+        pipeline_info.renderPass = pass;
+        pipeline_info.subpass = 0;
+        const VkResult result = g_vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                                            &pipeline_info, nullptr, target);
+        if (result != VK_SUCCESS) {
+            *error = "创建图形管线失败（" + ResultText(result) + "）";
+            return false;
+        }
+        return true;
+    };
+
+    // 不透明：不剔除（双面布料、发片都有），写深度
+    if (!build(opaque, VK_CULL_MODE_NONE, false, true)) {
         return false;
     }
-    // 着色器模块留着，离屏截图的管线还要复用。
-    // 截图目标建不起来不影响正常播放，只记一条日志。
-    std::string offscreen_error;
-    if (!CreateOffscreenTarget(&offscreen_error)) {
-        LogText("[render] 离屏截图目标创建失败：" + offscreen_error);
-        DestroyOffscreenTarget();
+    // 混合：不写深度，按 alpha 叠上去
+    if (!build(blended, VK_CULL_MODE_NONE, true, false)) {
+        return false;
     }
-    return true;
+    // 描边：顶点里已经沿法线外扩，剔除正面只留背面轮廓
+    return build(outline, VK_CULL_MODE_FRONT_BIT, false, true);
 }
 
 void Renderer::DestroyShowPipeline() {
+    DestroyMaterialResources();
     DestroyOffscreenTarget();
     if (device != VK_NULL_HANDLE) {
         if (g_vkDestroyShaderModule != nullptr) {
@@ -1293,6 +1355,12 @@ void Renderer::DestroyShowPipeline() {
         if (g_vkDestroyPipeline != nullptr && pipeline != VK_NULL_HANDLE) {
             g_vkDestroyPipeline(device, pipeline, nullptr);
         }
+        if (g_vkDestroyPipeline != nullptr && pipeline_blended != VK_NULL_HANDLE) {
+            g_vkDestroyPipeline(device, pipeline_blended, nullptr);
+        }
+        if (g_vkDestroyPipeline != nullptr && pipeline_outline != VK_NULL_HANDLE) {
+            g_vkDestroyPipeline(device, pipeline_outline, nullptr);
+        }
         if (g_vkDestroyDescriptorPool != nullptr && descriptor_pool != VK_NULL_HANDLE) {
             g_vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
         }
@@ -1305,15 +1373,335 @@ void Renderer::DestroyShowPipeline() {
     }
     DestroyCameraBuffer();
     pipeline = VK_NULL_HANDLE;
+    pipeline_blended = VK_NULL_HANDLE;
+    pipeline_outline = VK_NULL_HANDLE;
     descriptor_pool = VK_NULL_HANDLE;
     descriptor_set = VK_NULL_HANDLE;
     pipeline_layout = VK_NULL_HANDLE;
     descriptor_layout = VK_NULL_HANDLE;
 }
 
+bool Renderer::CreateTextureImage(const ShowTexture& texture, VkImage* image,
+                                  VkDeviceMemory* memory, VkImageView* view,
+                                  std::string* error) {
+    VkImageCreateInfo image_info{};
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    image_info.extent = {texture.width, texture.height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (g_vkCreateImage(device, &image_info, nullptr, image) != VK_SUCCESS) {
+        *error = "创建材质贴图失败";
+        return false;
+    }
+    VkMemoryRequirements requirements{};
+    g_vkGetImageMemoryRequirements(device, *image, &requirements);
+    const uint32_t type = FindMemoryType(physical_device, requirements.memoryTypeBits,
+                                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type == UINT32_MAX) {
+        *error = "贴图找不到显存类型";
+        return false;
+    }
+    VkMemoryAllocateInfo allocate_info{};
+    allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate_info.allocationSize = requirements.size;
+    allocate_info.memoryTypeIndex = type;
+    if (g_vkAllocateMemory(device, &allocate_info, nullptr, memory) != VK_SUCCESS ||
+        g_vkBindImageMemory(device, *image, *memory, 0) != VK_SUCCESS) {
+        *error = "贴图分配显存失败";
+        return false;
+    }
+
+    // 先写进 host-visible 暂存缓冲，再用一次性命令拷进显存
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+    void* staging_mapped = nullptr;
+    if (!CreateHostBuffer(device, physical_device, texture.rgba.size(),
+                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &staging, &staging_memory,
+                          &staging_mapped, "贴图暂存", error)) {
+        return false;
+    }
+    if (staging_mapped != nullptr && !texture.rgba.empty()) {
+        std::memcpy(staging_mapped, texture.rgba.data(), texture.rgba.size());
+    }
+
+    VkCommandBuffer command = command_buffers.empty() ? VK_NULL_HANDLE : command_buffers[0];
+    if (command == VK_NULL_HANDLE) {
+        *error = "贴图上传缺少命令缓冲";
+        return false;
+    }
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (g_vkBeginCommandBuffer(command, &begin_info) != VK_SUCCESS) {
+        *error = "贴图上传命令录制失败";
+        return false;
+    }
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = *image;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    g_vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                           &barrier);
+
+    VkBufferImageCopy copy{};
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageExtent = {texture.width, texture.height, 1};
+    g_vkCmdCopyBufferToImage(command, staging, *image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             1, &copy);
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    g_vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                           1, &barrier);
+    if (g_vkEndCommandBuffer(command) != VK_SUCCESS) {
+        *error = "贴图上传命令结束失败";
+        return false;
+    }
+
+    VkSubmitInfo submit_info{};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &command;
+    if (g_vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS ||
+        g_vkDeviceWaitIdle(device) != VK_SUCCESS) {
+        *error = "贴图上传提交失败";
+        return false;
+    }
+
+    if (staging_mapped != nullptr) {
+        g_vkUnmapMemory(device, staging_memory);
+    }
+    if (g_vkDestroyBuffer != nullptr) {
+        g_vkDestroyBuffer(device, staging, nullptr);
+    }
+    if (g_vkFreeMemory != nullptr) {
+        g_vkFreeMemory(device, staging_memory, nullptr);
+    }
+
+    VkImageViewCreateInfo view_info{};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = *image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view_info.subresourceRange.levelCount = 1;
+    view_info.subresourceRange.layerCount = 1;
+    if (g_vkCreateImageView(device, &view_info, nullptr, view) != VK_SUCCESS) {
+        *error = "创建贴图视图失败";
+        return false;
+    }
+    return true;
+}
+
+void Renderer::DestroyMaterialResources() {
+    materials_gpu.clear();
+    material_push.clear();
+    if (device != VK_NULL_HANDLE) {
+        if (g_vkDestroyImageView != nullptr) {
+            for (VkImageView view : texture_views) {
+                if (view != VK_NULL_HANDLE) {
+                    g_vkDestroyImageView(device, view, nullptr);
+                }
+            }
+            if (white_view != VK_NULL_HANDLE) {
+                g_vkDestroyImageView(device, white_view, nullptr);
+            }
+        }
+        if (g_vkDestroyImage != nullptr) {
+            for (VkImage image : texture_images) {
+                if (image != VK_NULL_HANDLE) {
+                    g_vkDestroyImage(device, image, nullptr);
+                }
+            }
+            if (white_image != VK_NULL_HANDLE) {
+                g_vkDestroyImage(device, white_image, nullptr);
+            }
+        }
+        if (g_vkFreeMemory != nullptr) {
+            for (VkDeviceMemory memory : texture_memory) {
+                if (memory != VK_NULL_HANDLE) {
+                    g_vkFreeMemory(device, memory, nullptr);
+                }
+            }
+            if (white_memory != VK_NULL_HANDLE) {
+                g_vkFreeMemory(device, white_memory, nullptr);
+            }
+        }
+        if (g_vkDestroySampler != nullptr && sampler != VK_NULL_HANDLE) {
+            g_vkDestroySampler(device, sampler, nullptr);
+        }
+    }
+    texture_images.clear();
+    texture_memory.clear();
+    texture_views.clear();
+    sampler = VK_NULL_HANDLE;
+    white_image = VK_NULL_HANDLE;
+    white_memory = VK_NULL_HANDLE;
+    white_view = VK_NULL_HANDLE;
+}
+
+bool Renderer::CreateMaterialResources(const Show& show, std::string* error) {
+    if (device == VK_NULL_HANDLE || descriptor_layout == VK_NULL_HANDLE ||
+        camera_buffer == VK_NULL_HANDLE) {
+        *error = "渲染资源未就绪，无法上传材质";
+        return false;
+    }
+    if (g_vkDeviceWaitIdle != nullptr) {
+        g_vkDeviceWaitIdle(device);
+    }
+    DestroyMaterialResources();
+
+    VkSamplerCreateInfo sampler_info{};
+    sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sampler_info.magFilter = VK_FILTER_LINEAR;
+    sampler_info.minFilter = VK_FILTER_LINEAR;
+    sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sampler_info.maxLod = 0.0f;
+    if (g_vkCreateSampler(device, &sampler_info, nullptr, &sampler) != VK_SUCCESS) {
+        *error = "创建采样器失败";
+        return false;
+    }
+
+    // 1×1 白色占位：材质缺某张贴图时绑它，采样结果不影响配色
+    ShowTexture white;
+    white.width = 1;
+    white.height = 1;
+    white.rgba.assign(4, 255);
+    if (!CreateTextureImage(white, &white_image, &white_memory, &white_view, error)) {
+        return false;
+    }
+
+    texture_images.assign(show.textures.size(), VK_NULL_HANDLE);
+    texture_memory.assign(show.textures.size(), VK_NULL_HANDLE);
+    texture_views.assign(show.textures.size(), VK_NULL_HANDLE);
+    for (size_t i = 0; i < show.textures.size(); ++i) {
+        if (!CreateTextureImage(show.textures[i], &texture_images[i], &texture_memory[i],
+                                &texture_views[i], error)) {
+            return false;
+        }
+    }
+
+    const uint32_t material_count = static_cast<uint32_t>(show.materials.size());
+    const uint32_t set_count = material_count + 1;   // 0 号给未指定材质的绘制兜底
+    VkDescriptorPoolSize sizes[2]{};
+    sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    sizes[0].descriptorCount = set_count;
+    sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    sizes[1].descriptorCount = set_count * 3;
+    VkDescriptorPoolCreateInfo pool_info{};
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.maxSets = set_count;
+    pool_info.poolSizeCount = 2;
+    pool_info.pPoolSizes = sizes;
+    if (g_vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool) != VK_SUCCESS) {
+        *error = "创建材质描述符池失败";
+        return false;
+    }
+
+    std::vector<VkDescriptorSetLayout> layouts(set_count, descriptor_layout);
+    std::vector<VkDescriptorSet> sets(set_count, VK_NULL_HANDLE);
+    VkDescriptorSetAllocateInfo set_info{};
+    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_info.descriptorPool = descriptor_pool;
+    set_info.descriptorSetCount = set_count;
+    set_info.pSetLayouts = layouts.data();
+    if (g_vkAllocateDescriptorSets(device, &set_info, sets.data()) != VK_SUCCESS) {
+        *error = "分配材质描述符集失败";
+        return false;
+    }
+    descriptor_set = sets[0];
+
+    auto write_set = [&](VkDescriptorSet set, int32_t base, int32_t sphere, int32_t mask) {
+        VkDescriptorBufferInfo buffer_info{};
+        buffer_info.buffer = camera_buffer;
+        buffer_info.offset = 0;
+        buffer_info.range = sizeof(CameraUniform);
+        VkDescriptorImageInfo images[3]{};
+        const int32_t indices[3] = {base, sphere, mask};
+        VkWriteDescriptorSet writes[4]{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = set;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].descriptorCount = 1;
+        writes[0].pBufferInfo = &buffer_info;
+        for (int i = 0; i < 3; ++i) {
+            VkImageView view = white_view;
+            if (indices[i] >= 0 && static_cast<size_t>(indices[i]) < texture_views.size() &&
+                texture_views[static_cast<size_t>(indices[i])] != VK_NULL_HANDLE) {
+                view = texture_views[static_cast<size_t>(indices[i])];
+            }
+            images[i].sampler = sampler;
+            images[i].imageView = view;
+            images[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            writes[i + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i + 1].dstSet = set;
+            writes[i + 1].dstBinding = static_cast<uint32_t>(i + 1);
+            writes[i + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[i + 1].descriptorCount = 1;
+            writes[i + 1].pImageInfo = &images[i];
+        }
+        g_vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
+    };
+
+    write_set(sets[0], -1, -1, -1);
+
+    materials_gpu.resize(material_count);
+    material_push.resize(material_count);
+    for (uint32_t i = 0; i < material_count; ++i) {
+        const ShowMaterial& material = show.materials[i];
+        materials_gpu[i].set = sets[i + 1];
+        write_set(sets[i + 1], material.base_texture, material.sphere_texture,
+                  material.shadow_texture);
+
+        MaterialPush& push = material_push[i];
+        push = MaterialPush{};
+        std::copy(material.shadow_tint, material.shadow_tint + 3, push.shadow_tint);
+        push.shadow_tint[3] = material.threshold;
+        std::copy(material.blend, material.blend + 3, push.blend);
+        push.blend[3] = material.rim_scale;
+        std::copy(material.add, material.add + 3, push.add);
+        push.add[3] = 1.5f;   // ToonShadowIntensity（与 Python 预览器默认值一致）
+        std::copy(material.sphere_blend, material.sphere_blend + 3, push.sphere);
+        push.sphere[3] = material.sphere_pow;
+        push.params[0] = material.unlit ? 1.0f : 0.0f;
+        push.params[1] = material.blend_mode == 1 ? 0.33f : 0.0f;
+        push.params[2] = material.sphere_boost;
+        push.params[3] = material.sphere_texture >= 0 ? 1.0f : 0.0f;
+        push.outline[0] = material.outline ? material.outline_width : 0.0f;
+    }
+    LOG_STEP("[render] 材质资源：%u 个材质，%zu 张贴图", material_count, show.textures.size());
+    return true;
+}
+
 void Renderer::DestroyOffscreenTarget() {
     if (device == VK_NULL_HANDLE) {
         offscreen_pipeline = VK_NULL_HANDLE;
+        offscreen_blended = VK_NULL_HANDLE;
+        offscreen_outline = VK_NULL_HANDLE;
         offscreen_pass = VK_NULL_HANDLE;
         offscreen_color = VK_NULL_HANDLE;
         offscreen_color_memory = VK_NULL_HANDLE;
@@ -1329,6 +1717,12 @@ void Renderer::DestroyOffscreenTarget() {
     }
     if (g_vkDestroyPipeline != nullptr && offscreen_pipeline != VK_NULL_HANDLE) {
         g_vkDestroyPipeline(device, offscreen_pipeline, nullptr);
+    }
+    if (g_vkDestroyPipeline != nullptr && offscreen_blended != VK_NULL_HANDLE) {
+        g_vkDestroyPipeline(device, offscreen_blended, nullptr);
+    }
+    if (g_vkDestroyPipeline != nullptr && offscreen_outline != VK_NULL_HANDLE) {
+        g_vkDestroyPipeline(device, offscreen_outline, nullptr);
     }
     if (g_vkDestroyFramebuffer != nullptr && offscreen_framebuffer != VK_NULL_HANDLE) {
         g_vkDestroyFramebuffer(device, offscreen_framebuffer, nullptr);
@@ -1371,6 +1765,8 @@ void Renderer::DestroyOffscreenTarget() {
         g_vkDestroyRenderPass(device, offscreen_pass, nullptr);
     }
     offscreen_pipeline = VK_NULL_HANDLE;
+    offscreen_blended = VK_NULL_HANDLE;
+    offscreen_outline = VK_NULL_HANDLE;
     offscreen_pass = VK_NULL_HANDLE;
     offscreen_color = VK_NULL_HANDLE;
     offscreen_color_memory = VK_NULL_HANDLE;
@@ -1504,95 +1900,9 @@ bool Renderer::CreateOffscreenTarget(std::string* error) {
         return false;
     }
 
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vertex_module;
-    stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = fragment_module;
-    stages[1].pName = "main";
-
-    VkVertexInputBindingDescription vertex_binding{};
-    vertex_binding.binding = 0;
-    vertex_binding.stride = static_cast<uint32_t>(sizeof(ShowVertex));
-    vertex_binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-    VkVertexInputAttributeDescription attributes[3]{};
-    attributes[0].location = 0;
-    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributes[0].offset = static_cast<uint32_t>(offsetof(ShowVertex, position));
-    attributes[1].location = 1;
-    attributes[1].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributes[1].offset = static_cast<uint32_t>(offsetof(ShowVertex, normal));
-    attributes[2].location = 2;
-    attributes[2].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributes[2].offset = static_cast<uint32_t>(offsetof(ShowVertex, color));
-    VkPipelineVertexInputStateCreateInfo vertex_input{};
-    vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertex_input.vertexBindingDescriptionCount = 1;
-    vertex_input.pVertexBindingDescriptions = &vertex_binding;
-    vertex_input.vertexAttributeDescriptionCount = 3;
-    vertex_input.pVertexAttributeDescriptions = attributes;
-
-    VkPipelineInputAssemblyStateCreateInfo input_assembly{};
-    input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo viewport_state{};
-    viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewport_state.viewportCount = 1;
-    viewport_state.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo rasterizer{};
-    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
-    rasterizer.cullMode = VK_CULL_MODE_NONE;
-    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rasterizer.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo multisample{};
-    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo depth_stencil{};
-    depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depth_stencil.depthTestEnable = VK_TRUE;
-    depth_stencil.depthWriteEnable = VK_TRUE;
-    depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendAttachmentState blend_attachment{};
-    blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    VkPipelineColorBlendStateCreateInfo color_blend{};
-    color_blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    color_blend.attachmentCount = 1;
-    color_blend.pAttachments = &blend_attachment;
-
-    const VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT,
-                                              VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{};
-    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamic.dynamicStateCount = 2;
-    dynamic.pDynamicStates = dynamic_states;
-
-    VkGraphicsPipelineCreateInfo pipeline_info{};
-    pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pipeline_info.stageCount = 2;
-    pipeline_info.pStages = stages;
-    pipeline_info.pVertexInputState = &vertex_input;
-    pipeline_info.pInputAssemblyState = &input_assembly;
-    pipeline_info.pViewportState = &viewport_state;
-    pipeline_info.pRasterizationState = &rasterizer;
-    pipeline_info.pMultisampleState = &multisample;
-    pipeline_info.pDepthStencilState = &depth_stencil;
-    pipeline_info.pColorBlendState = &color_blend;
-    pipeline_info.pDynamicState = &dynamic;
-    pipeline_info.layout = pipeline_layout;
-    pipeline_info.renderPass = offscreen_pass;
-    if (g_vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr,
-                                    &offscreen_pipeline) != VK_SUCCESS) {
-        *error = "创建离屏管线失败";
+    // 截图通道与窗口通道共用同一套管线状态（只换渲染通道对象）
+    if (!CreateShowPipelines(offscreen_pass, &offscreen_pipeline, &offscreen_blended,
+                             &offscreen_outline, error)) {
         return false;
     }
 
@@ -2247,6 +2557,18 @@ void ComputeGlobals(const ShowSkin& skin, const SkinCpu& cpu,
     }
 }
 
+// 材质决定这一段走哪个 pass：描边壳单独一遍（正面剔除），混合材质放在最后。
+int32_t DrawPass(const Show& show, int32_t material) {
+    if (material < 0 || static_cast<size_t>(material) >= show.materials.size()) {
+        return 0;
+    }
+    const ShowMaterial& data = show.materials[static_cast<size_t>(material)];
+    if (data.outline) {
+        return 2;
+    }
+    return data.blend_mode >= 2 ? 1 : 0;
+}
+
 bool ShowGpu::Upload(VkDevice device, VkPhysicalDevice physical, const Show& show,
                      std::string* error) {
     Destroy(device);
@@ -2307,7 +2629,9 @@ bool ShowGpu::Upload(VkDevice device, VkPhysicalDevice physical, const Show& sho
 
     size_t vertex_at = 0;
     size_t index_at = 0;
-    draws.clear();
+    for (int pass = 0; pass < 3; ++pass) {
+        passes[pass].clear();
+    }
     for (const ShowStage& stage : show.stages) {
         if (!stage.vertices.empty()) {
             std::memcpy(stage_out + vertex_at, stage.vertices.data(),
@@ -2319,12 +2643,32 @@ bool ShowGpu::Upload(VkDevice device, VkPhysicalDevice physical, const Show& sho
                         stage.indices.size() * sizeof(uint32_t));
         }
         index_at += stage.indices.size();
-        DrawRange range;
-        range.first_index = first_index;
-        range.index_count = static_cast<uint32_t>(stage.indices.size());
-        range.vertex_offset = static_cast<int32_t>(vertex_at);
-        range.skinned = false;
-        draws.push_back(range);
+        // 每个材质分段一段绘制；没有分段信息时整块当一段
+        if (stage.sections.empty()) {
+            DrawRange range;
+            range.first_index = first_index;
+            range.index_count = static_cast<uint32_t>(stage.indices.size());
+            range.vertex_offset = static_cast<int32_t>(vertex_at);
+            range.skinned = false;
+            passes[0].push_back(range);
+        } else {
+            for (const ShowSection& section : stage.sections) {
+                const uint32_t total = static_cast<uint32_t>(stage.indices.size());
+                const uint32_t first = std::min(section.first_index, total);
+                const uint32_t count = std::min(section.index_count, total - first);
+                if (count == 0) {
+                    continue;
+                }
+                DrawRange range;
+                range.first_index = first_index + first;
+                range.index_count = count;
+                range.vertex_offset = static_cast<int32_t>(vertex_at);
+                range.skinned = false;
+                range.material = section.material;
+                range.pass = DrawPass(show, section.material);
+                passes[range.pass].push_back(range);
+            }
+        }
         vertex_at += stage.vertices.size();
     }
 
@@ -2339,12 +2683,31 @@ bool ShowGpu::Upload(VkDevice device, VkPhysicalDevice physical, const Show& sho
                         skin.indices.size() * sizeof(uint32_t));
         }
         index_at += skin.indices.size();
-        DrawRange range;
-        range.first_index = first_index;
-        range.index_count = static_cast<uint32_t>(skin.indices.size());
-        range.vertex_offset = static_cast<int32_t>(skin_vertex_at);
-        range.skinned = true;
-        draws.push_back(range);
+        if (skin.sections.empty()) {
+            DrawRange range;
+            range.first_index = first_index;
+            range.index_count = static_cast<uint32_t>(skin.indices.size());
+            range.vertex_offset = static_cast<int32_t>(skin_vertex_at);
+            range.skinned = true;
+            passes[0].push_back(range);
+        } else {
+            for (const ShowSection& section : skin.sections) {
+                const uint32_t total = static_cast<uint32_t>(skin.indices.size());
+                const uint32_t first = std::min(section.first_index, total);
+                const uint32_t count = std::min(section.index_count, total - first);
+                if (count == 0) {
+                    continue;
+                }
+                DrawRange range;
+                range.first_index = first_index + first;
+                range.index_count = count;
+                range.vertex_offset = static_cast<int32_t>(skin_vertex_at);
+                range.skinned = true;
+                range.material = section.material;
+                range.pass = DrawPass(show, section.material);
+                passes[range.pass].push_back(range);
+            }
+        }
 
         SkinCpu& cpu = skins[s];
         cpu.vertex_offset = static_cast<uint32_t>(skin_vertex_at);
@@ -2386,9 +2749,13 @@ bool ShowGpu::Upload(VkDevice device, VkPhysicalDevice physical, const Show& sho
             dst[v].position[1] = src.position[1] + show.character_offset[1];
             dst[v].position[2] = src.position[2] + show.character_offset[2];
             std::copy(src.normal, src.normal + 3, dst[v].normal);
-            std::copy(src.color, src.color + 3, dst[v].color);
+            std::copy(src.uv, src.uv + 2, dst[v].uv);
         }
     }
+
+    LOG_STEP("[render] 绘制段：不透明 %zu，半透明 %zu，描边 %zu；材质 %zu，贴图 %zu",
+             passes[0].size(), passes[1].size(), passes[2].size(), show.materials.size(),
+             show.textures.size());
 
     head_skin = -1;
     head_bone = -1;
@@ -2472,7 +2839,9 @@ void ShowGpu::Destroy(VkDevice device) {
     release(&stage_vertices, &stage_memory, &stage_mapped);
     release(&skin_vertices, &skin_memory, &skin_mapped);
     release(&indices, &index_memory, &index_mapped);
-    draws.clear();
+    passes[0].clear();
+    passes[1].clear();
+    passes[2].clear();
     skins.clear();
     stage_vertex_count = 0;
     skin_vertex_count = 0;
@@ -2533,7 +2902,7 @@ void ShowGpu::Update(const Show& show, double seconds) {
                 dst[v].position[1] = position[1] + oy;
                 dst[v].position[2] = position[2] + oz;
                 std::copy(normal, normal + 3, dst[v].normal);
-                std::copy(src.color, src.color + 3, dst[v].color);
+                std::copy(src.uv, src.uv + 2, dst[v].uv);
             }
             continue;
         }
@@ -2578,7 +2947,69 @@ void ShowGpu::Update(const Show& show, double seconds) {
             dst[v].position[1] = position[1] + oy;
             dst[v].position[2] = position[2] + oz;
             std::copy(normal, normal + 3, dst[v].normal);
-            std::copy(src.color, src.color + 3, dst[v].color);
+            std::copy(src.uv, src.uv + 2, dst[v].uv);
+        }
+    }
+}
+
+// 三个 pass 依序绘制：不透明/抠像 → 混合 → 描边壳。
+// 每段都用材质自己的描述符集与 push constant，切换材质时才重绑。
+void Renderer::DrawShowGeometry(VkCommandBuffer command, const VkPipeline* pipelines) {
+    if (show_gpu.indices == VK_NULL_HANDLE) {
+        return;
+    }
+    const VkDeviceSize offset = 0;
+    g_vkCmdBindIndexBuffer(command, show_gpu.indices, 0, VK_INDEX_TYPE_UINT32);
+
+    MaterialPush fallback{};
+    fallback.shadow_tint[0] = fallback.shadow_tint[1] = fallback.shadow_tint[2] = 1.0f;
+    fallback.shadow_tint[3] = 0.47f;
+    fallback.blend[0] = fallback.blend[1] = fallback.blend[2] = 1.0f;
+    fallback.blend[3] = 7.5f;
+    fallback.add[3] = 1.5f;
+    fallback.sphere[0] = fallback.sphere[1] = fallback.sphere[2] = 1.0f;
+    fallback.sphere[3] = 1.0f;
+    fallback.params[2] = 1.0f;
+
+    for (int pass_index = 0; pass_index < 3; ++pass_index) {
+        if (show_gpu.passes[pass_index].empty() || pipelines[pass_index] == VK_NULL_HANDLE) {
+            continue;
+        }
+        g_vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            pipelines[pass_index]);
+        VkBuffer bound = VK_NULL_HANDLE;
+        VkDescriptorSet bound_set = VK_NULL_HANDLE;
+        for (const DrawRange& draw : show_gpu.passes[pass_index]) {
+            if (draw.index_count == 0) {
+                continue;
+            }
+            VkBuffer wanted = draw.skinned ? show_gpu.skin_vertices : show_gpu.stage_vertices;
+            if (wanted != bound) {
+                g_vkCmdBindVertexBuffers(command, 0, 1, &wanted, &offset);
+                bound = wanted;
+            }
+            const MaterialPush* push = &fallback;
+            if (draw.material >= 0 &&
+                static_cast<size_t>(draw.material) < materials_gpu.size()) {
+                push = &material_push[static_cast<size_t>(draw.material)];
+            }
+            if (materials_gpu.empty() || draw.material < 0) {
+                if (bound_set != descriptor_set) {
+                    g_vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                              pipeline_layout, 0, 1, &descriptor_set, 0,
+                                              nullptr);
+                    bound_set = descriptor_set;
+                }
+            } else if (bound_set != materials_gpu[static_cast<size_t>(draw.material)].set) {
+                bound_set = materials_gpu[static_cast<size_t>(draw.material)].set;
+                g_vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                          pipeline_layout, 0, 1, &bound_set, 0, nullptr);
+            }
+            g_vkCmdPushConstants(command, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT |
+                                     VK_SHADER_STAGE_FRAGMENT_BIT,
+                                 0, static_cast<uint32_t>(sizeof(MaterialPush)), push);
+            g_vkCmdDrawIndexed(command, draw.index_count, 1, draw.first_index,
+                               draw.vertex_offset, 0);
         }
     }
 }
@@ -2641,22 +3072,8 @@ bool Renderer::RecordShowCommandBuffer(uint32_t image_index) {
     g_vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     g_vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1,
                               &descriptor_set, 0, nullptr);
-    const VkDeviceSize offset = 0;
-    g_vkCmdBindIndexBuffer(command, show_gpu.indices, 0, VK_INDEX_TYPE_UINT32);
-
-    VkBuffer bound = VK_NULL_HANDLE;
-    for (const DrawRange& draw : show_gpu.draws) {
-        if (draw.index_count == 0) {
-            continue;
-        }
-        VkBuffer wanted = draw.skinned ? show_gpu.skin_vertices : show_gpu.stage_vertices;
-        if (wanted != bound) {
-            g_vkCmdBindVertexBuffers(command, 0, 1, &wanted, &offset);
-            bound = wanted;
-        }
-        g_vkCmdDrawIndexed(command, draw.index_count, 1, draw.first_index,
-                           draw.vertex_offset, 0);
-    }
+    const VkPipeline pipelines[3] = {pipeline, pipeline_blended, pipeline_outline};
+    DrawShowGeometry(command, pipelines);
 
     g_vkCmdEndRenderPass(command);
     return g_vkEndCommandBuffer(command) == VK_SUCCESS;
@@ -2731,10 +3148,18 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
     STEP("DrawShowFrame: 写 uniform");
     CameraUniform uniform{};
     std::memcpy(uniform.view_projection, view_projection.m, sizeof(uniform.view_projection));
+    std::memcpy(uniform.view, view.m, sizeof(uniform.view));
     uniform.light_direction[0] = 0.25f;
     uniform.light_direction[1] = 0.55f;
     uniform.light_direction[2] = 0.80f;
-    uniform.light_direction[3] = 0.0f;
+    uniform.light_direction[3] =
+        (surface_format.format == VK_FORMAT_B8G8R8A8_SRGB ||
+         surface_format.format == VK_FORMAT_R8G8B8A8_SRGB)
+            ? 1.0f
+            : 0.0f;   // w = 目标格式是否自带 sRGB 编码
+    uniform.eye_position[0] = pose.position[0];
+    uniform.eye_position[1] = pose.position[1];
+    uniform.eye_position[2] = pose.position[2];
     std::memcpy(camera_mapped, &uniform, sizeof(uniform));
 
     STEP("DrawShowFrame: CPU 蒙皮");
@@ -2752,12 +3177,16 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
         const float ndc_y = clip[3] != 0.0f ? clip[1] / clip[3] : 0.0f;
         const float ndc_z = clip[3] != 0.0f ? clip[2] / clip[3] : 0.0f;
         size_t indices = 0;
-        for (const DrawRange& draw : show_gpu.draws) {
-            indices += draw.index_count;
+        size_t draws = 0;
+        for (int pass_index = 0; pass_index < 3; ++pass_index) {
+            draws += show_gpu.passes[pass_index].size();
+            for (const DrawRange& draw : show_gpu.passes[pass_index]) {
+                indices += draw.index_count;
+            }
         }
         Logf("[render] 第 %llu 帧：draw %zu 个 / 索引 %zu，场景中心 NDC (%.2f, %.2f, %.3f)，"
              "相机 (%.0f, %.0f, %.0f) -> (%.0f, %.0f, %.0f)",
-             static_cast<unsigned long long>(frames_drawn), show_gpu.draws.size(), indices,
+             static_cast<unsigned long long>(frames_drawn), draws, indices,
              ndc_x, ndc_y, ndc_z, pose.position[0], pose.position[1], pose.position[2],
              pose.target[0], pose.target[1], pose.target[2]);
         Logf("[render] uniform: m00=%.4f m11=%.4f m22=%.4f m32=%.4f m23=%.4f 光照 (%.2f, %.2f, "
@@ -2769,16 +3198,16 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
         const ShowVertex* stage_vertices = static_cast<const ShowVertex*>(show_gpu.stage_mapped);
         const ShowVertex* skin_vertices = static_cast<const ShowVertex*>(show_gpu.skin_mapped);
         if (stage_vertices != nullptr) {
-            Logf("[render] 舞台首个顶点 (%.1f, %.1f, %.1f) 颜色 (%.2f, %.2f, %.2f)",
+            Logf("[render] 舞台首个顶点 (%.1f, %.1f, %.1f) UV (%.3f, %.3f)",
                  stage_vertices[0].position[0], stage_vertices[0].position[1],
-                 stage_vertices[0].position[2], stage_vertices[0].color[0],
-                 stage_vertices[0].color[1], stage_vertices[0].color[2]);
+                 stage_vertices[0].position[2], stage_vertices[0].uv[0],
+                 stage_vertices[0].uv[1]);
         }
         if (skin_vertices != nullptr) {
-            Logf("[render] 角色首个顶点 (%.1f, %.1f, %.1f) 颜色 (%.2f, %.2f, %.2f)",
+            Logf("[render] 角色首个顶点 (%.1f, %.1f, %.1f) UV (%.3f, %.3f)",
                  skin_vertices[0].position[0], skin_vertices[0].position[1],
-                 skin_vertices[0].position[2], skin_vertices[0].color[0],
-                 skin_vertices[0].color[1], skin_vertices[0].color[2]);
+                 skin_vertices[0].position[2], skin_vertices[0].uv[0],
+                 skin_vertices[0].uv[1]);
         }
     }
 
@@ -2945,10 +3374,18 @@ bool Renderer::RenderOffscreenFrame(const Show& show, double seconds, std::strin
     const Mat4 view_projection = MultiplyMat4(projection, view);
     CameraUniform uniform{};
     std::memcpy(uniform.view_projection, view_projection.m, sizeof(uniform.view_projection));
+    std::memcpy(uniform.view, view.m, sizeof(uniform.view));
     uniform.light_direction[0] = 0.25f;
     uniform.light_direction[1] = 0.55f;
     uniform.light_direction[2] = 0.80f;
-    uniform.light_direction[3] = 0.0f;
+    uniform.light_direction[3] =
+        (surface_format.format == VK_FORMAT_B8G8R8A8_SRGB ||
+         surface_format.format == VK_FORMAT_R8G8B8A8_SRGB)
+            ? 1.0f
+            : 0.0f;   // w = 目标格式是否自带 sRGB 编码
+    uniform.eye_position[0] = pose.position[0];
+    uniform.eye_position[1] = pose.position[1];
+    uniform.eye_position[2] = pose.position[2];
     std::memcpy(camera_mapped, &uniform, sizeof(uniform));
 
     show_gpu.Update(show, seconds);
@@ -3001,21 +3438,9 @@ bool Renderer::RenderOffscreenFrame(const Show& show, double seconds, std::strin
     g_vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, offscreen_pipeline);
     g_vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1,
                               &descriptor_set, 0, nullptr);
-    const VkDeviceSize offset = 0;
-    g_vkCmdBindIndexBuffer(command, show_gpu.indices, 0, VK_INDEX_TYPE_UINT32);
-    VkBuffer bound = VK_NULL_HANDLE;
-    for (const DrawRange& draw : show_gpu.draws) {
-        if (draw.index_count == 0) {
-            continue;
-        }
-        VkBuffer wanted = draw.skinned ? show_gpu.skin_vertices : show_gpu.stage_vertices;
-        if (wanted != bound) {
-            g_vkCmdBindVertexBuffers(command, 0, 1, &wanted, &offset);
-            bound = wanted;
-        }
-        g_vkCmdDrawIndexed(command, draw.index_count, 1, draw.first_index,
-                           draw.vertex_offset, 0);
-    }
+    const VkPipeline offscreen_pipelines[3] = {offscreen_pipeline, offscreen_blended,
+                                               offscreen_outline};
+    DrawShowGeometry(command, offscreen_pipelines);
     g_vkCmdEndRenderPass(command);
 
     VkBufferImageCopy copy{};
@@ -3149,6 +3574,14 @@ int RunShow(const Show& show) {
     }
     STEP("RunShow: 上传演出数据");
     if (!renderer.show_gpu.Upload(renderer.device, renderer.physical_device, show, &error)) {
+        LogText("[render] " + error);
+        MessageBoxA(g_window, error.c_str(), "liveview", MB_OK | MB_ICONERROR);
+        renderer.Shutdown();
+        DestroyWindow(g_window);
+        return 1;
+    }
+    STEP("RunShow: 上传材质");
+    if (!renderer.CreateMaterialResources(show, &error)) {
         LogText("[render] " + error);
         MessageBoxA(g_window, error.c_str(), "liveview", MB_OK | MB_ICONERROR);
         renderer.Shutdown();

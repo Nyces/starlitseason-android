@@ -408,6 +408,21 @@ void OnPlay(AppState* state) {
 #endif
 }
 
+// 演出包格式会随渲染升级变化：头 8 字节不是 LVS3 + 版本 3 就当作旧包。
+bool ShowFileIsCurrent(const std::wstring& path) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    unsigned char header[8] = {0};
+    DWORD read = 0;
+    const bool ok = ReadFile(file, header, 8, &read, nullptr) != 0 && read == 8;
+    CloseHandle(file);
+    return ok && header[0] == 'L' && header[1] == 'V' && header[2] == 'S' && header[3] == '3' &&
+           header[4] == 3 && header[5] == 0 && header[6] == 0 && header[7] == 0;
+}
+
 void OnPlayShow(AppState* state) {
     const std::wstring path = GetText(state->show_edit);
     if (path.empty()) {
@@ -415,6 +430,11 @@ void OnPlayShow(AppState* state) {
         return;
     }
     Logf("[app] 载入演出包: %s", NarrowUtf8(path).c_str());
+    if (!ShowFileIsCurrent(path)) {
+        AppendLog(state, L"[错误] 演出包是旧格式（不含贴图与材质）。请填好游戏目录后"
+                         L"重新导出：删掉该文件再播放，程序会自动生成新包。");
+        return;
+    }
     Show show;
     std::string error;
     if (!show.Load(path, &error)) {
@@ -647,7 +667,7 @@ void AutoStartShow(AppState* state) {
     const std::wstring key_hex = GetText(state->key_edit);
     std::wstring show_path = ResolveShowPath(GetText(state->show_edit));
 
-    if (!FileExists(show_path)) {
+    if (!FileExists(show_path) || !ShowFileIsCurrent(show_path)) {
         if (game_dir.empty() || key_hex.empty()) {
             AppendLog(state, L"[提示] 还没有演出包。请先填游戏目录与 AES 密钥，"
                              L"再点「播放演出」，程序会自动导出一份。");
@@ -660,7 +680,9 @@ void AutoStartShow(AppState* state) {
             return;
         }
         show_path = DefaultShowPath();
-        AppendLog(state, L"首次运行：正在从 pak 生成演出包（约 30 秒）…");
+        AppendLog(state, ShowFileIsCurrent(show_path) || !FileExists(show_path)
+                             ? L"首次运行：正在从 pak 生成演出包（含贴图，会久一点）…"
+                             : L"演出包是旧格式（没有贴图），正在重新导出…");
         std::wstring export_log;
         std::wstring error;
         if (!RunPythonExport(tools, game_dir, key_hex, show_path, &export_log, &error)) {

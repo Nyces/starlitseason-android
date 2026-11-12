@@ -2,6 +2,8 @@
 
 #include "show.h"
 
+#include <zlib.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -10,13 +12,13 @@
 namespace liveview {
 namespace {
 
-// 顶点结构在磁盘上是紧排的：3+3+3 个 float，再 4 个 uint16 + 4 个 float。
+// 顶点结构在磁盘上是紧排的：3+3+2 个 float，再 4 个 uint16 + 4 个 float。
 // x86/x64 为小端，与包内字节序一致，可以直接整块读。
-static_assert(sizeof(ShowVertex) == 36, "ShowVertex 必须是 36 字节");
-static_assert(sizeof(ShowSkinVertex) == 60, "ShowSkinVertex 必须是 60 字节");
+static_assert(sizeof(ShowVertex) == 32, "ShowVertex 必须是 32 字节");
+static_assert(sizeof(ShowSkinVertex) == 56, "ShowSkinVertex 必须是 56 字节");
 
-constexpr char kMagic[4] = {'L', 'V', 'S', '2'};
-constexpr uint32_t kVersion = 2;
+constexpr char kMagic[4] = {'L', 'V', 'S', '3'};
+constexpr uint32_t kVersion = 3;
 
 struct Reader {
     const uint8_t* data = nullptr;
@@ -144,6 +146,21 @@ void QuatSlerp(const float* a, const float* b, float t, float* out) {
     out[3] = w;
 }
 
+bool ReadSections(Reader& reader, std::vector<ShowSection>* out, std::string* error) {
+    const uint32_t count = reader.U32();
+    if (!reader.ok || count > reader.Remaining() / 12) {
+        *error = "材质分段数量异常";
+        return false;
+    }
+    out->resize(count);
+    for (ShowSection& section : *out) {
+        section.first_index = reader.U32();
+        section.index_count = reader.U32();
+        section.material = reader.I32();
+    }
+    return reader.ok;
+}
+
 }  // namespace
 
 bool Show::Load(const std::wstring& path, std::string* error) {
@@ -187,6 +204,73 @@ bool Show::Load(const std::wstring& path, std::string* error) {
         }
     }
 
+    // ---- 贴图（RGBA8，zlib 压缩） ----
+    const uint32_t texture_count = reader.U32();
+    if (!reader.ok || texture_count > reader.Remaining() / 16) {
+        *error = "贴图数量异常";
+        return false;
+    }
+    textures.resize(texture_count);
+    for (ShowTexture& texture : textures) {
+        texture.width = reader.U32();
+        texture.height = reader.U32();
+        const uint32_t packed_size = reader.U32();
+        if (!reader.ok || texture.width == 0 || texture.height == 0 ||
+            texture.width > 8192 || texture.height > 8192 ||
+            packed_size > reader.Remaining()) {
+            *error = "贴图表头异常";
+            return false;
+        }
+        const size_t raw_size = static_cast<size_t>(texture.width) * texture.height * 4;
+        texture.rgba.resize(raw_size);
+        uLongf length = static_cast<uLongf>(raw_size);
+        if (uncompress(texture.rgba.data(), &length, reader.data + reader.at,
+                       packed_size) != Z_OK ||
+            length != raw_size) {
+            *error = "贴图解压失败";
+            return false;
+        }
+        reader.at += packed_size;
+    }
+
+    // ---- 材质（Toon 参数） ----
+    const uint32_t material_count = reader.U32();
+    if (!reader.ok || material_count > reader.Remaining() / 84) {
+        *error = "材质数量异常";
+        return false;
+    }
+    materials.resize(material_count);
+    for (ShowMaterial& material : materials) {
+        material.base_texture = reader.I32();
+        material.sphere_texture = reader.I32();
+        material.shadow_texture = reader.I32();
+        for (float& value : material.shadow_tint) {
+            value = reader.F32();
+        }
+        material.threshold = reader.F32();
+        for (float& value : material.blend) {
+            value = reader.F32();
+        }
+        for (float& value : material.add) {
+            value = reader.F32();
+        }
+        material.rim_scale = reader.F32();
+        for (float& value : material.sphere_blend) {
+            value = reader.F32();
+        }
+        material.sphere_pow = reader.F32();
+        material.sphere_boost = reader.F32();
+        material.outline_width = reader.F32();
+        material.blend_mode = reader.U8();
+        material.unlit = reader.U8() != 0;
+        material.outline = reader.U8() != 0;
+        (void)reader.U8();
+    }
+    if (!reader.ok) {
+        *error = "材质数据不完整";
+        return false;
+    }
+
     const uint32_t stage_count = reader.U32();
     if (!reader.ok || stage_count > reader.Remaining() / 8) {
         *error = "舞台网格数量异常";
@@ -203,6 +287,9 @@ bool Show::Load(const std::wstring& path, std::string* error) {
         if (vertex_count > 0 &&
             !reader.Bytes(stage.vertices.data(), vertex_count * sizeof(ShowVertex))) {
             *error = "舞台顶点读取失败";
+            return false;
+        }
+        if (!ReadSections(reader, &stage.sections, error)) {
             return false;
         }
         const uint32_t index_count = reader.U32();
@@ -254,6 +341,9 @@ bool Show::Load(const std::wstring& path, std::string* error) {
         if (vertex_count > 0 &&
             !reader.Bytes(skin.vertices.data(), vertex_count * sizeof(ShowSkinVertex))) {
             *error = "蒙皮顶点读取失败";
+            return false;
+        }
+        if (!ReadSections(reader, &skin.sections, error)) {
             return false;
         }
         const uint32_t index_count = reader.U32();

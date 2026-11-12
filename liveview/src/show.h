@@ -18,21 +18,55 @@ namespace liveview {
 struct ShowVertex {
     float position[3] = {0.0f, 0.0f, 0.0f};
     float normal[3] = {0.0f, 0.0f, 0.0f};
-    float color[3] = {1.0f, 1.0f, 1.0f};
+    float uv[2] = {0.0f, 0.0f};
 };
 
 // 绑定姿势顶点 + 最多 4 个骨骼影响。
 struct ShowSkinVertex {
     float position[3] = {0.0f, 0.0f, 0.0f};
     float normal[3] = {0.0f, 0.0f, 0.0f};
-    float color[3] = {1.0f, 1.0f, 1.0f};
+    float uv[2] = {0.0f, 0.0f};
     uint16_t bones[4] = {0, 0, 0, 0};
     float weights[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+
+// 解压后的贴图（RGBA8，行序自上而下）。
+struct ShowTexture {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<uint8_t> rgba;
+};
+
+// 一个材质的 Toon 参数（与 Python 预览器的 SceneItem 同义）。
+struct ShowMaterial {
+    int32_t base_texture = -1;
+    int32_t sphere_texture = -1;
+    int32_t shadow_texture = -1;
+    float shadow_tint[3] = {1.0f, 1.0f, 1.0f};
+    float threshold = 0.47f;
+    float blend[3] = {1.0f, 1.0f, 1.0f};
+    float add[3] = {0.0f, 0.0f, 0.0f};
+    float rim_scale = 7.5f;
+    float sphere_blend[3] = {1.0f, 1.0f, 1.0f};
+    float sphere_pow = 1.0f;
+    float sphere_boost = 1.0f;
+    float outline_width = 0.0f;   // >0 = 描边壳，顶点沿法线外扩
+    uint8_t blend_mode = 0;   // 0 opaque / 1 masked / 2 additive / 3 translucent
+    bool unlit = false;
+    bool outline = false;     // 网格里的外扩描边壳，渲染时换个剔除顺序
+};
+
+// 网格里的一个材质分段：索引区间 + 材质下标。
+struct ShowSection {
+    uint32_t first_index = 0;
+    uint32_t index_count = 0;
+    int32_t material = -1;
 };
 
 struct ShowStage {
     std::vector<ShowVertex> vertices;
     std::vector<uint32_t> indices;
+    std::vector<ShowSection> sections;
 };
 
 struct ShowBone {
@@ -48,6 +82,7 @@ struct ShowSkin {
     std::vector<ShowBone> bones;
     std::vector<ShowSkinVertex> vertices;
     std::vector<uint32_t> indices;
+    std::vector<ShowSection> sections;
 };
 
 struct ShowCameraKey {
@@ -84,6 +119,8 @@ struct Show {
     float character_offset[3] = {0.0f, 0.0f, 0.0f};
 
     std::vector<ShowCameraKey> camera_keys;
+    std::vector<ShowTexture> textures;
+    std::vector<ShowMaterial> materials;
     std::vector<ShowStage> stages;
     std::vector<ShowSkin> skins;
     std::vector<std::string> anim_bones;
