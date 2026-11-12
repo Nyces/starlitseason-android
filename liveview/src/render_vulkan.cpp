@@ -31,6 +31,7 @@
 
 #include "render_vulkan.h"
 
+#include "config.h"
 #include "log.h"
 #include "scene_frag_spirv.h"
 #include "scene_vert_spirv.h"
@@ -128,6 +129,7 @@ PFN_vkCmdDrawIndexed g_vkCmdDrawIndexed = nullptr;
 PFN_vkCmdSetViewport g_vkCmdSetViewport = nullptr;
 PFN_vkCmdSetScissor g_vkCmdSetScissor = nullptr;
 PFN_vkCmdPipelineBarrier g_vkCmdPipelineBarrier = nullptr;
+PFN_vkCmdCopyImageToBuffer g_vkCmdCopyImageToBuffer = nullptr;
 
 // ---- 窗口状态 ----
 HWND g_window = nullptr;
@@ -419,6 +421,11 @@ struct CameraUniform {
     float light_direction[4];
 };
 
+// 提前声明：离屏截图目标在 CreateShowPipeline 里创建，而实现放在文件后半部。
+bool CreateHostBuffer(VkDevice device, VkPhysicalDevice physical, VkDeviceSize size,
+                      VkBufferUsageFlags usage, VkBuffer* buffer, VkDeviceMemory* memory,
+                      void** mapped, const char* what, std::string* error);
+
 uint32_t FindMemoryType(VkPhysicalDevice device, uint32_t type_bits,
                         VkMemoryPropertyFlags properties) {
     VkPhysicalDeviceMemoryProperties memory{};
@@ -522,6 +529,26 @@ struct Renderer {
     ShowGpu show_gpu;
     uint64_t frames_drawn = 0;   // 用于节流诊断日志
 
+    // 着色器模块与离屏截图目标
+    VkShaderModule vertex_module = VK_NULL_HANDLE;
+    VkShaderModule fragment_module = VK_NULL_HANDLE;
+    VkRenderPass offscreen_pass = VK_NULL_HANDLE;
+    VkPipeline offscreen_pipeline = VK_NULL_HANDLE;
+    VkImage offscreen_color = VK_NULL_HANDLE;
+    VkDeviceMemory offscreen_color_memory = VK_NULL_HANDLE;
+    VkImageView offscreen_color_view = VK_NULL_HANDLE;
+    VkImage offscreen_depth = VK_NULL_HANDLE;
+    VkDeviceMemory offscreen_depth_memory = VK_NULL_HANDLE;
+    VkImageView offscreen_depth_view = VK_NULL_HANDLE;
+    VkFramebuffer offscreen_framebuffer = VK_NULL_HANDLE;
+    VkBuffer readback_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory readback_memory = VK_NULL_HANDLE;
+    void* readback_mapped = nullptr;
+
+    // 把某一时刻渲染成图片（不依赖窗口，用于在没有画面的机器上定位问题）
+    bool CaptureFrame(const Show& show, double seconds, const std::wstring& path,
+                      std::string* error);
+
     bool Init(HWND target, std::string* error);
     void Shutdown();
     bool DrawFrame(const float* color, std::string* error);
@@ -543,6 +570,8 @@ private:
     bool CreateDepthResources(std::string* error);
     void DestroyDepthResources();
     bool CreateShowPipeline(std::string* error);
+    bool CreateOffscreenTarget(std::string* error);
+    void DestroyOffscreenTarget();
     void DestroyShowPipeline();
     bool CreateCameraBuffer(std::string* error);
     void DestroyCameraBuffer();
@@ -664,6 +693,7 @@ bool Renderer::LoadDeviceFunctions(std::string* error) {
     LOAD_DEVICE_FN(vkCmdSetViewport);
     LOAD_DEVICE_FN(vkCmdSetScissor);
     LOAD_DEVICE_FN(vkCmdPipelineBarrier);
+    LOAD_DEVICE_FN(vkCmdCopyImageToBuffer);
     return true;
 }
 
@@ -1068,7 +1098,6 @@ bool Renderer::CreateShowPipeline(std::string* error) {
     write.pBufferInfo = &buffer_info;
     g_vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 
-    VkShaderModule vertex_module = VK_NULL_HANDLE;
     VkShaderModuleCreateInfo shader_info{};
     shader_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     shader_info.codeSize = kSceneVertexSpirv_size;
@@ -1077,7 +1106,6 @@ bool Renderer::CreateShowPipeline(std::string* error) {
         *error = "创建顶点着色器模块失败";
         return false;
     }
-    VkShaderModule fragment_module = VK_NULL_HANDLE;
     shader_info.codeSize = kSceneFragmentSpirv_size;
     shader_info.pCode = reinterpret_cast<const uint32_t*>(kSceneFragmentSpirv);
     if (g_vkCreateShaderModule(device, &shader_info, nullptr, &fragment_module) != VK_SUCCESS) {
@@ -1183,16 +1211,34 @@ bool Renderer::CreateShowPipeline(std::string* error) {
 
     const VkResult result = g_vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
                                                         &pipeline_info, nullptr, &pipeline);
-    g_vkDestroyShaderModule(device, vertex_module, nullptr);
-    g_vkDestroyShaderModule(device, fragment_module, nullptr);
     if (result != VK_SUCCESS) {
         *error = "创建图形管线失败（" + ResultText(result) + "）";
         return false;
+    }
+    // 着色器模块留着，离屏截图的管线还要复用。
+    // 截图目标建不起来不影响正常播放，只记一条日志。
+    std::string offscreen_error;
+    if (!CreateOffscreenTarget(&offscreen_error)) {
+        LogText("[render] 离屏截图目标创建失败：" + offscreen_error);
+        DestroyOffscreenTarget();
     }
     return true;
 }
 
 void Renderer::DestroyShowPipeline() {
+    DestroyOffscreenTarget();
+    if (device != VK_NULL_HANDLE) {
+        if (g_vkDestroyShaderModule != nullptr) {
+            if (vertex_module != VK_NULL_HANDLE) {
+                g_vkDestroyShaderModule(device, vertex_module, nullptr);
+            }
+            if (fragment_module != VK_NULL_HANDLE) {
+                g_vkDestroyShaderModule(device, fragment_module, nullptr);
+            }
+        }
+        vertex_module = VK_NULL_HANDLE;
+        fragment_module = VK_NULL_HANDLE;
+    }
     if (device != VK_NULL_HANDLE) {
         if (g_vkDestroyPipeline != nullptr && pipeline != VK_NULL_HANDLE) {
             g_vkDestroyPipeline(device, pipeline, nullptr);
@@ -1213,6 +1259,300 @@ void Renderer::DestroyShowPipeline() {
     descriptor_set = VK_NULL_HANDLE;
     pipeline_layout = VK_NULL_HANDLE;
     descriptor_layout = VK_NULL_HANDLE;
+}
+
+void Renderer::DestroyOffscreenTarget() {
+    if (device == VK_NULL_HANDLE) {
+        offscreen_pipeline = VK_NULL_HANDLE;
+        offscreen_pass = VK_NULL_HANDLE;
+        offscreen_color = VK_NULL_HANDLE;
+        offscreen_color_memory = VK_NULL_HANDLE;
+        offscreen_color_view = VK_NULL_HANDLE;
+        offscreen_depth = VK_NULL_HANDLE;
+        offscreen_depth_memory = VK_NULL_HANDLE;
+        offscreen_depth_view = VK_NULL_HANDLE;
+        offscreen_framebuffer = VK_NULL_HANDLE;
+        readback_buffer = VK_NULL_HANDLE;
+        readback_memory = VK_NULL_HANDLE;
+        readback_mapped = nullptr;
+        return;
+    }
+    if (g_vkDestroyPipeline != nullptr && offscreen_pipeline != VK_NULL_HANDLE) {
+        g_vkDestroyPipeline(device, offscreen_pipeline, nullptr);
+    }
+    if (g_vkDestroyFramebuffer != nullptr && offscreen_framebuffer != VK_NULL_HANDLE) {
+        g_vkDestroyFramebuffer(device, offscreen_framebuffer, nullptr);
+    }
+    if (g_vkDestroyImageView != nullptr) {
+        if (offscreen_color_view != VK_NULL_HANDLE) {
+            g_vkDestroyImageView(device, offscreen_color_view, nullptr);
+        }
+        if (offscreen_depth_view != VK_NULL_HANDLE) {
+            g_vkDestroyImageView(device, offscreen_depth_view, nullptr);
+        }
+    }
+    if (g_vkDestroyImage != nullptr) {
+        if (offscreen_color != VK_NULL_HANDLE) {
+            g_vkDestroyImage(device, offscreen_color, nullptr);
+        }
+        if (offscreen_depth != VK_NULL_HANDLE) {
+            g_vkDestroyImage(device, offscreen_depth, nullptr);
+        }
+    }
+    if (g_vkFreeMemory != nullptr) {
+        if (offscreen_color_memory != VK_NULL_HANDLE) {
+            g_vkFreeMemory(device, offscreen_color_memory, nullptr);
+        }
+        if (offscreen_depth_memory != VK_NULL_HANDLE) {
+            g_vkFreeMemory(device, offscreen_depth_memory, nullptr);
+        }
+    }
+    if (g_vkDestroyBuffer != nullptr && readback_buffer != VK_NULL_HANDLE) {
+        g_vkDestroyBuffer(device, readback_buffer, nullptr);
+    }
+    if (readback_mapped != nullptr && g_vkUnmapMemory != nullptr) {
+        g_vkUnmapMemory(device, readback_memory);
+        readback_mapped = nullptr;
+    }
+    if (g_vkFreeMemory != nullptr && readback_memory != VK_NULL_HANDLE) {
+        g_vkFreeMemory(device, readback_memory, nullptr);
+    }
+    if (g_vkDestroyRenderPass != nullptr && offscreen_pass != VK_NULL_HANDLE) {
+        g_vkDestroyRenderPass(device, offscreen_pass, nullptr);
+    }
+    offscreen_pipeline = VK_NULL_HANDLE;
+    offscreen_pass = VK_NULL_HANDLE;
+    offscreen_color = VK_NULL_HANDLE;
+    offscreen_color_memory = VK_NULL_HANDLE;
+    offscreen_color_view = VK_NULL_HANDLE;
+    offscreen_depth = VK_NULL_HANDLE;
+    offscreen_depth_memory = VK_NULL_HANDLE;
+    offscreen_depth_view = VK_NULL_HANDLE;
+    offscreen_framebuffer = VK_NULL_HANDLE;
+    readback_buffer = VK_NULL_HANDLE;
+    readback_memory = VK_NULL_HANDLE;
+    readback_mapped = nullptr;
+}
+
+// 截图用的离屏目标：颜色附件最终布局是 TRANSFER_SRC，方便直接拷回内存。
+bool Renderer::CreateOffscreenTarget(std::string* error) {
+    DestroyOffscreenTarget();
+    if (extent.width == 0 || extent.height == 0) {
+        *error = "离屏目标尺寸为 0";
+        return false;
+    }
+
+    VkAttachmentDescription attachments[2]{};
+    attachments[0].format = surface_format.format;
+    attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    attachments[1] = attachments[0];
+    attachments[1].format = VK_FORMAT_D32_SFLOAT;
+    attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference color_reference{};
+    color_reference.attachment = 0;
+    color_reference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference depth_reference{};
+    depth_reference.attachment = 1;
+    depth_reference.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color_reference;
+    subpass.pDepthStencilAttachment = &depth_reference;
+
+    VkRenderPassCreateInfo pass_info{};
+    pass_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    pass_info.attachmentCount = 2;
+    pass_info.pAttachments = attachments;
+    pass_info.subpassCount = 1;
+    pass_info.pSubpasses = &subpass;
+    if (g_vkCreateRenderPass(device, &pass_info, nullptr, &offscreen_pass) != VK_SUCCESS) {
+        *error = "创建离屏渲染通道失败";
+        return false;
+    }
+
+    auto make_image = [&](VkFormat format, VkImageUsageFlags usage, VkImage* image,
+                          VkDeviceMemory* memory, VkImageView* view, VkImageAspectFlags aspect)
+        -> bool {
+        VkImageCreateInfo image_info{};
+        image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        image_info.imageType = VK_IMAGE_TYPE_2D;
+        image_info.format = format;
+        image_info.extent = {extent.width, extent.height, 1};
+        image_info.mipLevels = 1;
+        image_info.arrayLayers = 1;
+        image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+        image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        image_info.usage = usage;
+        image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (g_vkCreateImage(device, &image_info, nullptr, image) != VK_SUCCESS) {
+            return false;
+        }
+        VkMemoryRequirements requirements{};
+        g_vkGetImageMemoryRequirements(device, *image, &requirements);
+        const uint32_t type = FindMemoryType(physical_device, requirements.memoryTypeBits,
+                                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (type == UINT32_MAX) {
+            return false;
+        }
+        VkMemoryAllocateInfo allocate_info{};
+        allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocate_info.allocationSize = requirements.size;
+        allocate_info.memoryTypeIndex = type;
+        if (g_vkAllocateMemory(device, &allocate_info, nullptr, memory) != VK_SUCCESS) {
+            return false;
+        }
+        if (g_vkBindImageMemory(device, *image, *memory, 0) != VK_SUCCESS) {
+            return false;
+        }
+        VkImageViewCreateInfo view_info{};
+        view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view_info.image = *image;
+        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_info.format = format;
+        view_info.subresourceRange.aspectMask = aspect;
+        view_info.subresourceRange.levelCount = 1;
+        view_info.subresourceRange.layerCount = 1;
+        return g_vkCreateImageView(device, &view_info, nullptr, view) == VK_SUCCESS;
+    };
+
+    if (!make_image(surface_format.format,
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                    &offscreen_color, &offscreen_color_memory, &offscreen_color_view,
+                    VK_IMAGE_ASPECT_COLOR_BIT)) {
+        *error = "创建离屏颜色附件失败";
+        return false;
+    }
+    if (!make_image(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                    &offscreen_depth, &offscreen_depth_memory, &offscreen_depth_view,
+                    VK_IMAGE_ASPECT_DEPTH_BIT)) {
+        *error = "创建离屏深度附件失败";
+        return false;
+    }
+
+    VkFramebufferCreateInfo framebuffer_info{};
+    framebuffer_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    framebuffer_info.renderPass = offscreen_pass;
+    const VkImageView views[2] = {offscreen_color_view, offscreen_depth_view};
+    framebuffer_info.attachmentCount = 2;
+    framebuffer_info.pAttachments = views;
+    framebuffer_info.width = extent.width;
+    framebuffer_info.height = extent.height;
+    framebuffer_info.layers = 1;
+    if (g_vkCreateFramebuffer(device, &framebuffer_info, nullptr, &offscreen_framebuffer) !=
+        VK_SUCCESS) {
+        *error = "创建离屏帧缓冲失败";
+        return false;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vertex_module;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fragment_module;
+    stages[1].pName = "main";
+
+    VkVertexInputBindingDescription vertex_binding{};
+    vertex_binding.binding = 0;
+    vertex_binding.stride = static_cast<uint32_t>(sizeof(ShowVertex));
+    vertex_binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription attributes[3]{};
+    attributes[0].location = 0;
+    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributes[0].offset = static_cast<uint32_t>(offsetof(ShowVertex, position));
+    attributes[1].location = 1;
+    attributes[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributes[1].offset = static_cast<uint32_t>(offsetof(ShowVertex, normal));
+    attributes[2].location = 2;
+    attributes[2].format = VK_FORMAT_R32G32B32_SFLOAT;
+    attributes[2].offset = static_cast<uint32_t>(offsetof(ShowVertex, color));
+    VkPipelineVertexInputStateCreateInfo vertex_input{};
+    vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertex_input.vertexBindingDescriptionCount = 1;
+    vertex_input.pVertexBindingDescriptions = &vertex_binding;
+    vertex_input.vertexAttributeDescriptionCount = 3;
+    vertex_input.pVertexAttributeDescriptions = attributes;
+
+    VkPipelineInputAssemblyStateCreateInfo input_assembly{};
+    input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewport_state{};
+    viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewport_state.viewportCount = 1;
+    viewport_state.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rasterizer{};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo depth_stencil{};
+    depth_stencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depth_stencil.depthTestEnable = VK_TRUE;
+    depth_stencil.depthWriteEnable = VK_TRUE;
+    depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState blend_attachment{};
+    blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo color_blend{};
+    color_blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    color_blend.attachmentCount = 1;
+    color_blend.pAttachments = &blend_attachment;
+
+    const VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT,
+                                              VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{};
+    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dynamic_states;
+
+    VkGraphicsPipelineCreateInfo pipeline_info{};
+    pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipeline_info.stageCount = 2;
+    pipeline_info.pStages = stages;
+    pipeline_info.pVertexInputState = &vertex_input;
+    pipeline_info.pInputAssemblyState = &input_assembly;
+    pipeline_info.pViewportState = &viewport_state;
+    pipeline_info.pRasterizationState = &rasterizer;
+    pipeline_info.pMultisampleState = &multisample;
+    pipeline_info.pDepthStencilState = &depth_stencil;
+    pipeline_info.pColorBlendState = &color_blend;
+    pipeline_info.pDynamicState = &dynamic;
+    pipeline_info.layout = pipeline_layout;
+    pipeline_info.renderPass = offscreen_pass;
+    if (g_vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr,
+                                    &offscreen_pipeline) != VK_SUCCESS) {
+        *error = "创建离屏管线失败";
+        return false;
+    }
+
+    if (!CreateHostBuffer(device, physical_device,
+                          static_cast<VkDeviceSize>(extent.width) * extent.height * 4,
+                          VK_BUFFER_USAGE_TRANSFER_DST_BIT, &readback_buffer,
+                          &readback_memory, &readback_mapped, "截图回读", error)) {
+        return false;
+    }
+    return true;
 }
 
 bool Renderer::CreateCommandResources(std::string* error) {
@@ -2459,6 +2799,192 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
 
 }  // namespace
 
+// 把 RGBA/BGRA 像素写成 32 位 BMP（自下而上），不依赖任何图像库。
+namespace {
+
+bool WriteBmp(const std::wstring& path, uint32_t width, uint32_t height,
+              const std::vector<uint8_t>& pixels, bool bgra, std::string* error) {
+    const uint32_t row_bytes = width * 4;
+    BITMAPFILEHEADER file_header{};
+    BITMAPINFOHEADER info_header{};
+    file_header.bfType = 0x4D42;   // "BM"
+    file_header.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+    file_header.bfSize = file_header.bfOffBits + row_bytes * height;
+    info_header.biSize = sizeof(BITMAPINFOHEADER);
+    info_header.biWidth = static_cast<LONG>(width);
+    info_header.biHeight = static_cast<LONG>(height);
+    info_header.biPlanes = 1;
+    info_header.biBitCount = 32;
+    info_header.biCompression = BI_RGB;
+    info_header.biSizeImage = row_bytes * height;
+
+    std::FILE* file = _wfopen(path.c_str(), L"wb");
+    if (file == nullptr) {
+        *error = "无法写入截图文件";
+        return false;
+    }
+    std::fwrite(&file_header, sizeof(file_header), 1, file);
+    std::fwrite(&info_header, sizeof(info_header), 1, file);
+    std::vector<uint8_t> row(row_bytes);
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t* source = pixels.data() + static_cast<size_t>(height - 1 - y) * row_bytes;
+        for (uint32_t x = 0; x < width; ++x) {
+            row[x * 4 + 0] = bgra ? source[x * 4 + 0] : source[x * 4 + 2];
+            row[x * 4 + 1] = source[x * 4 + 1];
+            row[x * 4 + 2] = bgra ? source[x * 4 + 2] : source[x * 4 + 0];
+            row[x * 4 + 3] = 255;
+        }
+        std::fwrite(row.data(), row.size(), 1, file);
+    }
+    std::fclose(file);
+    return true;
+}
+
+}  // namespace
+
+bool Renderer::CaptureFrame(const Show& show, double seconds, const std::wstring& path,
+                            std::string* error) {
+    if (offscreen_pipeline == VK_NULL_HANDLE || readback_mapped == nullptr) {
+        *error = "离屏目标未就绪";
+        return false;
+    }
+    STEP("CaptureFrame: 等待设备空闲");
+    if (g_vkDeviceWaitIdle(device) != VK_SUCCESS) {
+        *error = "等待设备空闲失败";
+        return false;
+    }
+
+    const ShowCameraPose pose = show.SampleCamera(seconds);
+    const float radius = 0.5f * std::sqrt(
+        (show_gpu.bounds_hi[0] - show_gpu.bounds_lo[0]) *
+            (show_gpu.bounds_hi[0] - show_gpu.bounds_lo[0]) +
+        (show_gpu.bounds_hi[1] - show_gpu.bounds_lo[1]) *
+            (show_gpu.bounds_hi[1] - show_gpu.bounds_lo[1]) +
+        (show_gpu.bounds_hi[2] - show_gpu.bounds_lo[2]) *
+            (show_gpu.bounds_hi[2] - show_gpu.bounds_lo[2]));
+    const float aspect = extent.height > 0
+                             ? static_cast<float>(extent.width) / static_cast<float>(extent.height)
+                             : 1.0f;
+    const Mat4 view = LookAtVulkan(pose.position, pose.target);
+    const Mat4 projection = PerspectiveVulkan(45.0f, aspect,
+                                              std::max(radius * 0.002f, 0.05f),
+                                              radius * 30.0f + 100.0f);
+    const Mat4 view_projection = MultiplyMat4(projection, view);
+    CameraUniform uniform{};
+    std::memcpy(uniform.view_projection, view_projection.m, sizeof(uniform.view_projection));
+    uniform.light_direction[0] = 0.25f;
+    uniform.light_direction[1] = 0.55f;
+    uniform.light_direction[2] = 0.80f;
+    uniform.light_direction[3] = 0.0f;
+    std::memcpy(camera_mapped, &uniform, sizeof(uniform));
+
+    show_gpu.Update(show, seconds);
+
+    STEP("CaptureFrame: 录制");
+    VkCommandBuffer command = command_buffers[0];
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (g_vkBeginCommandBuffer(command, &begin_info) != VK_SUCCESS) {
+        *error = "录制截图命令失败";
+        return false;
+    }
+
+    VkMemoryBarrier host_barrier{};
+    host_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    host_barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    host_barrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+                                 VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT;
+    g_vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_HOST_BIT,
+                           VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                           0, 1, &host_barrier, 0, nullptr, 0, nullptr);
+
+    VkClearValue clear_values[2]{};
+    clear_values[0].color.float32[0] = 0.07f;
+    clear_values[0].color.float32[1] = 0.09f;
+    clear_values[0].color.float32[2] = 0.13f;
+    clear_values[0].color.float32[3] = 1.0f;
+    clear_values[1].depthStencil.depth = 1.0f;
+
+    VkRenderPassBeginInfo pass_info{};
+    pass_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    pass_info.renderPass = offscreen_pass;
+    pass_info.framebuffer = offscreen_framebuffer;
+    pass_info.renderArea.extent = extent;
+    pass_info.clearValueCount = 2;
+    pass_info.pClearValues = clear_values;
+    g_vkCmdBeginRenderPass(command, &pass_info, VK_SUBPASS_CONTENTS_INLINE);
+
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = static_cast<float>(extent.height);
+    viewport.maxDepth = 1.0f;
+    g_vkCmdSetViewport(command, 0, 1, &viewport);
+    VkRect2D scissor{};
+    scissor.extent = extent;
+    g_vkCmdSetScissor(command, 0, 1, &scissor);
+
+    g_vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, offscreen_pipeline);
+    g_vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1,
+                              &descriptor_set, 0, nullptr);
+    const VkDeviceSize offset = 0;
+    g_vkCmdBindIndexBuffer(command, show_gpu.indices, 0, VK_INDEX_TYPE_UINT32);
+    VkBuffer bound = VK_NULL_HANDLE;
+    for (const DrawRange& draw : show_gpu.draws) {
+        if (draw.index_count == 0) {
+            continue;
+        }
+        VkBuffer wanted = draw.skinned ? show_gpu.skin_vertices : show_gpu.stage_vertices;
+        if (wanted != bound) {
+            g_vkCmdBindVertexBuffers(command, 0, 1, &wanted, &offset);
+            bound = wanted;
+        }
+        g_vkCmdDrawIndexed(command, draw.index_count, 1, draw.first_index,
+                           draw.vertex_offset, 0);
+    }
+    g_vkCmdEndRenderPass(command);
+
+    VkBufferImageCopy copy{};
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageExtent = {extent.width, extent.height, 1};
+    g_vkCmdCopyImageToBuffer(command, offscreen_color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             readback_buffer, 1, &copy);
+
+    if (g_vkEndCommandBuffer(command) != VK_SUCCESS) {
+        *error = "结束截图命令失败";
+        return false;
+    }
+
+    STEP("CaptureFrame: 提交");
+    VkSubmitInfo submit_info{};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &command;
+    if (g_vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) {
+        *error = "提交截图命令失败";
+        return false;
+    }
+    if (g_vkDeviceWaitIdle(device) != VK_SUCCESS) {
+        *error = "等待截图完成失败";
+        return false;
+    }
+
+    STEP("CaptureFrame: 写文件");
+    const bool bgra = surface_format.format == VK_FORMAT_B8G8R8A8_UNORM ||
+                      surface_format.format == VK_FORMAT_B8G8R8A8_SRGB;
+    std::vector<uint8_t> pixels(static_cast<size_t>(extent.width) * extent.height * 4);
+    std::memcpy(pixels.data(), readback_mapped, pixels.size());
+    if (!WriteBmp(path, extent.width, extent.height, pixels, bgra, error)) {
+        return false;
+    }
+    Logf("[render] 已保存截图 %ux%u -> %s", extent.width, extent.height,
+         NarrowUtf8(path).c_str());
+    return true;
+}
+
+
 int RunShow(const Show& show) {
     if (show.camera_keys.empty()) {
         LogText("[render] 演出包里没有相机轨，无法播放");
@@ -2514,6 +3040,19 @@ int RunShow(const Show& show) {
     }
     STEP("RunShow: 进入渲染循环");
     LogText("[render] 进入渲染循环");
+
+    // 先离屏渲一帧存成图片：窗口没画面时，这张图能区分「渲染空」还是「呈现空」
+    {
+        const std::wstring config_path = ConfigPath();
+        const size_t slash = config_path.find_last_of(L"\\/");
+        const std::wstring shot_dir =
+            slash == std::wstring::npos ? std::wstring() : config_path.substr(0, slash + 1);
+        const std::wstring shot_path = shot_dir + L"shot_0000.bmp";
+        std::string shot_error;
+        if (!renderer.CaptureFrame(show, 0.0, shot_path, &shot_error)) {
+            LogText("[render] 截图失败：" + shot_error);
+        }
+    }
 
     std::printf("演出：%.2fs  相机 %zu 关键帧  舞台 %zu 三角  角色 %zu 三角  动画 %zu 骨骼\n",
                 duration, show.camera_keys.size(), show.StageTriangleCount(),
