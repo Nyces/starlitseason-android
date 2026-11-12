@@ -428,6 +428,247 @@ void OnPlayShow(AppState* state) {
 #endif
 }
 
+bool FileExists(const std::wstring& path) {
+    return !path.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+std::wstring DirectoryOf(const std::wstring& path) {
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash + 1);
+}
+
+std::wstring ExeDirectory() {
+    wchar_t buffer[MAX_PATH * 2] = {0};
+    const DWORD length = GetModuleFileNameW(nullptr, buffer, MAX_PATH * 2);
+    if (length == 0 || length >= MAX_PATH * 2) {
+        return std::wstring();
+    }
+    return DirectoryOf(std::wstring(buffer, length));
+}
+
+std::wstring ParentOf(const std::wstring& dir) {
+    if (dir.size() <= 3) {
+        return std::wstring();
+    }
+    std::wstring trimmed = dir;
+    if (!trimmed.empty() && (trimmed.back() == L'\\' || trimmed.back() == L'/')) {
+        trimmed.pop_back();
+    }
+    const size_t slash = trimmed.find_last_of(L"\\/");
+    if (slash == std::wstring::npos || slash < 2) {
+        return std::wstring();
+    }
+    return trimmed.substr(0, slash + 1);
+}
+
+// 目录可写性探测（Program Files 之类的位置不能写，就退回配置目录）。
+bool IsWritableDirectory(const std::wstring& dir) {
+    if (dir.empty()) {
+        return false;
+    }
+    const std::wstring probe = dir + L".liveview_write_test";
+    HANDLE handle = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                                nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    CloseHandle(handle);
+    return true;
+}
+
+// 演出包默认输出位置：可执行文件旁边（方便带走），否则跟配置放一起。
+std::wstring DefaultShowPath() {
+    const std::wstring exe_dir = ExeDirectory();
+    if (IsWritableDirectory(exe_dir)) {
+        return exe_dir + L"sng001.lvs";
+    }
+    return DirectoryOf(ConfigPath()) + L"sng001.lvs";
+}
+
+// 找一个已经存在的演出包：配置里的路径 → 可执行文件旁边 → 配置目录。
+std::wstring ResolveShowPath(const std::wstring& configured) {
+    if (FileExists(configured)) {
+        return configured;
+    }
+    const std::wstring beside_exe = ExeDirectory() + L"sng001.lvs";
+    if (FileExists(beside_exe)) {
+        return beside_exe;
+    }
+    const std::wstring local = DefaultShowPath();
+    if (FileExists(local)) {
+        return local;
+    }
+    return configured;
+}
+
+// 从可执行文件目录逐级向上找 tools\sspak\cli.py（它的上一级就是 tools）。
+std::wstring FindToolsDir() {
+    std::wstring dir = ExeDirectory();
+    for (int depth = 0; depth < 6 && !dir.empty(); ++depth) {
+        if (FileExists(dir + L"tools\\sspak\\cli.py")) {
+            return dir + L"tools";
+        }
+        dir = ParentOf(dir);
+    }
+    return std::wstring();
+}
+
+std::wstring Quote(const std::wstring& text) {
+    std::wstring out = L"\"";
+    out += text;
+    out += L"\"";
+    return out;
+}
+
+// 用 Python 导出演出包（GUI 内部调用，用户不需要碰命令行）。
+// 返回 true 表示进程退出码为 0 且输出文件存在；export_log 会带回日志尾部。
+bool RunPythonExport(const std::wstring& tools_dir, const std::wstring& game_dir,
+                     const std::wstring& key_hex, const std::wstring& out_path,
+                     std::wstring* export_log, std::wstring* error) {
+    const std::wstring log_path = DirectoryOf(ConfigPath()) + L"export.log";
+    CreateDirectoryW(DirectoryOf(log_path).c_str(), nullptr);
+
+    SECURITY_ATTRIBUTES security{};
+    security.nLength = sizeof(security);
+    security.bInheritHandle = TRUE;
+    HANDLE log_file = CreateFileW(log_path.c_str(), GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, &security,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (log_file == INVALID_HANDLE_VALUE) {
+        *error = L"无法写入导出日志";
+        return false;
+    }
+
+    std::wstring command = L"python -m sspak.cli --paks " + Quote(game_dir);
+    if (!key_hex.empty()) {
+        command += L" --key " + key_hex;
+    }
+    command += L" live-show";
+    command += L" --out " + Quote(out_path);
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+    startup.hStdOutput = log_file;
+    startup.hStdError = log_file;
+    startup.hStdInput = log_file;
+
+    PROCESS_INFORMATION process{};
+    std::vector<wchar_t> buffer(command.begin(), command.end());
+    buffer.push_back(L'\0');
+    const BOOL started = CreateProcessW(
+        nullptr, buffer.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
+        tools_dir.c_str(), &startup, &process);
+    CloseHandle(log_file);
+    if (!started) {
+        *error = L"无法启动 Python（请确认已安装 Python 并在 PATH 中）";
+        return false;
+    }
+
+    // 期间继续泵消息，窗口不会假死
+    bool running = true;
+    while (running) {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            if (message.message == WM_QUIT) {
+                running = false;
+                break;
+            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        if (!running) {
+            break;
+        }
+        if (WaitForSingleObject(process.hProcess, 50) == WAIT_OBJECT_0) {
+            break;
+        }
+    }
+
+    DWORD exit_code = 1;
+    GetExitCodeProcess(process.hProcess, &exit_code);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+
+    if (export_log != nullptr) {
+        export_log->clear();
+        HANDLE read_file = CreateFileW(log_path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                       nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                                       nullptr);
+        if (read_file != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER size{};
+            GetFileSizeEx(read_file, &size);
+            // 只取尾部 8KB，避免把整段日志塞进编辑框
+            const LONGLONG keep = 8192;
+            LARGE_INTEGER offset{};
+            offset.QuadPart = size.QuadPart > keep ? size.QuadPart - keep : 0;
+            SetFilePointerEx(read_file, offset, nullptr, FILE_BEGIN);
+            std::string raw(static_cast<size_t>(size.QuadPart - offset.QuadPart), '\0');
+            DWORD read = 0;
+            if (!raw.empty()) {
+                ReadFile(read_file, raw.data(), static_cast<DWORD>(raw.size()), &read,
+                         nullptr);
+                raw.resize(read);
+            }
+            CloseHandle(read_file);
+            for (char ch : raw) {
+                export_log->push_back(ch == '\r' ? L' ' : static_cast<wchar_t>(ch));
+            }
+        }
+    }
+
+    if (exit_code != 0) {
+        *error = L"导出失败（Python 退出码 " + std::to_wstring(exit_code) + L"）";
+        return false;
+    }
+    if (!FileExists(out_path)) {
+        *error = L"导出完成但没有生成文件";
+        return false;
+    }
+    return true;
+}
+
+// 自动播放入口：先找现成的演出包，没有就用 Python 现导一份，然后开始播放。
+void AutoStartShow(AppState* state) {
+    const std::wstring game_dir = GetText(state->dir_edit);
+    const std::wstring key_hex = GetText(state->key_edit);
+    std::wstring show_path = ResolveShowPath(GetText(state->show_edit));
+
+    if (!FileExists(show_path)) {
+        if (game_dir.empty() || key_hex.empty()) {
+            AppendLog(state, L"[提示] 还没有演出包。请先填游戏目录与 AES 密钥，"
+                             L"再点「播放演出」，程序会自动导出一份。");
+            return;
+        }
+        const std::wstring tools = FindToolsDir();
+        if (tools.empty()) {
+            AppendLog(state, L"[提示] 找不到导出工具 tools\\sspak（应与 liveview.exe 放在一起，"
+                             L"或放在可执行文件的上层目录里）。");
+            return;
+        }
+        show_path = DefaultShowPath();
+        AppendLog(state, L"首次运行：正在从 pak 生成演出包（约 30 秒）…");
+        std::wstring export_log;
+        std::wstring error;
+        if (!RunPythonExport(tools, game_dir, key_hex, show_path, &export_log, &error)) {
+            for (size_t i = 0; i < export_log.size(); i += 200) {
+                AppendLog(state, export_log.substr(i, 200));
+            }
+            AppendLog(state, L"[错误] " + error);
+            return;
+        }
+        AppendLog(state, L"演出包已生成：" + show_path);
+        SetText(state->show_edit, show_path);
+        SaveCurrentConfig(state);
+    } else if (GetText(state->show_edit).empty()) {
+        SetText(state->show_edit, show_path);
+    }
+
+    OnPlayShow(state);
+}
+
 void OnCommand(AppState* state, int id) {
     switch (id) {
         case kIdDirBrowse: {
@@ -473,9 +714,17 @@ void OnCommand(AppState* state, int id) {
             }
             return;
         }
-        case kIdShowPlay:
-            OnPlayShow(state);
+        case kIdShowPlay: {
+            // 没有演出包时先自动导出一份，再播放
+            const std::wstring path = ResolveShowPath(GetText(state->show_edit));
+            if (!FileExists(path)) {
+                AutoStartShow(state);
+            } else {
+                SetText(state->show_edit, path);
+                OnPlayShow(state);
+            }
             return;
+        }
         case kIdClearLog:
             ClearLog(state);
             return;
@@ -547,24 +796,8 @@ void LoadConfigIntoControls(AppState* state) {
     SetText(state->key_edit, std::wstring(config.key_hex.begin(), config.key_hex.end()));
     SetText(state->bundle_edit, config.bundle_path);
 
-    // 演出包没配置时，默认用可执行文件旁边的 sng001.lvs，这样双击打开就能直接播。
-    std::wstring show_path = config.show_path;
-    if (show_path.empty()) {
-        wchar_t exe[MAX_PATH * 2] = {0};
-        const DWORD length = GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
-        if (length > 0 && length < MAX_PATH * 2) {
-            std::wstring candidate(exe, length);
-            const size_t slash = candidate.find_last_of(L"\\/");
-            if (slash != std::wstring::npos) {
-                candidate.resize(slash + 1);
-            }
-            candidate += L"sng001.lvs";
-            if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                show_path = candidate;
-            }
-        }
-    }
-    SetText(state->show_edit, show_path);
+    // 演出包没配置时，默认找可执行文件旁边或配置目录里的 sng001.lvs
+    SetText(state->show_edit, ResolveShowPath(config.show_path));
     if (!config.game_dir.empty() || !config.key_hex.empty()) {
         AppendLog(state, L"已读取上次的目录与密钥，可直接点「校验 pak 索引」");
     }
@@ -593,9 +826,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
             LayoutControls(created, client.right - client.left, client.bottom - client.top);
             LoadConfigIntoControls(created);
             AppendLog(created, L"选择游戏资源目录、填入 AES 密钥，然后点「校验 pak 索引」。");
-            // 已经配好演出包时，打开软件就自动开始播放（延迟一点等窗口画完）
-            if (!GetText(created->show_edit).empty()) {
-                SetTimer(window, 1, 600, nullptr);
+            // 打开即播放：延迟一点等窗口画完，有演出包就直接播，没有就现导一份
+            if (!GetText(created->dir_edit).empty() || !GetText(created->show_edit).empty()) {
+                SetTimer(window, 1, 500, nullptr);
             }
             return 0;
         }
@@ -614,9 +847,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         case WM_TIMER: {
             if (wparam == 1) {
                 KillTimer(window, 1);
-                if (state != nullptr && !GetText(state->show_edit).empty()) {
-                    PostMessageW(window, WM_COMMAND,
-                                 MAKEWPARAM(kIdShowPlay, BN_CLICKED), 0);
+                if (state != nullptr) {
+                    AutoStartShow(state);
                 }
             }
             return 0;

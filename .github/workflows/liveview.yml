@@ -5,10 +5,12 @@ on:
     branches: [main]
     paths:
       - "liveview/**"
+      - "tools/sspak/**"
       - ".github/workflows/liveview.yml"
   pull_request:
     paths:
       - "liveview/**"
+      - "tools/sspak/**"
   workflow_dispatch:
 
 # 只保留一份构建（LIVEVIEW_RENDER=ON）。验证程序的用途就是播放演出，
@@ -123,8 +125,18 @@ jobs:
           $global:LASTEXITCODE = 0
           exit 0
 
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          # 产物里带一份 Python 导出器：程序首次启动会用它从 pak 生成演出包
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build/Release/liveview.exe dist/
+          New-Item -ItemType Directory -Force -Path dist/tools | Out-Null
+          Copy-Item -Recurse tools/sspak dist/tools/sspak
+          Get-ChildItem -Recurse dist | Select-Object FullName, Length
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: liveview-windows
-          path: build/Release/liveview.exe
+          path: dist
