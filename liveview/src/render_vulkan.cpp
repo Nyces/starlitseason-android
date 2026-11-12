@@ -549,6 +549,18 @@ struct Renderer {
     bool CaptureFrame(const Show& show, double seconds, const std::wstring& path,
                       std::string* error);
 
+    // 只渲染到离屏图像并等 GPU 完成，像素留在 readback_mapped 里
+    bool RenderOffscreenFrame(const Show& show, double seconds, std::string* error);
+    // 把 readback 里的像素贴到窗口（GDI），用于显卡不接显示器的情况
+    bool BlitToWindow(const Show& show, double seconds, std::string* error);
+    // readback（可能是 RGBA/BGRA）转成 BGRA 自顶向下
+    void CopyReadbackToBgra(std::vector<uint8_t>* out) const;
+
+    // 选中的显卡是否真的接着显示器；不是就改用「离屏 + GDI 上屏」
+    bool device_on_display = false;
+    bool present_via_gdi = false;
+    std::vector<uint8_t> pixel_buffer;   // GDI 上屏用的 BGRA 像素
+
     bool Init(HWND target, std::string* error);
     void Shutdown();
     bool DrawFrame(const float* color, std::string* error);
@@ -709,12 +721,43 @@ bool Renderer::PickPhysicalDevice(std::string* error) {
         return false;
     }
 
+    // 桌面上的显示适配器名。矿卡这类没有视频输出的卡即使能渲染，画面也到不了屏幕，
+    // 所以要优先选「真正驱动显示输出」的那块 GPU。
+    std::vector<std::string> display_adapters;
+    for (DWORD i = 0;; ++i) {
+        DISPLAY_DEVICEW display{};
+        display.cb = sizeof(display);
+        if (EnumDisplayDevicesW(nullptr, i, &display, 0) == FALSE) {
+            break;
+        }
+        if ((display.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) == 0) {
+            continue;
+        }
+        display_adapters.push_back(NarrowUtf8(display.DeviceString));
+        LOG_STEP("[render] 桌面显示适配器: %s", display_adapters.back().c_str());
+    }
+
     int best_score = -1;
     for (VkPhysicalDevice candidate : devices) {
         VkPhysicalDeviceProperties properties{};
         g_vkGetPhysicalDeviceProperties(candidate, &properties);
-        LOG_STEP("[render] 发现设备: %s（类型 %d）", properties.deviceName,
-                 static_cast<int>(properties.deviceType));
+        std::string device_name = properties.deviceName;
+        std::string device_lower = device_name;
+        std::transform(device_lower.begin(), device_lower.end(), device_lower.begin(), ::tolower);
+
+        bool on_display = false;
+        for (const std::string& adapter : display_adapters) {
+            std::string adapter_lower = adapter;
+            std::transform(adapter_lower.begin(), adapter_lower.end(), adapter_lower.begin(),
+                           ::tolower);
+            if (adapter_lower.find(device_lower) != std::string::npos ||
+                device_lower.find(adapter_lower) != std::string::npos) {
+                on_display = true;
+                break;
+            }
+        }
+        LOG_STEP("[render] 发现设备: %s（类型 %d，接显示器 %s）", properties.deviceName,
+                 static_cast<int>(properties.deviceType), on_display ? "是" : "否");
 
         uint32_t family_count = 0;
         g_vkGetPhysicalDeviceQueueFamilyProperties(candidate, &family_count, nullptr);
@@ -770,6 +813,7 @@ bool Renderer::PickPhysicalDevice(std::string* error) {
             best_score = score;
             physical_device = candidate;
             queue_family = chosen_family;
+            device_on_display = on_display;
         }
     }
 
@@ -788,6 +832,12 @@ bool Renderer::PickPhysicalDevice(std::string* error) {
              VK_VERSION_MAJOR(properties.apiVersion),
              VK_VERSION_MINOR(properties.apiVersion),
              VK_VERSION_PATCH(properties.apiVersion), properties.driverVersion);
+    // 这块卡没有接显示器（矿卡）时，交换链呈现到不了屏幕，
+    // 改成离屏渲染 + GDI 上屏：渲染还是在这块卡上，只是最后一步交给系统显示。
+    present_via_gdi = !device_on_display;
+    LogText(present_via_gdi
+                ? "[render] 该显卡不接显示器：改用离屏渲染 + GDI 上屏（渲染仍在 GPU）"
+                : "[render] 该显卡接显示器：使用交换链直接呈现");
     return true;
 }
 
@@ -1816,7 +1866,15 @@ bool Renderer::RecreateSwapchain(std::string* error) {
         return false;
     }
     DestroySwapchainResources();
-    return CreateSwapchain(error);
+    if (!CreateSwapchain(error)) {
+        return false;
+    }
+    // 离屏目标（截图 / GDI 上屏）跟着新尺寸重建
+    std::string offscreen_error;
+    if (!CreateOffscreenTarget(&offscreen_error)) {
+        LogText("[render] 离屏目标重建失败：" + offscreen_error);
+    }
+    return true;
 }
 
 bool Renderer::Init(HWND target, std::string* error) {
@@ -2605,6 +2663,22 @@ bool Renderer::RecordShowCommandBuffer(uint32_t image_index) {
 }
 
 bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* error) {
+    // 显卡不接显示器时：渲染到离屏图像，再把像素贴到窗口上
+    if (present_via_gdi) {
+        if (g_window_resized) {
+            g_window_resized = false;
+            RECT client{};
+            GetClientRect(window, &client);
+            if (client.right - client.left > 0 && client.bottom - client.top > 0) {
+                if (!RecreateSwapchain(error)) {
+                    LOG_STEP("[render] %s", error->c_str());
+                    return false;
+                }
+            }
+        }
+        return BlitToWindow(show, seconds, error);
+    }
+
     if (pipeline == VK_NULL_HANDLE || descriptor_set == VK_NULL_HANDLE ||
         show_gpu.indices == VK_NULL_HANDLE || camera_mapped == nullptr) {
         *error = "渲染资源未就绪（管线/描述符/索引缓冲/USO 缺失）";
@@ -2842,13 +2916,12 @@ bool WriteBmp(const std::wstring& path, uint32_t width, uint32_t height,
 
 }  // namespace
 
-bool Renderer::CaptureFrame(const Show& show, double seconds, const std::wstring& path,
-                            std::string* error) {
+bool Renderer::RenderOffscreenFrame(const Show& show, double seconds, std::string* error) {
     if (offscreen_pipeline == VK_NULL_HANDLE || readback_mapped == nullptr) {
         *error = "离屏目标未就绪";
         return false;
     }
-    STEP("CaptureFrame: 等待设备空闲");
+    STEP("离屏帧: 等待设备空闲");
     if (g_vkDeviceWaitIdle(device) != VK_SUCCESS) {
         *error = "等待设备空闲失败";
         return false;
@@ -2957,26 +3030,70 @@ bool Renderer::CaptureFrame(const Show& show, double seconds, const std::wstring
         return false;
     }
 
-    STEP("CaptureFrame: 提交");
+    STEP("离屏帧: 提交");
     VkSubmitInfo submit_info{};
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &command;
     if (g_vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) {
-        *error = "提交截图命令失败";
+        *error = "提交离屏渲染命令失败";
         return false;
     }
     if (g_vkDeviceWaitIdle(device) != VK_SUCCESS) {
-        *error = "等待截图完成失败";
+        *error = "等待离屏渲染完成失败";
         return false;
     }
+    return true;
+}
 
-    STEP("CaptureFrame: 写文件");
+void Renderer::CopyReadbackToBgra(std::vector<uint8_t>* out) const {
+    const size_t bytes = static_cast<size_t>(extent.width) * extent.height * 4;
+    out->resize(bytes);
+    std::memcpy(out->data(), readback_mapped, bytes);
     const bool bgra = surface_format.format == VK_FORMAT_B8G8R8A8_UNORM ||
                       surface_format.format == VK_FORMAT_B8G8R8A8_SRGB;
-    std::vector<uint8_t> pixels(static_cast<size_t>(extent.width) * extent.height * 4);
-    std::memcpy(pixels.data(), readback_mapped, pixels.size());
-    if (!WriteBmp(path, extent.width, extent.height, pixels, bgra, error)) {
+    if (!bgra) {   // RGBA -> BGRA
+        for (size_t i = 0; i + 3 < bytes; i += 4) {
+            std::swap((*out)[i], (*out)[i + 2]);
+        }
+    }
+    for (size_t i = 3; i < bytes; i += 4) {
+        (*out)[i] = 255;
+    }
+}
+
+bool Renderer::BlitToWindow(const Show& show, double seconds, std::string* error) {
+    if (!RenderOffscreenFrame(show, seconds, error)) {
+        return false;
+    }
+    CopyReadbackToBgra(&pixel_buffer);
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = static_cast<LONG>(extent.width);
+    info.bmiHeader.biHeight = -static_cast<LONG>(extent.height);   // 自顶向下
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    HDC dc = GetDC(window);
+    if (dc == nullptr) {
+        *error = "取窗口 DC 失败";
+        return false;
+    }
+    SetDIBitsToDevice(dc, 0, 0, extent.width, extent.height, 0, 0, 0, extent.height,
+                      pixel_buffer.data(), &info, DIB_RGB_COLORS);
+    ReleaseDC(window, dc);
+    return true;
+}
+
+bool Renderer::CaptureFrame(const Show& show, double seconds, const std::wstring& path,
+                            std::string* error) {
+    if (!RenderOffscreenFrame(show, seconds, error)) {
+        return false;
+    }
+    STEP("CaptureFrame: 写文件");
+    std::vector<uint8_t> pixels;
+    CopyReadbackToBgra(&pixels);
+    if (!WriteBmp(path, extent.width, extent.height, pixels, true, error)) {
         return false;
     }
     Logf("[render] 已保存截图 %ux%u -> %s", extent.width, extent.height,
