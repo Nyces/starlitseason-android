@@ -65,6 +65,21 @@ def _align(value: int, alignment: int = 16) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
+def _looks_like_index(buf: bytes) -> bool:
+    """索引开头应是挂载点 FString（形如 "../../../GameName/"）。"""
+    if len(buf) < 8:
+        return False
+    (length,) = struct.unpack_from("<i", buf, 0)
+    if length == 0:
+        return True
+    if 0 < length <= 512:
+        text = buf[4:4 + length]
+        return all(32 <= b < 127 or b == 0 for b in text)
+    if -512 <= length < 0:
+        return 4 - length * 2 <= len(buf)
+    return False
+
+
 class PakFile:
     """单个 pak 文件。索引在构造时一次性解析，条目数据按需读取。"""
 
@@ -83,7 +98,14 @@ class PakFile:
         self.compression_methods = info["compression_methods"]
 
         index = self._read(self.index_offset, self.index_size)
-        if self.encrypted_index:
+        if self.encrypted_index is None:
+            # 包尾没有加密标志（mod 工具常见）：按索引内容判断，先当明文试
+            if _looks_like_index(index):
+                self.encrypted_index = False
+            else:
+                self.encrypted_index = True
+                index = self._decrypt(index)
+        elif self.encrypted_index:
             index = self._decrypt(index)
         self.mount_point, pos = _read_fstring(index, 0)
         (count,) = struct.unpack_from("<i", index, pos)
@@ -146,12 +168,22 @@ class PakFile:
         info = tail[pos:]
         (version,) = struct.unpack_from("<i", info, 4)
         index_offset, index_size = struct.unpack_from("<QQ", info, 8)
-        encrypted_index = info[44] != 0
-        guid = info[45:61]
+        # 包尾有两种布局：官方包（221 字节）在索引哈希后有 bEncryptedIndex(1) + GUID(16)；
+        # 很多 mod 工具产出的包（204 字节）省略了这两个字段，压缩方式名紧跟哈希。
+        # 用包尾长度区分；没有加密标志时 encrypted_index 记为 None，稍后按索引内容判断。
+        if len(info) >= 221 and info[44] in (0, 1):
+            encrypted_index = info[44] != 0
+            guid = info[45:61]
+            methods_at = 61
+        else:
+            encrypted_index = None
+            guid = b""
+            methods_at = 44
         methods = []
         if version >= 8:
             for i in range(5):
-                raw = info[61 + i * 32:61 + (i + 1) * 32].split(b"\x00")[0]
+                start = methods_at + i * 32
+                raw = info[start:start + 32].split(b"\x00")[0]
                 methods.append(raw.decode("latin1"))
         return {
             "version": version,
