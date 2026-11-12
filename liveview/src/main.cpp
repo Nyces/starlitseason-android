@@ -25,6 +25,7 @@
 #include "app_window.h"
 #include "bundle.h"
 #include "commands.h"
+#include "log.h"
 #include "pak.h"
 #include "show.h"
 
@@ -295,10 +296,21 @@ int RunShowCommand(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
+    liveview::InitLog();
+    liveview::InstallCrashHandler();
+
+    // 先把启动方式记下来：闪退时这一行能证明程序进到了哪里
+    std::string command_line = "启动参数:";
+    for (int i = 0; i < argc; ++i) {
+        command_line += " ";
+        command_line += argv[i];
+    }
+    liveview::LogText(command_line);
 
     if (argc < 2) {
         // 双击启动时顺手关掉附带的控制台窗口，只留图形界面
         FreeConsole();
+        liveview::LogText("进入图形界面");
         return liveview::RunAppWindow();
     }
     if (std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "-h") == 0) {

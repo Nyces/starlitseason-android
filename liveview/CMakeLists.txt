@@ -37,6 +37,7 @@ add_executable(liveview
   src/commands.cpp
   src/bundle.cpp
   src/show.cpp
+  src/log.cpp
   src/aes256.cpp
   src/pak.cpp
   src/config.cpp
@@ -48,7 +49,7 @@ target_include_directories(liveview PRIVATE src)
 # zlib 不同版本的目标名不一样（zlibstatic / zlib），用生成表达式兜底
 target_link_libraries(liveview PRIVATE
   $<IF:$<TARGET_EXISTS:zlibstatic>,zlibstatic,zlib>
-  comdlg32 shell32 ole32 user32 gdi32 advapi32)
+  comdlg32 shell32 ole32 user32 gdi32 advapi32 dbghelp)
 
 if(MSVC)
   # /utf-8：源码和字符串字面量按 UTF-8 解释，否则中文对话框会乱码

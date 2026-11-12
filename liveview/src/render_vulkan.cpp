@@ -31,6 +31,7 @@
 
 #include "render_vulkan.h"
 
+#include "log.h"
 #include "scene_frag_spirv.h"
 #include "scene_vert_spirv.h"
 #include "show.h"
@@ -124,6 +125,7 @@ PFN_vkCmdBindDescriptorSets g_vkCmdBindDescriptorSets = nullptr;
 PFN_vkCmdDrawIndexed g_vkCmdDrawIndexed = nullptr;
 PFN_vkCmdSetViewport g_vkCmdSetViewport = nullptr;
 PFN_vkCmdSetScissor g_vkCmdSetScissor = nullptr;
+PFN_vkCmdPipelineBarrier g_vkCmdPipelineBarrier = nullptr;
 
 // ---- 窗口状态 ----
 HWND g_window = nullptr;
@@ -155,6 +157,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
 std::string ResultText(VkResult result) {
     return "VkResult " + std::to_string(static_cast<int>(result));
 }
+
+// 每一步都先记 checkpoint：崩溃时日志最后一行就能指出死在哪
+#define STEP(name) SetCheckpoint(name)
+#define LOG_STEP(...) Logf(__VA_ARGS__)
 
 std::string FormatPose(const CameraKey& pose) {
     char buffer[192];
@@ -629,6 +635,7 @@ bool Renderer::LoadDeviceFunctions(std::string* error) {
     LOAD_DEVICE_FN(vkCmdDrawIndexed);
     LOAD_DEVICE_FN(vkCmdSetViewport);
     LOAD_DEVICE_FN(vkCmdSetScissor);
+    LOAD_DEVICE_FN(vkCmdPipelineBarrier);
     return true;
 }
 
@@ -717,6 +724,10 @@ bool Renderer::PickPhysicalDevice(std::string* error) {
                 VK_VERSION_MAJOR(properties.apiVersion),
                 VK_VERSION_MINOR(properties.apiVersion),
                 VK_VERSION_PATCH(properties.apiVersion));
+    LOG_STEP("[render] 显卡 %s（Vulkan %u.%u.%u，驱动 %u）", properties.deviceName,
+             VK_VERSION_MAJOR(properties.apiVersion),
+             VK_VERSION_MINOR(properties.apiVersion),
+             VK_VERSION_PATCH(properties.apiVersion), properties.driverVersion);
     return true;
 }
 
@@ -1417,9 +1428,11 @@ bool Renderer::Init(HWND target, std::string* error) {
     window = target;
     hinstance = GetModuleHandleW(nullptr);
 
+    STEP("Init: 加载 vulkan-1.dll");
     loader = LoadLibraryW(L"vulkan-1.dll");
     if (loader == nullptr) {
         *error = "无法加载 vulkan-1.dll（请安装显卡驱动或 Vulkan 运行时）";
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
     g_get_instance_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
@@ -1491,30 +1504,48 @@ bool Renderer::Init(HWND target, std::string* error) {
         return false;
     }
 
+    STEP("Init: 选择物理设备");
     if (!PickPhysicalDevice(error)) {
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    STEP("Init: 创建逻辑设备");
     if (!CreateDeviceObject(error)) {
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    STEP("Init: 取设备入口函数");
     if (!LoadDeviceFunctions(error)) {
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    STEP("Init: 创建渲染通道");
     if (!CreateRenderPass(error)) {
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    STEP("Init: 创建命令资源");
     if (!CreateCommandResources(error)) {
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    STEP("Init: 创建同步对象");
     if (!CreateSyncObjects(error)) {
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    STEP("Init: 创建交换链");
     if (!CreateSwapchain(error)) {
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    STEP("Init: 创建管线");
     if (!CreateShowPipeline(error)) {
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    STEP("Init: 完成");
+    LOG_STEP("[render] 初始化完成（%ux%u）", extent.width, extent.height);
     return true;
 }
 
@@ -1759,6 +1790,7 @@ void ComputeGlobals(const ShowSkin& skin, const SkinCpu& cpu,
 bool ShowGpu::Upload(VkDevice device, VkPhysicalDevice physical, const Show& show,
                      std::string* error) {
     Destroy(device);
+    STEP("Upload: 统计尺寸");
 
     size_t stage_vertices_total = 0;
     size_t index_total = 0;
@@ -1774,29 +1806,44 @@ bool ShowGpu::Upload(VkDevice device, VkPhysicalDevice physical, const Show& sho
     stage_vertex_count = stage_vertices_total;
     skin_vertex_count = skin_vertices_total;
     index_count = index_total;
+    LOG_STEP("[render] 上传：舞台顶点 %zu，角色顶点 %zu，索引 %zu", stage_vertex_count,
+             skin_vertex_count, index_count);
 
+    STEP("Upload: 创建舞台顶点缓冲");
     if (!CreateHostBuffer(device, physical,
                           static_cast<VkDeviceSize>(stage_vertex_count) * sizeof(ShowVertex),
                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &stage_vertices, &stage_memory,
                           &stage_mapped, "舞台顶点", error)) {
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    STEP("Upload: 创建角色顶点缓冲");
     if (!CreateHostBuffer(device, physical,
                           static_cast<VkDeviceSize>(skin_vertex_count) * sizeof(ShowVertex),
                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &skin_vertices, &skin_memory,
                           &skin_mapped, "角色顶点", error)) {
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    STEP("Upload: 创建索引缓冲");
     if (!CreateHostBuffer(device, physical,
                           static_cast<VkDeviceSize>(index_count) * sizeof(uint32_t),
                           VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &indices, &index_memory,
                           &index_mapped, "索引", error)) {
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
 
     ShowVertex* stage_out = static_cast<ShowVertex*>(stage_mapped);
     ShowVertex* skin_out = static_cast<ShowVertex*>(skin_mapped);
     uint32_t* index_out = static_cast<uint32_t*>(index_mapped);
+    if ((stage_vertex_count > 0 && stage_out == nullptr) ||
+        (skin_vertex_count > 0 && skin_out == nullptr) ||
+        (index_count > 0 && index_out == nullptr)) {
+        *error = "顶点/索引缓冲映射失败";
+        LOG_STEP("[render] %s", error->c_str());
+        return false;
+    }
 
     size_t vertex_at = 0;
     size_t index_at = 0;
@@ -1939,6 +1986,8 @@ bool ShowGpu::Upload(VkDevice device, VkPhysicalDevice physical, const Show& sho
             bounds_hi[i] = 100.0f;
         }
     }
+    LOG_STEP("[render] 场景包围盒 (%.1f, %.1f, %.1f) .. (%.1f, %.1f, %.1f)", bounds_lo[0],
+             bounds_lo[1], bounds_lo[2], bounds_hi[0], bounds_hi[1], bounds_hi[2]);
     return true;
 }
 
@@ -2090,6 +2139,19 @@ bool Renderer::RecordShowCommandBuffer(uint32_t image_index) {
     clear_values[1].depthStencil.depth = 1.0f;
     clear_values[1].depthStencil.stencil = 0;
 
+    // CPU 每帧重写顶点与 uniform，必须显式做一次 host -> GPU 的可见性屏障，
+    // 否则部分驱动会读到旧数据（画面空白或扭曲）。
+    VkMemoryBarrier host_barrier{};
+    host_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    host_barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    host_barrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+                                 VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT;
+    g_vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_HOST_BIT,
+                           VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                           0, 1, &host_barrier, 0, nullptr, 0, nullptr);
+
     VkRenderPassBeginInfo pass_info{};
     pass_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     pass_info.renderPass = render_pass;
@@ -2140,23 +2202,35 @@ bool Renderer::RecordShowCommandBuffer(uint32_t image_index) {
 }
 
 bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* error) {
+    if (pipeline == VK_NULL_HANDLE || descriptor_set == VK_NULL_HANDLE ||
+        show_gpu.indices == VK_NULL_HANDLE || camera_mapped == nullptr) {
+        *error = "渲染资源未就绪（管线/描述符/索引缓冲/USO 缺失）";
+        LOG_STEP("[render] %s", error->c_str());
+        return false;
+    }
+
     if (g_window_resized) {
         g_window_resized = false;
         RECT client{};
         GetClientRect(window, &client);
         if (client.right - client.left > 0 && client.bottom - client.top > 0) {
+            STEP("DrawShowFrame: 重建交换链");
             if (!RecreateSwapchain(error)) {
+                LOG_STEP("[render] %s", error->c_str());
                 return false;
             }
         }
     }
 
     // 顶点缓冲与 uniform 每帧都由 CPU 重写，等上一帧彻底画完再写。
+    STEP("DrawShowFrame: 等待设备空闲");
     if (g_vkDeviceWaitIdle(device) != VK_SUCCESS) {
         *error = "等待设备空闲失败";
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
 
+    STEP("DrawShowFrame: 采样相机");
     const ShowCameraPose pose = show.SampleCamera(seconds);
     const float radius = 0.5f * std::sqrt(
         (show_gpu.bounds_hi[0] - show_gpu.bounds_lo[0]) *
@@ -2175,6 +2249,7 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
     const Mat4 projection = PerspectiveVulkan(45.0f, aspect, near_plane, far_plane);
     const Mat4 view_projection = MultiplyMat4(projection, view);
 
+    STEP("DrawShowFrame: 写 uniform");
     CameraUniform uniform{};
     std::memcpy(uniform.view_projection, view_projection.m, sizeof(uniform.view_projection));
     uniform.light_direction[0] = 0.25f;
@@ -2183,13 +2258,17 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
     uniform.light_direction[3] = 0.0f;
     std::memcpy(camera_mapped, &uniform, sizeof(uniform));
 
+    STEP("DrawShowFrame: CPU 蒙皮");
     show_gpu.Update(show, seconds);
 
+    STEP("DrawShowFrame: 等待帧栅栏");
     if (g_vkWaitForFences(device, 1, &in_flight[frame_index], VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
         *error = "等待帧栅栏失败";
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
 
+    STEP("DrawShowFrame: 获取交换链图像");
     uint32_t image_index = 0;
     const VkResult acquire_result = g_vkAcquireNextImageKHR(
         device, swapchain, UINT64_MAX, image_available[frame_index], VK_NULL_HANDLE, &image_index);
@@ -2198,17 +2277,22 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
     }
     if (acquire_result != VK_SUCCESS && acquire_result != VK_SUBOPTIMAL_KHR) {
         *error = "获取交换链图像失败（" + ResultText(acquire_result) + "）";
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
 
     if (g_vkResetFences(device, 1, &in_flight[frame_index]) != VK_SUCCESS) {
         *error = "重置帧栅栏失败";
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    STEP("DrawShowFrame: 录制命令");
     if (!RecordShowCommandBuffer(image_index)) {
         *error = "录制演出命令缓冲失败";
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    STEP("DrawShowFrame: 提交");
 
     VkSubmitInfo submit_info{};
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -2223,8 +2307,11 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
 
     if (g_vkQueueSubmit(queue, 1, &submit_info, in_flight[frame_index]) != VK_SUCCESS) {
         *error = "提交演出命令失败";
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+
+    STEP("DrawShowFrame: 呈现");
 
     VkPresentInfoKHR present_info{};
     present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -2242,6 +2329,7 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
     }
     if (present_result != VK_SUCCESS) {
         *error = "呈现演出画面失败（" + ResultText(present_result) + "）";
+        LOG_STEP("[render] %s", error->c_str());
         return false;
     }
     return true;
@@ -2251,10 +2339,12 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
 
 int RunShow(const Show& show) {
     if (show.camera_keys.empty()) {
+        LogText("[render] 演出包里没有相机轨，无法播放");
         std::fprintf(stderr, "演出包里没有相机轨，无法播放\n");
         return 1;
     }
     if (show.poses.empty()) {
+        LogText("[render] 演出包里没有动画数据，无法播放");
         std::fprintf(stderr, "演出包里没有动画数据，无法播放\n");
         return 1;
     }
@@ -2263,29 +2353,42 @@ int RunShow(const Show& show) {
         duration = static_cast<double>(show.poses.back().frame) / show.anim_fps;
     }
     if (duration <= 0.0) {
+        LogText("[render] 演出时长为 0，无法播放");
         std::fprintf(stderr, "演出时长为 0，无法播放\n");
         return 1;
     }
+    LOG_STEP("[render] 开始播放：时长 %.2fs，相机 %zu 帧，动画 %zu 骨骼 × %zu 帧，"
+             "舞台 %zu 三角，角色 %zu 三角",
+             duration, show.camera_keys.size(), show.anim_bones.size(), show.poses.size(),
+             show.StageTriangleCount(), show.SkinTriangleCount());
 
     std::string error;
+    STEP("RunShow: 创建窗口");
     if (!CreateRenderWindow(&error)) {
+        LogText("[render] " + error);
         MessageBoxA(nullptr, error.c_str(), "liveview", MB_OK | MB_ICONERROR);
         return 1;
     }
 
     Renderer renderer;
+    STEP("RunShow: 初始化 Vulkan");
     if (!renderer.Init(g_window, &error)) {
+        LogText("[render] " + error);
         MessageBoxA(g_window, error.c_str(), "liveview", MB_OK | MB_ICONERROR);
         renderer.Shutdown();
         DestroyWindow(g_window);
         return 1;
     }
+    STEP("RunShow: 上传演出数据");
     if (!renderer.show_gpu.Upload(renderer.device, renderer.physical_device, show, &error)) {
+        LogText("[render] " + error);
         MessageBoxA(g_window, error.c_str(), "liveview", MB_OK | MB_ICONERROR);
         renderer.Shutdown();
         DestroyWindow(g_window);
         return 1;
     }
+    STEP("RunShow: 进入渲染循环");
+    LogText("[render] 进入渲染循环");
 
     std::printf("演出：%.2fs  相机 %zu 关键帧  舞台 %zu 三角  角色 %zu 三角  动画 %zu 骨骼\n",
                 duration, show.camera_keys.size(), show.StageTriangleCount(),
@@ -2302,6 +2405,8 @@ int RunShow(const Show& show) {
     MSG message{};
     bool running = true;
     double title_time = -1.0;
+    long long frame_logs = 0;
+    double last_frame_log = -1.0;
 
     while (running) {
         while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
@@ -2332,8 +2437,17 @@ int RunShow(const Show& show) {
         }
 
         if (!renderer.DrawShowFrame(show, seconds, &error)) {
+            Logf("[render] 帧 %.2fs 失败：%s", seconds, error.c_str());
             MessageBoxA(g_window, error.c_str(), "liveview", MB_OK | MB_ICONERROR);
             break;
+        }
+
+        // 前几帧与之后每 5 秒记一行，既能确认画面在推进，也不至于把日志写爆
+        if (frame_logs < 5 || elapsed - last_frame_log >= 5.0) {
+            Logf("[render] 已渲染 %.2fs / %.1fs（第 %lld 帧）", seconds, duration,
+                 static_cast<long long>(frame_logs));
+            ++frame_logs;
+            last_frame_log = elapsed;
         }
 
         if (elapsed - title_time >= 0.25) {
@@ -2346,6 +2460,7 @@ int RunShow(const Show& show) {
     }
 
     renderer.Shutdown();
+    LogText("[render] 播放结束");
     if (g_window != nullptr && IsWindow(g_window)) {
         DestroyWindow(g_window);
     }
@@ -2372,18 +2487,23 @@ int RunRender(const Bundle& bundle, double seconds) {
     }
 
     std::string error;
+    STEP("RunRender: 创建窗口");
     if (!CreateRenderWindow(&error)) {
+        LogText("[render] " + error);
         MessageBoxA(nullptr, error.c_str(), "liveview", MB_OK | MB_ICONERROR);
         return 1;
     }
 
     Renderer renderer;
+    STEP("RunRender: 初始化 Vulkan");
     if (!renderer.Init(g_window, &error)) {
+        LogText("[render] " + error);
         MessageBoxA(g_window, error.c_str(), "liveview", MB_OK | MB_ICONERROR);
         renderer.Shutdown();
         DestroyWindow(g_window);
         return 1;
     }
+    LOG_STEP("[render] 相机包播放：%.2fs（tick %.0f）", duration, bundle.tick_fps);
 
     std::printf("播放 %.2f 秒（tick %.0f fps）；ESC 或关闭窗口结束\n", duration,
                 bundle.tick_fps);

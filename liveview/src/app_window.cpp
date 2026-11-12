@@ -21,11 +21,13 @@
 #endif
 #include <windows.h>
 #include <objbase.h>
+#include <shellapi.h>
 
 #include "bundle.h"
 #include "commands.h"
 #include "config.h"
 #include "dialogs.h"
+#include "log.h"
 #include "pak.h"
 #include "show.h"
 
@@ -64,6 +66,7 @@ enum ControlId {
     kIdShowBrowse,
     kIdShowPlay,
     kIdClearLog,
+    kIdOpenLog,
     kIdLog,
 };
 
@@ -101,6 +104,7 @@ struct AppState {
     HWND show_play = nullptr;
 
     HWND clear_log = nullptr;
+    HWND open_log = nullptr;
     HWND log = nullptr;
 
     HFONT font = nullptr;
@@ -135,6 +139,8 @@ void SetText(HWND control, const std::wstring& text) {
 }
 
 void AppendLog(AppState* state, const std::wstring& line) {
+    // 同步落盘，闪退时日志不会丢
+    LogText(NarrowUtf8(line));
     if (state->log == nullptr) {
         return;
     }
@@ -294,6 +300,7 @@ void LayoutControls(AppState* state, int width, int height) {
     y += play_height + gap;
 
     // 日志
+    Place(state->open_log, width - margin - 96 * 2 - 6, y, 96, 22);
     Place(state->clear_log, width - margin - 96, y, 96, 22);
     y += 26;
     int log_height = height - y - margin;
@@ -407,6 +414,7 @@ void OnPlayShow(AppState* state) {
         AppendLog(state, L"[错误] 请先选择演出包（*.lvs，由 sspak live-show 生成）");
         return;
     }
+    Logf("[app] 载入演出包: %s", NarrowUtf8(path).c_str());
     Show show;
     std::string error;
     if (!show.Load(path, &error)) {
@@ -418,6 +426,9 @@ void OnPlayShow(AppState* state) {
                          L" 秒，舞台 " + std::to_wstring(show.StageTriangleCount()) +
                          L" 三角，角色 " + std::to_wstring(show.SkinTriangleCount()) +
                          L" 三角，动画 " + std::to_wstring(show.anim_bones.size()) + L" 骨骼");
+    Logf("[app] 包内容：%.2fs 相机 %zu 帧 舞台 %zu 三角 角色 %zu 三角 动画 %zu 骨骼 %zu 帧",
+         show.duration, show.camera_keys.size(), show.StageTriangleCount(),
+         show.SkinTriangleCount(), show.anim_bones.size(), show.poses.size());
     SaveCurrentConfig(state);
 #ifdef LIVEVIEW_RENDER
     AppendLog(state, L"打开演出窗口（ESC 退出）…");
@@ -728,6 +739,16 @@ void OnCommand(AppState* state, int id) {
         case kIdClearLog:
             ClearLog(state);
             return;
+        case kIdOpenLog: {
+            const std::wstring path = LogPath();
+            if (!FileExists(path)) {
+                AppendLog(state, L"日志文件还没有生成：" + path);
+                return;
+            }
+            AppendLog(state, L"日志文件：" + path);
+            ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            return;
+        }
         default:
             return;
     }
@@ -780,6 +801,8 @@ void CreateControls(AppState* state) {
 
     state->clear_log = MakeControl(state, L"BUTTON", L"清空日志", BS_PUSHBUTTON | WS_TABSTOP,
                                    kIdClearLog);
+    state->open_log = MakeControl(state, L"BUTTON", L"打开日志文件", BS_PUSHBUTTON | WS_TABSTOP,
+                                  kIdOpenLog);
     state->log = MakeControl(state, L"EDIT", L"",
                              WS_BORDER | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY |
                                  ES_AUTOVSCROLL | ES_AUTOHSCROLL,
@@ -910,6 +933,7 @@ void DestroyState(HWND window) {
 
 int RunAppWindow() {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    Logf("[app] 日志文件: %s", NarrowUtf8(LogPath()).c_str());
 
     HINSTANCE instance = GetModuleHandleW(nullptr);
     WNDCLASSEXW window_class{};
