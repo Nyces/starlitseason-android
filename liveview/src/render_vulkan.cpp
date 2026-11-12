@@ -754,7 +754,8 @@ bool Renderer::CreateDeviceObject(std::string* error) {
         *error = "创建 Vulkan 逻辑设备失败（" + ResultText(result) + "）";
         return false;
     }
-    g_vkGetDeviceQueue(device, queue_family, 0, &queue);
+    // 注意：g_vkGetDeviceQueue 属于设备级入口，要等 LoadDeviceFunctions 之后才能取队列，
+    // 这里不能调用（以前在这里调会跳到空指针）。
     return true;
 }
 
@@ -1516,6 +1517,13 @@ bool Renderer::Init(HWND target, std::string* error) {
     }
     STEP("Init: 取设备入口函数");
     if (!LoadDeviceFunctions(error)) {
+        LOG_STEP("[render] %s", error->c_str());
+        return false;
+    }
+    STEP("Init: 取图形队列");
+    g_vkGetDeviceQueue(device, queue_family, 0, &queue);
+    if (queue == VK_NULL_HANDLE) {
+        *error = "取图形队列失败";
         LOG_STEP("[render] %s", error->c_str());
         return false;
     }
