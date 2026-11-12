@@ -59,6 +59,8 @@ PFN_vkGetPhysicalDeviceQueueFamilyProperties g_vkGetPhysicalDeviceQueueFamilyPro
 PFN_vkGetPhysicalDeviceSurfaceSupportKHR g_vkGetPhysicalDeviceSurfaceSupportKHR = nullptr;
 PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR g_vkGetPhysicalDeviceSurfaceCapabilitiesKHR = nullptr;
 PFN_vkGetPhysicalDeviceSurfaceFormatsKHR g_vkGetPhysicalDeviceSurfaceFormatsKHR = nullptr;
+PFN_vkGetPhysicalDeviceSurfacePresentModesKHR g_vkGetPhysicalDeviceSurfacePresentModesKHR =
+    nullptr;
 PFN_vkCreateWin32SurfaceKHR g_vkCreateWin32SurfaceKHR = nullptr;
 PFN_vkDestroySurfaceKHR g_vkDestroySurfaceKHR = nullptr;
 PFN_vkCreateDevice g_vkCreateDevice = nullptr;
@@ -331,14 +333,20 @@ Mat4 MultiplyMat4(const Mat4& left, const Mat4& right) {
     return out;
 }
 
+// 列主序矩阵：m[col * 4 + row]。
+// Vulkan 的裁剪空间是 0 ≤ z ≤ w、Y 轴朝下，所以 z 的常量项与 w 的 -1 不能写反：
+//   z_clip = far/(near-far) * z_view + far*near/(near-far)
+//   w_clip = -z_view
+// 之前把这两项写反，导致 z_ndc ≈ -0.32（负深度），整幅画面被近平面裁掉 —— 全黑。
 Mat4 PerspectiveVulkan(float fov_degrees, float aspect, float near_plane, float far_plane) {
     Mat4 out{};
     const float f = 1.0f / std::tan(fov_degrees * 3.14159265358979323846f / 360.0f);
     out.m[0] = f / (aspect > 0.0f ? aspect : 1.0f);
     out.m[5] = -f;   // Vulkan 的 Y 轴朝下，这里翻一次
     out.m[10] = far_plane / (near_plane - far_plane);
-    out.m[11] = far_plane * near_plane / (near_plane - far_plane);
-    out.m[14] = -1.0f;
+    out.m[11] = -1.0f;
+    out.m[14] = far_plane * near_plane / (near_plane - far_plane);
+    out.m[15] = 0.0f;
     return out;
 }
 
@@ -385,6 +393,24 @@ Mat4 LookAtVulkan(const float eye[3], const float target[3]) {
     out.m[14] = forward[0] * eye[0] + forward[1] * eye[1] + forward[2] * eye[2];
     out.m[15] = 1.0f;
     return out;
+}
+
+// 与着色器一致的矩阵作用：out = M · p（M 按列主序存放）。
+void ApplyMat4(const Mat4& m, const float in[4], float out[4]) {
+    for (int row = 0; row < 4; ++row) {
+        out[row] = m.m[row] * in[0] + m.m[4 + row] * in[1] + m.m[8 + row] * in[2] +
+                   m.m[12 + row] * in[3];
+    }
+}
+
+double NowSeconds() {
+    static LARGE_INTEGER frequency{};
+    if (frequency.QuadPart == 0) {
+        QueryPerformanceFrequency(&frequency);
+    }
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    return static_cast<double>(now.QuadPart) / static_cast<double>(frequency.QuadPart);
 }
 
 // 与着色器里的 CameraBlock 一致（std140）。
@@ -494,6 +520,7 @@ struct Renderer {
     void* camera_mapped = nullptr;
 
     ShowGpu show_gpu;
+    uint64_t frames_drawn = 0;   // 用于节流诊断日志
 
     bool Init(HWND target, std::string* error);
     void Shutdown();
@@ -567,6 +594,7 @@ bool Renderer::LoadInstanceFunctions(std::string* error) {
     LOAD_INSTANCE_FN(vkGetPhysicalDeviceSurfaceSupportKHR);
     LOAD_INSTANCE_FN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
     LOAD_INSTANCE_FN(vkGetPhysicalDeviceSurfaceFormatsKHR);
+    LOAD_INSTANCE_FN(vkGetPhysicalDeviceSurfacePresentModesKHR);
     LOAD_INSTANCE_FN(vkCreateWin32SurfaceKHR);
     LOAD_INSTANCE_FN(vkDestroySurfaceKHR);
     LOAD_INSTANCE_FN(vkCreateDevice);
@@ -655,6 +683,8 @@ bool Renderer::PickPhysicalDevice(std::string* error) {
     for (VkPhysicalDevice candidate : devices) {
         VkPhysicalDeviceProperties properties{};
         g_vkGetPhysicalDeviceProperties(candidate, &properties);
+        LOG_STEP("[render] 发现设备: %s（类型 %d）", properties.deviceName,
+                 static_cast<int>(properties.deviceType));
 
         uint32_t family_count = 0;
         g_vkGetPhysicalDeviceQueueFamilyProperties(candidate, &family_count, nullptr);
@@ -1307,6 +1337,30 @@ bool Renderer::CreateSwapchain(std::string* error) {
         }
     }
 
+    // 呈现模式：优先 MAILBOX（不阻塞等待垂直同步）。
+    // 本机是挖矿卡（CMP 30HX，无显示输出），FIFO 会和合成器互相等，实测每帧卡 5 秒。
+    VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
+    uint32_t mode_count = 0;
+    if (g_vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &mode_count,
+                                                    nullptr) == VK_SUCCESS &&
+        mode_count > 0) {
+        std::vector<VkPresentModeKHR> modes(mode_count);
+        if (g_vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &mode_count,
+                                                        modes.data()) == VK_SUCCESS) {
+            bool has_mailbox = false;
+            for (VkPresentModeKHR mode : modes) {
+                if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
+                    has_mailbox = true;
+                }
+            }
+            if (has_mailbox) {
+                present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+            }
+        }
+    }
+    LOG_STEP("[render] 呈现模式 %s", present_mode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX"
+                                                                                : "FIFO");
+
     if (capabilities.currentExtent.width != UINT32_MAX) {
         extent = capabilities.currentExtent;
     } else {
@@ -1351,7 +1405,7 @@ bool Renderer::CreateSwapchain(std::string* error) {
     create_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     create_info.preTransform = capabilities.currentTransform;
     create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    create_info.presentMode = present_mode;
     create_info.clipped = VK_TRUE;
     create_info.oldSwapchain = VK_NULL_HANDLE;
 
@@ -2140,9 +2194,10 @@ bool Renderer::RecordShowCommandBuffer(uint32_t image_index) {
     }
 
     VkClearValue clear_values[2]{};
-    clear_values[0].color.float32[0] = 0.02f;
-    clear_values[0].color.float32[1] = 0.025f;
-    clear_values[0].color.float32[2] = 0.032f;
+    // 这里刻意不用纯黑：画面全黑时无法区分“呈现没生效”和“几何没画出来”
+    clear_values[0].color.float32[0] = 0.07f;
+    clear_values[0].color.float32[1] = 0.09f;
+    clear_values[0].color.float32[2] = 0.13f;
     clear_values[0].color.float32[3] = 1.0f;
     clear_values[1].depthStencil.depth = 1.0f;
     clear_values[1].depthStencil.stencil = 0;
@@ -2231,12 +2286,14 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
     }
 
     // 顶点缓冲与 uniform 每帧都由 CPU 重写，等上一帧彻底画完再写。
+    const double t_begin = NowSeconds();
     STEP("DrawShowFrame: 等待设备空闲");
     if (g_vkDeviceWaitIdle(device) != VK_SUCCESS) {
         *error = "等待设备空闲失败";
         LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    const double t_idle = NowSeconds();
 
     STEP("DrawShowFrame: 采样相机");
     const ShowCameraPose pose = show.SampleCamera(seconds);
@@ -2268,6 +2325,48 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
 
     STEP("DrawShowFrame: CPU 蒙皮");
     show_gpu.Update(show, seconds);
+    const double t_skin = NowSeconds();
+
+    // 首帧把几何和取景的硬数据记进日志：画面若是空的，这两行能直接说明原因
+    if (frames_drawn < 3) {
+        float center[4] = {(show_gpu.bounds_lo[0] + show_gpu.bounds_hi[0]) * 0.5f,
+                           (show_gpu.bounds_lo[1] + show_gpu.bounds_hi[1]) * 0.5f,
+                           (show_gpu.bounds_lo[2] + show_gpu.bounds_hi[2]) * 0.5f, 1.0f};
+        float clip[4];
+        ApplyMat4(view_projection, center, clip);
+        const float ndc_x = clip[3] != 0.0f ? clip[0] / clip[3] : 0.0f;
+        const float ndc_y = clip[3] != 0.0f ? clip[1] / clip[3] : 0.0f;
+        const float ndc_z = clip[3] != 0.0f ? clip[2] / clip[3] : 0.0f;
+        size_t indices = 0;
+        for (const DrawRange& draw : show_gpu.draws) {
+            indices += draw.index_count;
+        }
+        Logf("[render] 第 %llu 帧：draw %zu 个 / 索引 %zu，场景中心 NDC (%.2f, %.2f, %.3f)，"
+             "相机 (%.0f, %.0f, %.0f) -> (%.0f, %.0f, %.0f)",
+             static_cast<unsigned long long>(frames_drawn), show_gpu.draws.size(), indices,
+             ndc_x, ndc_y, ndc_z, pose.position[0], pose.position[1], pose.position[2],
+             pose.target[0], pose.target[1], pose.target[2]);
+        Logf("[render] uniform: m00=%.4f m11=%.4f m22=%.4f m32=%.4f m23=%.4f 光照 (%.2f, %.2f, "
+             "%.2f)",
+             uniform.view_projection[0], uniform.view_projection[5],
+             uniform.view_projection[10], uniform.view_projection[14],
+             uniform.view_projection[11], uniform.light_direction[0],
+             uniform.light_direction[1], uniform.light_direction[2]);
+        const ShowVertex* stage_vertices = static_cast<const ShowVertex*>(show_gpu.stage_mapped);
+        const ShowVertex* skin_vertices = static_cast<const ShowVertex*>(show_gpu.skin_mapped);
+        if (stage_vertices != nullptr) {
+            Logf("[render] 舞台首个顶点 (%.1f, %.1f, %.1f) 颜色 (%.2f, %.2f, %.2f)",
+                 stage_vertices[0].position[0], stage_vertices[0].position[1],
+                 stage_vertices[0].position[2], stage_vertices[0].color[0],
+                 stage_vertices[0].color[1], stage_vertices[0].color[2]);
+        }
+        if (skin_vertices != nullptr) {
+            Logf("[render] 角色首个顶点 (%.1f, %.1f, %.1f) 颜色 (%.2f, %.2f, %.2f)",
+                 skin_vertices[0].position[0], skin_vertices[0].position[1],
+                 skin_vertices[0].position[2], skin_vertices[0].color[0],
+                 skin_vertices[0].color[1], skin_vertices[0].color[2]);
+        }
+    }
 
     STEP("DrawShowFrame: 等待帧栅栏");
     if (g_vkWaitForFences(device, 1, &in_flight[frame_index], VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
@@ -2288,6 +2387,7 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
         LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    const double t_acquire = NowSeconds();
 
     if (g_vkResetFences(device, 1, &in_flight[frame_index]) != VK_SUCCESS) {
         *error = "重置帧栅栏失败";
@@ -2300,6 +2400,7 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
         LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    const double t_record = NowSeconds();
     STEP("DrawShowFrame: 提交");
 
     VkSubmitInfo submit_info{};
@@ -2318,6 +2419,7 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
         LOG_STEP("[render] %s", error->c_str());
         return false;
     }
+    const double t_submit = NowSeconds();
 
     STEP("DrawShowFrame: 呈现");
 
@@ -2330,7 +2432,19 @@ bool Renderer::DrawShowFrame(const Show& show, double seconds, std::string* erro
     present_info.pImageIndices = &image_index;
 
     const VkResult present_result = g_vkQueuePresentKHR(queue, &present_info);
+    const double t_present = NowSeconds();
     frame_index = (frame_index + 1) % kFramesInFlight;
+
+    // 诊断：把每帧各阶段耗时写进日志，能区分「GPU/呈现被卡住」与「CPU 太慢」
+    ++frames_drawn;
+    if (frames_drawn <= 3 || (t_present - t_begin) > 0.2 || frames_drawn % 120 == 0) {
+        Logf("[render] 帧耗时 %.0f ms（等待 %.0f / 蒙皮 %.0f / 取图含栅栏 %.0f / 录制 %.0f / "
+             "提交 %.0f / 呈现 %.0f）",
+             (t_present - t_begin) * 1000.0, (t_idle - t_begin) * 1000.0,
+             (t_skin - t_idle) * 1000.0, (t_acquire - t_skin) * 1000.0,
+             (t_record - t_acquire) * 1000.0, (t_submit - t_record) * 1000.0,
+             (t_present - t_submit) * 1000.0);
+    }
 
     if (present_result == VK_ERROR_OUT_OF_DATE_KHR || present_result == VK_SUBOPTIMAL_KHR) {
         return RecreateSwapchain(error);
@@ -2377,6 +2491,9 @@ int RunShow(const Show& show) {
         MessageBoxA(nullptr, error.c_str(), "liveview", MB_OK | MB_ICONERROR);
         return 1;
     }
+    // 盖住参数窗口，避免被遮挡后合成器不再消费画面
+    SetForegroundWindow(g_window);
+    BringWindowToTop(g_window);
 
     Renderer renderer;
     STEP("RunShow: 初始化 Vulkan");
@@ -2414,7 +2531,8 @@ int RunShow(const Show& show) {
     bool running = true;
     double title_time = -1.0;
     long long frame_logs = 0;
-    double last_frame_log = -1.0;
+    long long frames_since_log = 0;
+    double last_frame_log = 0.0;
 
     while (running) {
         while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
@@ -2450,12 +2568,16 @@ int RunShow(const Show& show) {
             break;
         }
 
-        // 前几帧与之后每 5 秒记一行，既能确认画面在推进，也不至于把日志写爆
+        // 前几帧与之后每 5 秒记一行，附带平均帧耗时，便于判断是渲染慢还是呈现被卡住
+        ++frames_since_log;
         if (frame_logs < 5 || elapsed - last_frame_log >= 5.0) {
-            Logf("[render] 已渲染 %.2fs / %.1fs（第 %lld 帧）", seconds, duration,
-                 static_cast<long long>(frame_logs));
+            const double average_ms =
+                frames_since_log > 0 ? (elapsed - last_frame_log) * 1000.0 / frames_since_log : 0.0;
+            Logf("[render] 已渲染 %.2fs / %.1fs（第 %lld 帧，平均 %.0f ms/帧）", seconds,
+                 duration, static_cast<long long>(frame_logs), average_ms);
             ++frame_logs;
             last_frame_log = elapsed;
+            frames_since_log = 0;
         }
 
         if (elapsed - title_time >= 0.25) {
