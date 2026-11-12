@@ -242,6 +242,19 @@ int RunShowCommand(int argc, char** argv) {
         PrintUsage();
         return 1;
     }
+
+    // 先把选项解析完，参数不合法时不必白读一遍演出包
+    bool play = false;
+    for (int i = 3; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--play") == 0) {
+            play = true;
+        } else {
+            std::fprintf(stderr, "无法识别的参数: %s\n", argv[i]);
+            PrintUsage();
+            return 1;
+        }
+    }
+
     liveview::Show show;
     std::string error;
     if (!show.Load(FromAnsi(argv[2]), &error)) {
@@ -265,16 +278,6 @@ int RunShowCommand(int argc, char** argv) {
         const liveview::ShowSkin& skin = show.skins[i];
         std::printf("    [%zu] 骨骼 %zu，跟随 %s\n", i, skin.bones.size(),
                     skin.attach_bone.empty() ? "-" : skin.attach_bone.c_str());
-    }
-
-    bool play = false;
-    for (int i = 3; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--play") == 0) {
-            play = true;
-        } else {
-            PrintUsage();
-            return 1;
-        }
     }
 
     if (play) {

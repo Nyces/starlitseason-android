@@ -11,6 +11,8 @@ on:
       - "liveview/**"
   workflow_dispatch:
 
+# 只保留一份构建（LIVEVIEW_RENDER=ON）。验证程序的用途就是播放演出，
+# 不带渲染后端的构建看不到画面，没必要再单独编一份。
 jobs:
   build:
     runs-on: windows-latest
@@ -18,25 +20,48 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -S liveview -B build -DCMAKE_BUILD_TYPE=Release
+        shell: pwsh
+        run: |
+          cmake -S liveview -B build -DCMAKE_BUILD_TYPE=Release -DLIVEVIEW_RENDER=ON 2>&1 | Tee-Object -FilePath configure.log
+          if ($LASTEXITCODE -ne 0) { throw "配置失败（exit $LASTEXITCODE）" }
 
       - name: Build
-        run: cmake --build build --config Release --parallel
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) { throw "构建失败（exit $LASTEXITCODE）" }
+
+      - name: Show build tail
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($f in @("configure.log", "build.log")) {
+            if (Test-Path $f) {
+              Write-Output "===== $f (tail) ====="
+              Get-Content $f -Tail 120
+            }
+          }
 
       - name: Smoke test
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $exe = "build/Release/liveview.exe"
           if (-not (Test-Path $exe)) { throw "未生成 liveview.exe" }
+
           & $exe --selftest
           if ($LASTEXITCODE -ne 0) { throw "liveview 自检失败" }
+
           & $exe --help
           if ($LASTEXITCODE -ne 0) { throw "liveview --help 失败" }
-          # 空目录里没有 pak，应当以非零退出并打印提示（验证 CLI 管线）
+
+          # 空目录里没有 pak，应当以非零退出（验证 CLI 管线）
           $empty = Join-Path $env:RUNNER_TEMP "nopak"
           New-Item -ItemType Directory -Force -Path $empty | Out-Null
           & $exe --paks $empty --key 0000000000000000000000000000000000000000000000000000000000000000
           if ($LASTEXITCODE -eq 0) { throw "空目录却报告成功" }
+
+          # 文本相机包：读取 / 采样 / 时间轴推进
           $bundle = Join-Path $env:RUNNER_TEMP "smoke.bundle"
           @(
             "#liveview-bundle 1",
@@ -54,54 +79,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "liveview 采样失败" }
           & $exe $bundle --play 0.02
           if ($LASTEXITCODE -ne 0) { throw "liveview 时间轴推进失败" }
-          Get-Item $exe | Select-Object Name, Length
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: liveview-windows
-          path: build/Release/liveview.exe
-
-  # 渲染后端是可选构建：CI 上没有 GPU，只验证能编译通过。
-  render:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure (LIVEVIEW_RENDER=ON)
-        shell: pwsh
-        run: |
-          cmake -S liveview -B build-render -DCMAKE_BUILD_TYPE=Release -DLIVEVIEW_RENDER=ON 2>&1 | Tee-Object -FilePath configure-render.log
-          if ($LASTEXITCODE -ne 0) { throw "配置失败（exit $LASTEXITCODE）" }
-
-      - name: Build
-        shell: pwsh
-        run: |
-          cmake --build build-render --config Release --parallel 2>&1 | Tee-Object -FilePath build-render.log
-          if ($LASTEXITCODE -ne 0) { throw "构建失败（exit $LASTEXITCODE）" }
-
-      - name: Show build tail
-        if: always()
-        shell: pwsh
-        run: |
-          foreach ($f in @("configure-render.log", "build-render.log")) {
-            if (Test-Path $f) {
-              Write-Output "===== $f (tail) ====="
-              Get-Content $f -Tail 120
-            }
-          }
-
-      - name: Check binary
-        shell: pwsh
-        run: |
-          $exe = "build-render/Release/liveview.exe"
-          if (-not (Test-Path $exe)) { throw "未生成启用了渲染的 liveview.exe" }
-          & $exe --selftest
-          if ($LASTEXITCODE -ne 0) { throw "liveview --selftest 失败" }
-          & $exe --help
-          if ($LASTEXITCODE -ne 0) { throw "liveview --help 失败" }
-
-          # 用 Python 造一个最小演出包，验证 C++ 侧的二进制读取（CI 没有游戏资源）
+          # 演出包：用 Python 造一个最小包，验证 C++ 侧的二进制读取（CI 没有游戏资源）
           $script = @'
           import struct
           f = open("smoke.lvs", "wb")
@@ -127,12 +106,25 @@ jobs:
           $script | python -
           & $exe --show smoke.lvs
           if ($LASTEXITCODE -ne 0) { throw "liveview --show 读取失败" }
+
+          # 未知参数必须报错退出（这里会留下 LASTEXITCODE=1，结尾统一归零）
           & $exe --show smoke.lvs --nope
           if ($LASTEXITCODE -ne 1) { throw "--show 未识别参数应返回 1" }
+
+          # 截断的包必须被拒绝，而不是画出乱七八糟的东西
+          $bad = Join-Path $env:RUNNER_TEMP "truncated.lvs"
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path "smoke.lvs"))
+          [System.IO.File]::WriteAllBytes($bad, $bytes[0..($bytes.Length - 9)])
+          & $exe --show $bad
+          if ($LASTEXITCODE -eq 0) { throw "截断的演出包未被拒绝" }
+
           Get-Item $exe | Select-Object Name, Length
+          # PowerShell 会把最后一个外部命令的退出码当成脚本退出码，这里显式归零
+          $global:LASTEXITCODE = 0
+          exit 0
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: liveview-windows-render
-          path: build-render/Release/liveview.exe
+          name: liveview-windows
+          path: build/Release/liveview.exe
