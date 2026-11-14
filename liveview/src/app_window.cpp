@@ -419,8 +419,8 @@ bool ShowFileIsCurrent(const std::wstring& path) {
     DWORD read = 0;
     const bool ok = ReadFile(file, header, 8, &read, nullptr) != 0 && read == 8;
     CloseHandle(file);
-    return ok && header[0] == 'L' && header[1] == 'V' && header[2] == 'S' && header[3] == '3' &&
-           header[4] == 3 && header[5] == 0 && header[6] == 0 && header[7] == 0;
+    return ok && header[0] == 'L' && header[1] == 'V' && header[2] == 'S' && header[3] == '4' &&
+           header[4] == 4 && header[5] == 0 && header[6] == 0 && header[7] == 0;
 }
 
 void OnPlayShow(AppState* state) {

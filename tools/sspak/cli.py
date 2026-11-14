@@ -1433,6 +1433,33 @@ def _show_animation(store, anim: str, step: int, verbose: bool = True):
         seen.add(name)
         tracks.append((name, rotation, position))
 
+    # 这套 rig 的躯干变形走 AO_* 链，但动画里 AO_Hips / AO_Spine1 / SO_Spine2 都是常量，
+    # 真正在转的是 SO_Spine / SO_Spine1。只按同名应用的话，腿和手臂会动、上半身僵住。
+    # 这里把 SO_<后缀> 的旋转补给没有旋转的 AO_<后缀>，两者是同一段运动的两套骨骼。
+    # 只处理躯干：头颈有自己的空间常量规则，套过来会让头转两倍。
+    retargeted = []
+    torso = ("AO_Spine", "AO_Spine1", "AO_Spine2", "AO_Hips")
+    by_name = {name: index for index, (name, _, _) in enumerate(tracks)}
+    for index, (name, rotation, position) in enumerate(list(tracks)):
+        if name not in torso or rotation is not None:
+            continue
+        source_name = "SO_" + name[3:]
+        source = by_name.get(source_name)
+        if source is None or tracks[source][1] is None:
+            continue
+        tracks[index] = (name, tracks[source][1], position)
+        retargeted.append(f"{name} <- {source_name}")
+    for name in torso:
+        if name in by_name:
+            continue
+        source = by_name.get("SO_" + name[3:])
+        if source is None or tracks[source][1] is None:
+            continue
+        tracks.append((name, tracks[source][1], None))
+        retargeted.append(f"{name} <- SO_{name[3:]}（新增）")
+    if verbose and retargeted:
+        print(f"  骨骼重定向 {len(retargeted)} 条：" + "，".join(retargeted))
+
     step = max(1, step)
     frames = list(range(0, sequence.num_frames, step))
     if frames[-1] != sequence.num_frames - 1:

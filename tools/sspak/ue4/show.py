@@ -9,8 +9,8 @@ CPU 线性混合蒙皮与渲染。
 
 格式（全部小端）：
 
-    char[4] "LVS3"
-    u32     version = 3
+    char[4] "LVS4"
+    u32     version = 4
 
     --- 时间轴 ---
     f64 camera_tick_fps        // 相机轨的 tick 频率
@@ -80,8 +80,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-SHOW_MAGIC = b"LVS3"
-SHOW_VERSION = 3
+SHOW_MAGIC = b"LVS4"
+SHOW_VERSION = 4
 
 # 混合模式在包里的编号（与 C++ 侧 ShowMaterial::blend_mode 一致）
 BLEND_MODES = {"opaque": 0, "masked": 1, "additive": 2, "translucent": 3, "modulate": 4}
