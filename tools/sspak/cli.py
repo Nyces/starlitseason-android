@@ -1433,62 +1433,6 @@ def _show_animation(store, anim: str, step: int, verbose: bool = True):
         seen.add(name)
         tracks.append((name, rotation, position))
 
-    # 这套 rig 的躯干变形走 AO_* 链，但动画里 AO_Hips / AO_Spine1 / SO_Spine2 都是常量，
-    # 真正在转的是 SO_Spine / SO_Spine1。只按同名应用的话，腿和手臂会动、上半身僵住。
-    # 注意两根骨骼的绑定朝向不同（AO_Spine 与 SO_Spine 的本地旋转差 90°），
-    # 不能直接搬四元数，必须按「世界空间的旋转增量」换算：
-    #   目标本地旋转 = 目标绑定本地 × (源关键帧 × 源绑定本地⁻¹)
-    # 这样在关键帧等于绑定姿势时，目标骨骼正好保持绑定姿势（不会整段歪 90°）。
-    retargeted = []
-    torso = ("AO_Spine", "AO_Spine1", "AO_Spine2", "AO_Hips")
-    by_name = {name: index for index, (name, _, _) in enumerate(tracks)}
-    skeleton_index = {name: index for index, name in enumerate(names)}
-    # 绑定姿势的世界旋转：源/目标骨骼的父骨朝向不同，只有按世界增量换算才不会歪
-    world_bind = [np.eye(3, dtype=np.float64) for _ in names]
-    for bone, parent in enumerate(parents):
-        world_bind[bone] = (world_bind[parent] @ binds[bone]
-                            if 0 <= parent < bone else binds[bone])
-
-    def retarget_rotation(source_keys, source_bone, target_bone):
-        from .ue4.anim import quat_matrix
-
-        source_parent = parents[source_bone]
-        target_parent = parents[target_bone]
-        source_parent_world = (world_bind[source_parent] if source_parent >= 0
-                               else np.eye(3))
-        target_parent_world = (world_bind[target_parent] if target_parent >= 0
-                               else np.eye(3))
-        source_bind_inv = np.linalg.inv(world_bind[source_bone])
-        out = np.zeros((len(source_keys), 3), np.float32)
-        for row, key in enumerate(source_keys):
-            delta = source_parent_world @ quat_matrix(key) @ source_bind_inv
-            matrix = target_parent_world.T @ delta @ world_bind[target_bone]
-            quat = quat_from_matrix(matrix)
-            out[row] = quat[:3]
-        # 相邻键保持同一半球，线性插值才不会穿过零四元数
-        for row in range(1, len(out)):
-            if float(np.dot(out[row], out[row - 1])) < 0.0:
-                out[row] = -out[row]
-        return out
-
-    for index, (name, rotation, position) in enumerate(list(tracks)):
-        if name not in torso or rotation is not None:
-            continue
-        source_name = "SO_" + name[3:]
-        source = by_name.get(source_name)
-        if source is None or tracks[source][1] is None:
-            continue
-        source_bone = skeleton_index.get(source_name)
-        target_bone = skeleton_index.get(name)
-        if source_bone is None or target_bone is None:
-            continue
-        tracks[index] = (name,
-                         retarget_rotation(tracks[source][1], source_bone, target_bone),
-                         position)
-        retargeted.append(f"{name} <- {source_name}")
-    if verbose and retargeted:
-        print(f"  骨骼重定向 {len(retargeted)} 条：" + "，".join(retargeted))
-
     step = max(1, step)
     frames = list(range(0, sequence.num_frames, step))
     if frames[-1] != sequence.num_frames - 1:
