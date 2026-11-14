@@ -86,8 +86,8 @@ jobs:
           $script = @'
           import struct
           f = open("smoke.lvs", "wb")
-          f.write(b"LVS4")
-          f.write(struct.pack("<I", 4))
+          f.write(b"LVS5")
+          f.write(struct.pack("<I", 5))
           f.write(struct.pack("<ddd", 24000.0, 60.0, 1.0))
           f.write(struct.pack("<3f", 0.0, 0.0, 0.0))
           f.write(struct.pack("<I", 2))

@@ -17,8 +17,8 @@ namespace {
 static_assert(sizeof(ShowVertex) == 32, "ShowVertex 必须是 32 字节");
 static_assert(sizeof(ShowSkinVertex) == 56, "ShowSkinVertex 必须是 56 字节");
 
-constexpr char kMagic[4] = {'L', 'V', 'S', '4'};
-constexpr uint32_t kVersion = 4;
+constexpr char kMagic[4] = {'L', 'V', 'S', '5'};
+constexpr uint32_t kVersion = 5;
 
 struct Reader {
     const uint8_t* data = nullptr;
