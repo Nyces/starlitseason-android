@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -2786,6 +2787,31 @@ bool ShowGpu::Upload(VkDevice device, VkPhysicalDevice physical, const Show& sho
                 }
             }
         }
+        if (s == 0) {
+            size_t mapped = 0;
+            for (int32_t index : cpu.anim_bone) {
+                if (index >= 0) {
+                    ++mapped;
+                }
+            }
+            LOG_STEP("[render] 角色骨骼映射：%zu 根骨骼，命中动画 %zu 根", bone_count, mapped);
+            // 躯干/手臂是判断「上半身动不动」的关键骨骼，单独报出来
+            const char* watched[] = {"AO_Spine", "AO_Spine2", "SO_Spine", "SO_Spine1",
+                                     "SO_ForeArm_L", "SO_ForeArm_R", "SO_Neck"};
+            for (const char* name : watched) {
+                int32_t index = -1;
+                for (size_t i = 0; i < bone_count; ++i) {
+                    if (skin.bones[i].name == name) {
+                        index = static_cast<int32_t>(i);
+                        break;
+                    }
+                }
+                LOG_STEP("[render]   %s：%s", name,
+                         index < 0 ? "网格里没有" 
+                                   : (cpu.anim_bone[static_cast<size_t>(index)] >= 0 ? "已驱动"
+                                                                                    : "无动画"));
+            }
+        }
 
         std::vector<Affine> locals(bone_count);
         for (size_t i = 0; i < bone_count; ++i) {
@@ -3703,6 +3729,33 @@ int RunShow(const Show& show) {
         std::string shot_error;
         if (!renderer.CaptureFrame(show, 0.0, shot_path, &shot_error)) {
             LogText("[render] 截图失败：" + shot_error);
+        }
+
+        // LIVEVIEW_SHOTS=0,10,20 时额外导出这些时间点的画面，用来逐帧对比姿势
+        char shots[256] = {};
+        if (GetEnvironmentVariableA("LIVEVIEW_SHOTS", shots, sizeof(shots)) > 0) {
+            const std::string list(shots);
+            size_t start = 0;
+            while (start <= list.size()) {
+                const size_t comma = list.find(',', start);
+                const size_t end = comma == std::string::npos ? list.size() : comma;
+                const std::string token = list.substr(start, end - start);
+                if (!token.empty()) {
+                    const double seconds = std::atof(token.c_str());
+                    wchar_t name[64] = {};
+                    std::swprintf(name, 64, L"shot_%05.1fs.bmp", seconds);
+                    std::string extra_error;
+                    if (!renderer.CaptureFrame(show, seconds, shot_dir + name, &extra_error)) {
+                        LogText("[render] 定时截图失败：" + extra_error);
+                    } else {
+                        Logf("[render] 定时截图 %.1fs -> %s", seconds, token.c_str());
+                    }
+                }
+                if (comma == std::string::npos) {
+                    break;
+                }
+                start = comma + 1;
+            }
         }
     }
 
