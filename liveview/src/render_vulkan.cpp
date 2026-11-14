@@ -2557,6 +2557,68 @@ void ComputeGlobals(const ShowSkin& skin, const SkinCpu& cpu,
     }
 }
 
+// ---- 角色根骨骼诊断 ----
+// 角色会不会在舞台上移动，唯一的数据来源就是动画里的根骨骼（AO_Position）平移。
+// 这里把它换算成世界坐标，供日志和窗口标题显示：数值不变就是数据里没有位移，
+// 而不是渲染没应用。
+
+struct RootProbe {
+    int32_t bone = -1;
+    std::vector<int32_t> anim_bone;   // 骨骼 -> 动画轨道
+};
+
+RootProbe MakeRootProbe(const Show& show) {
+    RootProbe probe;
+    if (show.skins.empty()) {
+        return probe;
+    }
+    const ShowSkin& skin = show.skins[0];
+    for (size_t i = 0; i < skin.bones.size(); ++i) {
+        if (skin.bones[i].name == "AO_Position") {
+            probe.bone = static_cast<int32_t>(i);
+            break;
+        }
+    }
+    if (probe.bone < 0) {
+        for (size_t i = 0; i < skin.bones.size(); ++i) {
+            if (skin.bones[i].name == "Root") {
+                probe.bone = static_cast<int32_t>(i);
+                break;
+            }
+        }
+    }
+    if (probe.bone < 0) {
+        return probe;
+    }
+    probe.anim_bone.assign(skin.bones.size(), -1);
+    for (size_t i = 0; i < skin.bones.size(); ++i) {
+        for (size_t a = 0; a < show.anim_bones.size(); ++a) {
+            if (show.anim_bones[a] == skin.bones[i].name) {
+                probe.anim_bone[i] = static_cast<int32_t>(a);
+                break;
+            }
+        }
+    }
+    return probe;
+}
+
+bool CharacterRootWorld(const Show& show, const RootProbe& probe, double seconds, float out[3]) {
+    if (probe.bone < 0 || show.skins.empty()) {
+        return false;
+    }
+    const ShowSkin& skin = show.skins[0];
+    SkinCpu cpu;
+    cpu.anim_bone = probe.anim_bone;
+    const std::vector<ShowBonePose> pose = show.SamplePose(seconds);
+    std::vector<Affine> globals;
+    ComputeGlobals(skin, cpu, pose, &globals);
+    const Affine& model = globals[static_cast<size_t>(probe.bone)];
+    for (int i = 0; i < 3; ++i) {
+        out[i] = model.t[i] + show.character_offset[i];
+    }
+    return true;
+}
+
 // 材质决定这一段走哪个 pass：描边壳单独一遍（正面剔除），混合材质放在最后。
 int32_t DrawPass(const Show& show, int32_t material) {
     if (material < 0 || static_cast<size_t>(material) >= show.materials.size()) {
@@ -3552,6 +3614,46 @@ int RunShow(const Show& show) {
              duration, show.camera_keys.size(), show.anim_bones.size(), show.poses.size(),
              show.StageTriangleCount(), show.SkinTriangleCount());
 
+    // 先扫一遍整场的根骨骼世界坐标范围：这行是"角色到底会不会动"的直接证据
+    const RootProbe root_probe = MakeRootProbe(show);
+    const int32_t root_bone = root_probe.bone;
+    {
+        float low[3] = {0.0f, 0.0f, 0.0f};
+        float high[3] = {0.0f, 0.0f, 0.0f};
+        bool found = false;
+        for (double t = 0.0; t <= duration; t += 0.5) {
+            float value[3];
+            if (!CharacterRootWorld(show, root_probe, t, value)) {
+                break;
+            }
+            if (!found) {
+                for (int i = 0; i < 3; ++i) {
+                    low[i] = high[i] = value[i];
+                }
+                found = true;
+            } else {
+                for (int i = 0; i < 3; ++i) {
+                    low[i] = std::min(low[i], value[i]);
+                    high[i] = std::max(high[i], value[i]);
+                }
+            }
+        }
+        if (found) {
+            const float dx = high[0] - low[0];
+            const float dy = high[1] - low[1];
+            const float dz = high[2] - low[2];
+            Logf("[render] 角色根骨骼 %s：x %.1f..%.1f  y %.1f..%.1f  z %.1f..%.1f，"
+                 "最大位移 %.1f（%.2f 米）",
+                 root_bone >= 0 ? show.skins[0].bones[static_cast<size_t>(root_bone)].name.c_str()
+                                : "无",
+                 low[0], high[0], low[1], high[1], low[2], high[2],
+                 std::sqrt(dx * dx + dy * dy + dz * dz),
+                 std::sqrt(dx * dx + dy * dy + dz * dz) / 100.0f);
+        } else {
+            LogText("[render] 角色根骨骼：未找到 AO_Position/Root，无法统计位移");
+        }
+    }
+
     std::string error;
     STEP("RunShow: 创建窗口");
     if (!CreateRenderWindow(&error)) {
@@ -3664,6 +3766,11 @@ int RunShow(const Show& show) {
                 frames_since_log > 0 ? (elapsed - last_frame_log) * 1000.0 / frames_since_log : 0.0;
             Logf("[render] 已渲染 %.2fs / %.1fs（第 %lld 帧，平均 %.0f ms/帧）", seconds,
                  duration, static_cast<long long>(frame_logs), average_ms);
+            float root[3];
+            if (CharacterRootWorld(show, root_probe, seconds, root)) {
+                Logf("[render] 角色根骨骼世界坐标 (%.1f, %.1f, %.1f)", root[0], root[1],
+                     root[2]);
+            }
             ++frame_logs;
             last_frame_log = elapsed;
             frames_since_log = 0;
@@ -3671,9 +3778,16 @@ int RunShow(const Show& show) {
 
         if (elapsed - title_time >= 0.25) {
             title_time = elapsed;
-            char title[160];
-            std::snprintf(title, sizeof(title), "liveview show  %.1f / %.1f s", seconds,
-                          duration);
+            char title[200];
+            float root[3];
+            if (CharacterRootWorld(show, root_probe, seconds, root)) {
+                std::snprintf(title, sizeof(title),
+                              "liveview show  %.1f / %.1f s   根骨骼 (%.0f, %.0f, %.0f)",
+                              seconds, duration, root[0], root[1], root[2]);
+            } else {
+                std::snprintf(title, sizeof(title), "liveview show  %.1f / %.1f s", seconds,
+                              duration);
+            }
             SetWindowTextA(g_window, title);
         }
     }
