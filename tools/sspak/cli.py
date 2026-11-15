@@ -1399,6 +1399,109 @@ def _show_skin_meshes(store, chr_id: str, library: ShowMaterialLibrary,
     return meshes
 
 
+def _ground_feet(animation, skin, floor_z: float = 0.0, verbose: bool = True):
+    """把最低的那只脚压回地面：逐帧给根骨骼叠加竖直位移。
+
+    这段舞蹈的动画只带关节角度（AO_Hips 全程只有 1 个键，AO_Spine 位移不到
+    2 cm），腿一抬整个人就悬空；游戏是运行时靠骨盆/脚部解算把脚贴回地面。
+    这里在导出时补一次：算出每帧两只脚里最低的高度，把差值加到 AO_Position
+    的平移上，角色就会真正踩在舞台上。
+    """
+    import numpy as np
+
+    names = [bone[0] for bone in skin.bones]
+    parents = [bone[1] for bone in skin.bones]
+    if not names or "AO_Position" not in names:
+        return 0
+    feet = [name for name in ("SO_Foot_L", "SO_Foot_R", "SO_Toe_L", "SO_Toe_R")
+            if name in names]
+    if not feet:
+        return 0
+    column = {name: index for index, name in enumerate(animation.bone_names)}
+    root_column = column.get("AO_Position")
+    if root_column is None:
+        return 0
+    if np.isnan(animation.translations[:, root_column, 2]).all():
+        return 0
+    # 个别帧没有根位移时按 0 处理，否则加起来会变成 NaN
+    animation.translations[:, root_column, :] = np.nan_to_num(
+        animation.translations[:, root_column, :], nan=0.0)
+
+    # 每条腿从根到脚的骨链，避免每帧遍历全部骨骼
+    chains = []
+    for name in feet:
+        chain = []
+        at = names.index(name)
+        while at >= 0:
+            chain.append(at)
+            at = parents[at]
+        chains.append(list(reversed(chain)))
+
+    def quat_matrix(quat):
+        x, y, z, w = (float(v) for v in quat)
+        return np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ], dtype=np.float64)
+
+    def local(index, row):
+        """该骨骼这一帧的局部旋转与平移（没有动画就用绑定姿势）。"""
+        name = names[index]
+        bind = skin.bind_pose[index]
+        quat = bind[:4]
+        translation = bind[4:7].astype(np.float64)
+        scale = bind[7:10].astype(np.float64)
+        at = column.get(name)
+        if at is not None and row >= 0:
+            if animation.has_rotation[row, at]:
+                quat = animation.quats[row, at]
+            sampled = animation.translations[row, at]
+            if not np.isnan(sampled).all():
+                translation = sampled.astype(np.float64)
+        return quat_matrix(quat) * scale, translation
+
+    def chain_z(chain, row):
+        """沿骨链累乘，返回该骨骼的世界高度。"""
+        rotation = np.eye(3)
+        position = np.zeros(3)
+        for index in chain:
+            rot, trans = local(index, row)
+            position = rotation @ trans + position
+            rotation = rotation @ rot
+        return float(position[2])
+
+    def lowest(row):
+        return min(chain_z(chain, row) for chain in chains)
+
+    floor_bind = lowest(-1)
+    shifts = np.zeros(len(animation.frames), dtype=np.float64)
+    for row in range(len(animation.frames)):
+        shifts[row] = (floor_z if floor_z is not None else floor_bind) - lowest(row)
+    # 1 毫米以下的抖动忽略，避免无意义的抖动
+    shifts[np.abs(shifts) < 0.1] = 0.0
+
+    # AO_Position 的平移写在父骨骼（Root）空间里，而 UE 的 Root 骨骼朝向不是世界轴，
+    # 直接把竖直位移加在 z 上会被 Root 的旋转摊成水平偏移，所以先转到 Root 空间。
+    ancestor_rotation = np.eye(3)
+    chain: list[int] = []
+    at = parents[names.index("AO_Position")]
+    while at >= 0:
+        chain.append(at)
+        at = parents[at]
+    for index in reversed(chain):
+        bind = skin.bind_pose[index]
+        ancestor_rotation = ancestor_rotation @ (quat_matrix(bind[:4]) * bind[7:10])
+    vertical = np.linalg.pinv(ancestor_rotation) @ np.array([0.0, 0.0, 1.0])
+    animation.translations[:, root_column, :] += (shifts[:, None] * vertical).astype(
+        np.float32)
+    if verbose:
+        print(f"  贴地补偿：{len(shifts)} 帧，竖直位移 "
+              f"{shifts.min():+.1f}..{shifts.max():+.1f} cm；"
+              f"绑定姿势下双脚最低 {floor_bind:.1f} cm")
+    return int(np.count_nonzero(shifts))
+
+
 def _show_animation(store, anim: str, step: int, verbose: bool = True):
     """逐帧采样动画，返回 (Animation, 原始总帧数, 帧率)。"""
     import numpy as np
@@ -1523,6 +1626,11 @@ def cmd_live_show(args) -> int:
         stages = _show_stage_meshes(store, args.map, library)
         body_mesh = None if args.body.lower() == "priv" else args.body
         skins = _show_skin_meshes(store, args.chr, library, body_mesh)
+        # 动画只带关节角度，腿一抬整个人会飘起来；导出时按"最低的脚贴地"补根位移
+        if not args.no_ground and skins:
+            body = next((mesh for mesh in skins
+                         if any(name == "SO_Foot_L" for name, _parent in mesh.bones)), skins[0])
+            _ground_feet(animation, body, floor_z=float(args.character_z))
 
         # 角色落位：优先用角色跟拍相机的瞄准点（= 角色在舞台上的位置），
         # 没有该绑定时退回播放相机的首个瞄准点。脚底贴到主地面（实测 z≈0.1）。
@@ -1847,6 +1955,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.add_argument("--camera-fps", type=float, default=30.0, help="相机采样帧率")
     p_show.add_argument("--character-z", type=float, default=0.0,
                         help="角色脚底的世界 Z（舞台主地面）")
+    p_show.add_argument("--no-ground", action="store_true",
+                        help="不做\"最低的脚贴地\"补偿，保留动画原始根位移")
     p_show.set_defaults(func=cmd_live_show)
 
     return parser
