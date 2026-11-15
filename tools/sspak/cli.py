@@ -1322,16 +1322,22 @@ def _show_stage_meshes(store, map_path: str, library: ShowMaterialLibrary,
 
 
 def _show_skin_meshes(store, chr_id: str, library: ShowMaterialLibrary,
-                      verbose: bool = True):
-    """把角色的身体/脸/头发/饰品导成蒙皮网格（头发与饰品跟随 SO_Head）。"""
+                      body_mesh: str | None = None, verbose: bool = True):
+    """把角色的身体/脸/头发/饰品导成蒙皮网格（头发与饰品跟随 SO_Head）。
+
+    body_mesh 为空时用角色默认的私服身体；给出资源路径则换成那套服装的网格
+    （服装是按部件/款式存的完整身体网格，例如 cos003 的 a 款）。
+    """
     import numpy as np
 
     from .ue4.show import MeshSection, SkinMesh
     from .ue4.skeletalmesh import parse_skeletal_mesh
     from .render import _smooth_normals
 
+    body_asset = body_mesh or (
+        f"Model/Character/Body/Priv/chr_body_priv001_{chr_id}/Mesh/SK_chr_body_priv001_{chr_id}_a")
     candidates = [
-        f"Model/Character/Body/Priv/chr_body_priv001_{chr_id}/Mesh/SK_chr_body_priv001_{chr_id}_a",
+        body_asset,
         f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_face",
         f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_hair",
         f"Model/Character/Chr/{chr_id}/Mesh/SK_chr_{chr_id}_orna",
@@ -1515,7 +1521,8 @@ def cmd_live_show(args) -> int:
             args.character_binding)
         library = ShowMaterialLibrary(store)
         stages = _show_stage_meshes(store, args.map, library)
-        skins = _show_skin_meshes(store, args.chr, library)
+        body_mesh = None if args.body.lower() == "priv" else args.body
+        skins = _show_skin_meshes(store, args.chr, library, body_mesh)
 
         # 角色落位：优先用角色跟拍相机的瞄准点（= 角色在舞台上的位置），
         # 没有该绑定时退回播放相机的首个瞄准点。脚底贴到主地面（实测 z≈0.1）。
@@ -1822,6 +1829,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_show = sub.add_parser("live-show", help="导出 liveview 直接播放的演出包（相机+舞台+角色）")
     p_show.add_argument("--out", required=True, help="输出演出包路径（*.lvs）")
     p_show.add_argument("--chr", default="chr0101", help="角色 ID")
+    p_show.add_argument(
+        "--body",
+        default="Model/Character/Body/Cos/chr_body_cos003/Mesh/SK_chr_body_cos003_a_01",
+        help="身体网格资源路径（不含扩展名）；传 priv 用角色默认私服身体")
     p_show.add_argument("--anim", default="Animation/Character/Live/Sng001/A_sng001_D_Pos01",
                         help="舞蹈动画资源路径（不含扩展名）")
     p_show.add_argument("--map", default="Maps/Game/Stage/LEVEL_Stg111_Map",
