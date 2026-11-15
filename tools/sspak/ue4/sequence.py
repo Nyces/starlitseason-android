@@ -48,6 +48,7 @@ class Track:
     export_index: int
     class_name: str
     sections: list[Section] = field(default_factory=list)
+    property_name: str = ""      # 轨道驱动的属性名（例如相机轨里的 FreeLocationX）
 
 
 @dataclass
@@ -197,6 +198,13 @@ def _track(pkg: Package, export_index: int) -> Track:
     data = pkg.export_bytes(export)
     props, _ = parse_properties(data, pkg.names)
     track = Track(export_index=export_index, class_name=export.class_name)
+    for prop in props:
+        if prop.name == "PropertyName":
+            index = struct.unpack_from("<i", data, prop.offset)[0]
+            if 0 <= index < len(pkg.names):
+                track.property_name = pkg.names[index]
+        elif prop.name == "PropertyPath" and not track.property_name:
+            track.property_name = _text(pkg, data, prop)
     for prop in props:
         if prop.name != "Sections" or prop.type != "ArrayProperty":
             continue
