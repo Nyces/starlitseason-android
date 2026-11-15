@@ -1399,6 +1399,18 @@ def _show_skin_meshes(store, chr_id: str, library: ShowMaterialLibrary,
     return meshes
 
 
+def _quat_matrix(quat):
+    """四元数 (x, y, z, w) 转 3×3 旋转矩阵，与 C++ 侧 QuatToMatrix 一致。"""
+    import numpy as np
+
+    x, y, z, w = (float(v) for v in quat)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ], dtype=np.float64)
+
+
 def _ground_feet(animation, skin, floor_z: float = 0.0, verbose: bool = True):
     """把最低的那只脚压回地面：逐帧给根骨骼叠加竖直位移。
 
@@ -1437,14 +1449,6 @@ def _ground_feet(animation, skin, floor_z: float = 0.0, verbose: bool = True):
             at = parents[at]
         chains.append(list(reversed(chain)))
 
-    def quat_matrix(quat):
-        x, y, z, w = (float(v) for v in quat)
-        return np.array([
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ], dtype=np.float64)
-
     def local(index, row):
         """该骨骼这一帧的局部旋转与平移（没有动画就用绑定姿势）。"""
         name = names[index]
@@ -1459,7 +1463,7 @@ def _ground_feet(animation, skin, floor_z: float = 0.0, verbose: bool = True):
             sampled = animation.translations[row, at]
             if not np.isnan(sampled).all():
                 translation = sampled.astype(np.float64)
-        return quat_matrix(quat) * scale, translation
+        return _quat_matrix(quat) * scale, translation
 
     def chain_z(chain, row):
         """沿骨链累乘，返回该骨骼的世界高度。"""
@@ -1491,7 +1495,7 @@ def _ground_feet(animation, skin, floor_z: float = 0.0, verbose: bool = True):
         at = parents[at]
     for index in reversed(chain):
         bind = skin.bind_pose[index]
-        ancestor_rotation = ancestor_rotation @ (quat_matrix(bind[:4]) * bind[7:10])
+        ancestor_rotation = ancestor_rotation @ (_quat_matrix(bind[:4]) * bind[7:10])
     vertical = np.linalg.pinv(ancestor_rotation) @ np.array([0.0, 0.0, 1.0])
     animation.translations[:, root_column, :] += (shifts[:, None] * vertical).astype(
         np.float32)
@@ -1500,6 +1504,34 @@ def _ground_feet(animation, skin, floor_z: float = 0.0, verbose: bool = True):
               f"{shifts.min():+.1f}..{shifts.max():+.1f} cm；"
               f"绑定姿势下双脚最低 {floor_bind:.1f} cm")
     return int(np.count_nonzero(shifts))
+
+
+def _root_offset_track(animation, skin):
+    """逐帧算出根骨骼的世界位移（相对第一帧），供自动机位跟拍角色用。"""
+    import numpy as np
+
+    names = [bone[0] for bone in skin.bones]
+    parents = [bone[1] for bone in skin.bones]
+    if "AO_Position" not in names:
+        return None
+    column = {name: index for index, name in enumerate(animation.bone_names)}
+    root_column = column.get("AO_Position")
+    if root_column is None:
+        return None
+    local = np.nan_to_num(animation.translations[:, root_column, :],
+                          nan=0.0).astype(np.float64)
+    # 根骨骼空间 -> 世界：沿父链累乘绑定旋转
+    rotation = np.eye(3)
+    chain: list[int] = []
+    at = names.index("AO_Position")
+    while at >= 0:
+        chain.append(at)
+        at = parents[at]
+    for index in reversed(chain):
+        bind = skin.bind_pose[index]
+        rotation = rotation @ (_quat_matrix(bind[:4]) * bind[7:10])
+    world = local @ rotation.T
+    return world - world[0]
 
 
 def _show_animation(store, anim: str, step: int, verbose: bool = True):
@@ -1571,22 +1603,23 @@ def _show_animation(store, anim: str, step: int, verbose: bool = True):
 
 
 def _show_camera_keys(store, sequence_asset: str, binding_name: str,
-                      duration: float, fps: float, character_binding: str = ""):
-    """按固定帧率采样相机轨，并顺带取角色站位（角色相机的瞄准点）。"""
+                      duration: float, fps: float, character_binding: str = "",
+                      cut_seconds: float = 0.0, track=None):
+    """按固定帧率采样相机轨，并顺带取角色站位（角色相机的瞄准点）。
+
+    binding_name 传 auto 时走"合成自动机位"：游戏的 AUTO CAM 是运行时导演蓝图
+    在多个机位之间硬切，切点和机位选择都不在资产里（CamCharaA 的轨里还有大量
+    拉到十几米外的运镜），所以这里按角色站位合成一组固定机位，按时长硬切，
+    保证画面始终框住角色，观感接近原版的中近景轮换。
+    """
     from .ue4.sequence import camera_pose, parse_level_sequence
 
     package = store.package(sequence_asset)
     if package is None:
         raise SystemExit(f"未找到序列: {sequence_asset}")
     info = parse_level_sequence(package)
-    binding = next((b for b in info.bindings if b.name == binding_name), None)
-    if binding is None:
-        binding = next((b for b in info.bindings
-                        if any(t.class_name == "LiveCameraMovementTrack" for t in b.tracks)),
-                       info.bindings[0] if info.bindings else None)
-    if binding is None:
-        raise SystemExit(f"序列里没有相机绑定: {sequence_asset}")
     tick_fps = info.tick_fps or info.display_fps or 1.0
+    auto = binding_name.lower() == "auto"
 
     # 角色站位：角色跟拍相机（CamCharaA）的环绕中心就是该角色在舞台上的位置
     character_target = None
@@ -1597,15 +1630,72 @@ def _show_camera_keys(store, sequence_asset: str, binding_name: str,
             if pose is not None:
                 character_target = pose.target
 
-    keys = []
     count = max(1, int(round(duration * fps)) + 1)
+    if auto and character_target is not None:
+        keys = _auto_camera_keys(character_target, duration, fps, tick_fps,
+                                 cut_seconds, track)
+        return keys, tick_fps, "AUTO(合成机位)", character_target
+
+    binding = next((b for b in info.bindings if b.name == binding_name), None)
+    if binding is None:
+        binding = next(
+            (b for b in info.bindings
+             if any(t.class_name == "LiveCameraMovementTrack" for t in b.tracks)),
+            info.bindings[0] if info.bindings else None)
+    if binding is None:
+        raise SystemExit(f"序列里没有相机绑定: {sequence_asset}")
+    label = binding.name
+
+    keys = []
     for i in range(count):
         frame = (i / fps) * tick_fps
         pose = camera_pose(binding, frame)
         if pose is None:
             continue
         keys.append((int(round(frame)), pose.position, pose.target))
-    return keys, tick_fps, binding.name, character_target
+    return keys, tick_fps, label, character_target
+
+
+# 合成机位：相对角色胸口（CamCharaA 的瞄准点）的相机位置、瞄准偏移与镜头说明
+AUTO_SHOTS = [
+    ((0.0, 520.0, 55.0), (0.0, 0.0, 15.0), "中景正面"),
+    ((150.0, 330.0, 65.0), (0.0, 0.0, 35.0), "半身偏侧"),
+    ((25.0, 165.0, 85.0), (0.0, 0.0, 60.0), "近景正面"),
+    ((300.0, 300.0, 45.0), (0.0, 0.0, 15.0), "侧面中景"),
+    ((80.0, 760.0, 130.0), (0.0, 0.0, 0.0), "全景"),
+]
+
+
+def _auto_camera_keys(anchor, duration: float, fps: float, tick_fps: float,
+                      cut_seconds: float, track=None):
+    """按角色站位合成一组机位，每 cut_seconds 秒硬切一次。
+
+    track 是逐帧的角色根位移（相对第一帧），给了就跟着角色走，避免她走位后跑出画。
+    """
+    span = cut_seconds if cut_seconds > 0.0 else 4.0
+    count = max(1, int(round(duration * fps)) + 1)
+    keys = []
+    previous = -1
+    rows = 0 if track is None else len(track)
+    for i in range(count):
+        seconds = i / fps
+        shot = int(seconds // span) % len(AUTO_SHOTS)
+        offset, aim, _name = AUTO_SHOTS[shot]
+        shift = (0.0, 0.0, 0.0)
+        if rows > 1:
+            row = min(rows - 1, int(round(seconds / duration * (rows - 1))))
+            shift = (float(track[row][0]), float(track[row][1]), float(track[row][2]))
+        eye = (anchor[0] + offset[0] + shift[0], anchor[1] + offset[1] + shift[1],
+               anchor[2] + offset[2] + shift[2])
+        target = (anchor[0] + aim[0] + shift[0], anchor[1] + aim[1] + shift[1],
+                  anchor[2] + aim[2] + shift[2])
+        frame = int(round(seconds * tick_fps))
+        if shot != previous and keys:
+            # 切镜：上一帧重复旧机位，下一帧直接换新机位，避免插值成运镜
+            keys.append((frame - 1, keys[-1][1], keys[-1][2]))
+        keys.append((frame, eye, target))
+        previous = shot
+    return keys
 
 
 def cmd_live_show(args) -> int:
@@ -1619,17 +1709,20 @@ def cmd_live_show(args) -> int:
         anim_fps = float(args.anim_fps)
         animation, num_frames = _show_animation(store, args.anim, args.anim_step)
         duration = max(0.0, (num_frames - 1) / anim_fps)
-        camera_keys, tick_fps, binding_name, character_target = _show_camera_keys(
-            store, args.sequence, args.binding, duration, args.camera_fps,
-            args.character_binding)
         library = ShowMaterialLibrary(store)
         stages = _show_stage_meshes(store, args.map, library)
         body_mesh = None if args.body.lower() == "priv" else args.body
         skins = _show_skin_meshes(store, args.chr, library, body_mesh)
+        body = next((mesh for mesh in skins
+                     if any(name == "SO_Foot_L" for name, _parent in mesh.bones)),
+                    skins[0] if skins else None)
+        # 自动机位要跟着角色走：用贴地之前的根位移算水平轨迹（避免镜头跟着上下颠）
+        track = _root_offset_track(animation, body) if body is not None else None
+        camera_keys, tick_fps, binding_name, character_target = _show_camera_keys(
+            store, args.sequence, args.binding, duration, args.camera_fps,
+            args.character_binding, args.camera_cut, track)
         # 动画只带关节角度，腿一抬整个人会飘起来；导出时按"最低的脚贴地"补根位移
-        if not args.no_ground and skins:
-            body = next((mesh for mesh in skins
-                         if any(name == "SO_Foot_L" for name, _parent in mesh.bones)), skins[0])
+        if not args.no_ground and body is not None:
             _ground_feet(animation, body, floor_z=float(args.character_z))
 
         # 角色落位：优先用角色跟拍相机的瞄准点（= 角色在舞台上的位置），
@@ -1719,7 +1812,9 @@ def cmd_sequence(args) -> int:
                 spans = ", ".join(
                     f"{'∞' if s.start is None else s.start}..{'∞' if s.end is None else s.end}"
                     for s in track.sections) or "无"
-                print(f"      {track.class_name} 区段 {len(track.sections)} {spans}")
+                label = f"{track.class_name}（{track.property_name}）" \
+                    if track.property_name else track.class_name
+                print(f"      {label} 区段 {len(track.sections)} {spans}")
                 for section in track.sections:
                     keys = sum(len(v) for v in section.channels.values())
                     named = ", ".join(f"{k}({len(v)})"
@@ -1947,7 +2042,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="舞台地图资源路径（不含扩展名）")
     p_show.add_argument("--sequence", default="Sequence/Live/Sng001/LS_Sng001_Common_Camera",
                         help="相机 LevelSequence 资源路径（不含扩展名）")
-    p_show.add_argument("--binding", default="CamAllA", help="相机绑定名")
+    p_show.add_argument("--binding", default="auto",
+                        help="相机绑定名；auto = 在角色跟拍机位之间自动切镜")
+    p_show.add_argument("--camera-cut", type=float, default=4.0,
+                        help="auto 模式的切镜间隔（秒）；0 表示不切")
     p_show.add_argument("--character-binding", default="CamCharaA",
                         help="角色跟拍相机绑定名（用它的瞄准点作为角色站位）")
     p_show.add_argument("--anim-fps", type=float, default=60.0, help="动画原始帧率")
