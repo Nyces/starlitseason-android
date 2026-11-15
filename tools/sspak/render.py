@@ -309,9 +309,12 @@ def _look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
     forward = target - eye
     forward = forward / np.linalg.norm(forward)
     up = up / np.linalg.norm(up)
-    right = np.cross(forward, up)
+    # UE 资产是左手坐标系（X 前 / Y 右 / Z 上），而这里的投影按右手系算。
+    # 直接拿 cross(forward, up) 当屏幕右方向会把整个场景左右镜像（胸前印花、
+    # 舞台文字全反，角色左右手脚也会互换），所以这里把右方向取反一次。
+    right = -np.cross(forward, up)
     right = right / np.linalg.norm(right)
-    true_up = np.cross(right, forward)
+    true_up = -np.cross(right, forward)
     m = np.eye(4, dtype=np.float32)
     m[0, :3] = right
     m[1, :3] = true_up
@@ -400,7 +403,7 @@ def _upload_texture(ctx, array: np.ndarray):
 
 def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
                  eye: np.ndarray | None = None, target: np.ndarray | None = None,
-                 exposure: float = 1.0, fov: float = 45.0,
+                 exposure: float = 1.0, fov: float = 45.0, aspect: float = 1.0,
                  tint: tuple[float, float, float] = (0.78, 0.76, 0.72),
                  # 默认主光来自前上方：正上方打光时 ToonBaseFace 的 dot(N,L) 分界线
                  # 正好横落在鼻梁和两颊上，渲出一条横贯脸的色带。
@@ -428,10 +431,15 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
     target = np.asarray(target, dtype=np.float32)
 
     ctx = moderngl.create_standalone_context(require=330)
+    # 画幅由 size 与 aspect 决定：size 是长边，短边按比例缩
+    width = int(size)
+    height = max(1, int(round(size / max(aspect, 1e-6)))) if aspect >= 1.0 else int(size)
+    if aspect < 1.0:
+        width = max(1, int(round(size * aspect)))
     # 主场景渲到 HDR，曝光/泛光/编码在最后一步做
-    scene_texture = ctx.texture((size, size), 4, dtype="f2")
+    scene_texture = ctx.texture((width, height), 4, dtype="f2")
     scene_texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
-    scene_depth = ctx.depth_texture((size, size))
+    scene_depth = ctx.depth_texture((width, height))
     fbo = ctx.framebuffer(color_attachments=[scene_texture], depth_attachment=scene_depth)
     fbo.use()
     ctx.clear(0.01, 0.012, 0.016, 1.0)
@@ -441,7 +449,8 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
     outline_program = ctx.program(vertex_shader=OUTLINE_VERTEX_SHADER,
                                   fragment_shader=OUTLINE_FRAGMENT_SHADER)
     view = _look_at(eye, target, np.array([0.0, 0.0, 1.0], dtype=np.float32))
-    view_proj = _perspective(fov, 1.0, max(radius * 0.002, 0.05), radius * 30 + 100) @ view
+    view_proj = _perspective(fov, width / float(height), max(radius * 0.002, 0.05),
+                             radius * 30 + 100) @ view
     _set(program, "tint", tint)
     _set(program, "exposure", float(exposure))
     _set(program, "eye", tuple(float(v) for v in eye))
@@ -620,7 +629,7 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
         ctx.disable(moderngl.BLEND)
 
     # 后处理：亮部提取 -> 两趟高斯 -> 合成（曝光 + sRGB）
-    screen = ctx.simple_framebuffer((size, size))
+    screen = ctx.simple_framebuffer((width, height))
     screen.use()
     ctx.disable(moderngl.DEPTH_TEST)
     quad_positions = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype="f4")
@@ -632,9 +641,10 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
     bloom_texture = ctx.texture((1, 1), 4, bytes((0, 0, 0, 0)))
 
     if bloom:
-        half = max(size // 2, 1)
-        bright = ctx.texture((half, half), 4, dtype="f2")
-        temp = ctx.texture((half, half), 4, dtype="f2")
+        half_w = max(width // 2, 1)
+        half_h = max(height // 2, 1)
+        bright = ctx.texture((half_w, half_h), 4, dtype="f2")
+        temp = ctx.texture((half_w, half_h), 4, dtype="f2")
         for target_tex in (bright, temp):
             target_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
             target_tex.repeat_x = target_tex.repeat_y = False
@@ -652,7 +662,7 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
         blur_program = ctx.program(vertex_shader=POST_VERTEX_SHADER,
                                    fragment_shader=BLUR_FRAGMENT_SHADER)
         blur_vao = ctx.vertex_array(blur_program, [(quad_buffer, "2f", "in_pos")])
-        passes = (((1.0 / half, 0.0), bright, temp), ((0.0, 1.0 / half), temp, bright))
+        passes = (((1.0 / half_w, 0.0), bright, temp), ((0.0, 1.0 / half_h), temp, bright))
         for direction, source, destination in passes:
             target_fbo = ctx.framebuffer([destination])
             target_fbo.use()
@@ -666,8 +676,8 @@ def render_scene(items: list[SceneItem], out_path: str, size: int = 1024,
     # 深度差近似的环境光遮蔽：让角色与地面、舞台构件之间压出暗部
     ao_texture = ctx.texture((1, 1), 1, bytes((255,)))
     if ao:
-        ao_size = max(size // 2, 1)
-        ao_texture = ctx.texture((ao_size, ao_size), 1, dtype="f1")
+        ao_size = (max(width // 2, 1), max(height // 2, 1))
+        ao_texture = ctx.texture(ao_size, 1, dtype="f1")
         ao_texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
         ao_texture.repeat_x = ao_texture.repeat_y = False
         ao_program = ctx.program(vertex_shader=POST_VERTEX_SHADER,

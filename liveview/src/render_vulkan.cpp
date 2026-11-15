@@ -369,6 +369,9 @@ Mat4 LookAtVulkan(const float eye[3], const float target[3]) {
         forward[0] = 1.0f;
     }
     const float up[3] = {0.0f, 0.0f, 1.0f};
+    // UE 资产是左手坐标系（X 前 / Y 右 / Z 上），而这里的投影按右手系算。
+    // 直接用 cross(forward, up) 当屏幕右方向会把整个场景左右镜像（印花与舞台
+    // 文字全反，角色左右手脚互换），所以下面写矩阵时把右方向取反一次。
     float right[3] = {forward[1] * up[2] - forward[2] * up[1],
                       forward[2] * up[0] - forward[0] * up[2],
                       forward[0] * up[1] - forward[1] * up[0]};
@@ -386,10 +389,10 @@ Mat4 LookAtVulkan(const float eye[3], const float target[3]) {
                               right[0] * forward[1] - right[1] * forward[0]};
 
     Mat4 out{};
-    out.m[0] = right[0];
-    out.m[4] = right[1];
-    out.m[8] = right[2];
-    out.m[12] = -(right[0] * eye[0] + right[1] * eye[1] + right[2] * eye[2]);
+    out.m[0] = -right[0];
+    out.m[4] = -right[1];
+    out.m[8] = -right[2];
+    out.m[12] = right[0] * eye[0] + right[1] * eye[1] + right[2] * eye[2];
     out.m[1] = true_up[0];
     out.m[5] = true_up[1];
     out.m[9] = true_up[2];
