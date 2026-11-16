@@ -408,7 +408,7 @@ void OnPlay(AppState* state) {
 #endif
 }
 
-// 演出包格式会随渲染升级变化：头 8 字节不是 LVS3 + 版本 3 就当作旧包。
+// 演出包格式会随渲染升级变化：头 8 字节不是 LVS9 + 版本 9 就当作旧包。
 bool ShowFileIsCurrent(const std::wstring& path) {
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -419,8 +419,8 @@ bool ShowFileIsCurrent(const std::wstring& path) {
     DWORD read = 0;
     const bool ok = ReadFile(file, header, 8, &read, nullptr) != 0 && read == 8;
     CloseHandle(file);
-    return ok && header[0] == 'L' && header[1] == 'V' && header[2] == 'S' && header[3] == '8' &&
-           header[4] == 8 && header[5] == 0 && header[6] == 0 && header[7] == 0;
+    return ok && header[0] == 'L' && header[1] == 'V' && header[2] == 'S' && header[3] == '9' &&
+           header[4] == 9 && header[5] == 0 && header[6] == 0 && header[7] == 0;
 }
 
 void OnPlayShow(AppState* state) {

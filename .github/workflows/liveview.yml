@@ -1,4 +1,4 @@
-name: liveview
+﻿name: liveview
 
 on:
   push:
@@ -86,8 +86,8 @@ jobs:
           $script = @'
           import struct
           f = open("smoke.lvs", "wb")
-          f.write(b"LVS8")
-          f.write(struct.pack("<I", 8))
+          f.write(b"LVS9")
+          f.write(struct.pack("<I", 9))
           f.write(struct.pack("<ddd", 24000.0, 60.0, 1.0))
           f.write(struct.pack("<3f", 0.0, 0.0, 0.0))
           f.write(struct.pack("<I", 2))

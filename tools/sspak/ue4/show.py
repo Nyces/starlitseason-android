@@ -1,4 +1,4 @@
-"""导出 liveview 演出包（二进制小端）。
+﻿"""导出 liveview 演出包（二进制小端）。
 
 包内容：相机轨 + 舞台静态网格 + 角色蒙皮网格 + 骨骼动画采样。
 所有资产解析、蒙皮权重映射与动画语义都留在 Python 侧；C++ 侧只做读取、
@@ -9,7 +9,7 @@ CPU 线性混合蒙皮与渲染。
 
 格式（全部小端）：
 
-    char[4] "LVS8"
+    char[4] "LVS9"
     u32     version = 8
 
     --- 时间轴 ---
@@ -80,8 +80,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-SHOW_MAGIC = b"LVS8"
-SHOW_VERSION = 8
+SHOW_MAGIC = b"LVS9"
+SHOW_VERSION = 9
 
 # 混合模式在包里的编号（与 C++ 侧 ShowMaterial::blend_mode 一致）
 BLEND_MODES = {"opaque": 0, "masked": 1, "additive": 2, "translucent": 3, "modulate": 4}

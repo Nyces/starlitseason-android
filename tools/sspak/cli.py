@@ -1411,6 +1411,26 @@ def _quat_matrix(quat):
     ], dtype=np.float64)
 
 
+def _quat_mul(a, b):
+    """四元数 (x, y, z, w) 相乘，语义等价于先转成矩阵再相乘。"""
+    import numpy as np
+
+    ax, ay, az, aw = (float(v) for v in a)
+    bx, by, bz, bw = (float(v) for v in b)
+    return np.array([
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ], dtype=np.float64)
+
+
+def _quat_conj(quat):
+    """四元数共轭，对应旋转矩阵的转置。"""
+    x, y, z, w = (float(v) for v in quat)
+    return (-x, -y, -z, w)
+
+
 def _ground_feet(animation, skin, floor_z: float = 0.0, verbose: bool = True):
     """把最低的那只脚压回地面：逐帧给根骨骼叠加竖直位移。
 
@@ -1479,11 +1499,12 @@ def _ground_feet(animation, skin, floor_z: float = 0.0, verbose: bool = True):
         return min(chain_z(chain, row) for chain in chains)
 
     floor_bind = lowest(-1)
-    shifts = np.zeros(len(animation.frames), dtype=np.float64)
-    for row in range(len(animation.frames)):
-        shifts[row] = (floor_z if floor_z is not None else floor_bind) - lowest(row)
-    # 1 毫米以下的抖动忽略，避免无意义的抖动
-    shifts[np.abs(shifts) < 0.1] = 0.0
+    raw = np.array([(floor_z if floor_z is not None else floor_bind) - lowest(row)
+                    for row in range(len(animation.frames))], dtype=np.float64)
+    # 逐帧贴地会把抬腿的帧压成深蹲，整个人在 55 cm 范围内上下浮动，看起来像飘在
+    # 空中。改成取中位数的一次性抬升：身体高度稳定，抬腿时脚自然离地。
+    shift = float(np.median(raw))
+    shifts = np.full(len(animation.frames), shift, dtype=np.float64)
 
     # AO_Position 的平移写在父骨骼（Root）空间里，而 UE 的 Root 骨骼朝向不是世界轴，
     # 直接把竖直位移加在 z 上会被 Root 的旋转摊成水平偏移，所以先转到 Root 空间。
@@ -1500,42 +1521,20 @@ def _ground_feet(animation, skin, floor_z: float = 0.0, verbose: bool = True):
     animation.translations[:, root_column, :] += (shifts[:, None] * vertical).astype(
         np.float32)
     if verbose:
-        print(f"  贴地补偿：{len(shifts)} 帧，竖直位移 "
-              f"{shifts.min():+.1f}..{shifts.max():+.1f} cm；"
-              f"绑定姿势下双脚最低 {floor_bind:.1f} cm")
-    return int(np.count_nonzero(shifts))
+        print(f"  贴地补偿：常量抬升 {shift:+.1f} cm"
+              f"（逐帧需求 {raw.min():+.1f}..{raw.max():+.1f} cm，"
+              f"绑定姿势下双脚最低 {floor_bind:.1f} cm）")
+    return int(len(shifts))
 
 
-def _root_offset_track(animation, skin):
-    """逐帧算出根骨骼的世界位移（相对第一帧），供自动机位跟拍角色用。"""
-    import numpy as np
+def _show_animation(store, anim: str, step: int, verbose: bool = True,
+                    fps: float = 60.0, offset_seconds: float = 0.0):
+    """逐帧采样动画，返回 (Animation, 原始总帧数, 帧率)。
 
-    names = [bone[0] for bone in skin.bones]
-    parents = [bone[1] for bone in skin.bones]
-    if "AO_Position" not in names:
-        return None
-    column = {name: index for index, name in enumerate(animation.bone_names)}
-    root_column = column.get("AO_Position")
-    if root_column is None:
-        return None
-    local = np.nan_to_num(animation.translations[:, root_column, :],
-                          nan=0.0).astype(np.float64)
-    # 根骨骼空间 -> 世界：沿父链累乘绑定旋转
-    rotation = np.eye(3)
-    chain: list[int] = []
-    at = names.index("AO_Position")
-    while at >= 0:
-        chain.append(at)
-        at = parents[at]
-    for index in reversed(chain):
-        bind = skin.bind_pose[index]
-        rotation = rotation @ (_quat_matrix(bind[:4]) * bind[7:10])
-    world = local @ rotation.T
-    return world - world[0]
-
-
-def _show_animation(store, anim: str, step: int, verbose: bool = True):
-    """逐帧采样动画，返回 (Animation, 原始总帧数, 帧率)。"""
+    offset_seconds 用来对齐时间轴：这段演出里角色动画比相机序列晚 3 秒进入
+    （相机序列的播放范围从 -3 秒开始），录像第 16 秒的画面与动画第 19 秒的
+    姿态一致就是这个偏移造成的。
+    """
     import numpy as np
 
     from .ue4.anim import _sample_keys, parse_animation, quat_matrix
@@ -1551,9 +1550,10 @@ def _show_animation(store, anim: str, step: int, verbose: bool = True):
 
     names, binds, parents = _master_bones(store)
     facial = _facial_bones(names, parents)
-    tracks: list[tuple[str, np.ndarray | None, np.ndarray | None]] = []
+    # (名字, 旋转键, 位移键, 是否要去基线, 绑定旋转)
+    tracks: list[tuple[str, np.ndarray | None, np.ndarray | None, bool, np.ndarray]] = []
     seen: set[str] = set()
-    space_offsets = 0
+    rebased = 0
     for t, bone in enumerate(sequence.bone_indices):
         bone = int(bone)
         if not 0 <= bone < len(names) or bone in facial:
@@ -1562,29 +1562,39 @@ def _show_animation(store, anim: str, step: int, verbose: bool = True):
         if name in seen:
             continue
         rotation = None
+        normalize = False
         keys = sequence.rotations[t]
         if len(keys) > 1:
-            if _is_space_offset(keys, binds[bone]):
-                space_offsets += 1
-            else:
-                rotation = keys
+            # 肩膀、颈、臀部这些轨带着很大的恒定空间偏移，整条丢掉会让这几段
+            # 冻在绑定姿势（手臂跟肩膀脱开、腰上撕开）。保留曲线、只扣掉偏移。
+            normalize = _is_space_offset(keys, binds[bone])
+            rotation = keys
+            if normalize:
+                rebased += 1
         position = sequence.positions[t] if len(sequence.positions[t]) > 1 else None
         if rotation is None and position is None:
             continue
         seen.add(name)
-        tracks.append((name, rotation, position))
+        tracks.append((name, rotation, position, normalize,
+                       np.asarray(binds[bone], np.float64)))
 
     step = max(1, step)
-    frames = list(range(0, sequence.num_frames, step))
-    if frames[-1] != sequence.num_frames - 1:
-        frames.append(sequence.num_frames - 1)
+    start = 0
+    if offset_seconds > 0.0:
+        start = min(int(round(offset_seconds * fps)),
+                    max(0, sequence.num_frames - 2))
+    source_frames = list(range(start, sequence.num_frames, step))
+    if source_frames[-1] != sequence.num_frames - 1:
+        source_frames.append(sequence.num_frames - 1)
+    # 帧号要重排到 0 起：播放器按 时间 × 帧率 取帧，留着原始帧号等于没偏移
+    frames = [frame - start for frame in source_frames]
 
     quats = np.zeros((len(frames), len(tracks), 4), np.float32)
     quats[:, :, 3] = 1.0
     has_rotation = np.zeros((len(frames), len(tracks)), bool)
     translations = np.full((len(frames), len(tracks), 3), np.nan, np.float32)
-    for row, frame in enumerate(frames):
-        for column, (_, rotation, position) in enumerate(tracks):
+    for row, frame in enumerate(source_frames):
+        for column, (_name, rotation, position, _normalize, _bind) in enumerate(tracks):
             if rotation is not None:
                 quats[row, column] = quat_from_matrix(
                     quat_matrix(_sample_keys(rotation, frame, sequence.num_frames)))
@@ -1592,10 +1602,19 @@ def _show_animation(store, anim: str, step: int, verbose: bool = True):
             if position is not None:
                 translations[row, column] = _sample_keys(
                     position, frame, sequence.num_frames)
+
+    # 去基线：把首帧对齐到绑定姿势，只保留这条轨自身的变化量
+    for column, (_name, rotation, _position, normalize, bind_matrix) in enumerate(tracks):
+        if not normalize or rotation is None:
+            continue
+        delta = _quat_mul(quat_from_matrix(bind_matrix), _quat_conj(quats[0, column]))
+        for row in range(len(frames)):
+            quats[row, column] = _quat_mul(delta, quats[row, column])
+
     if verbose:
         print(f"  动画 {anim.rsplit('/', 1)[-1]}：{len(tracks)} 根骨骼 / "
-              f"{sequence.num_frames} 帧 -> 采样 {len(frames)} 帧 "
-              f"（空间常量 {space_offsets} 轨）")
+              f"{sequence.num_frames} 帧 -> 采样 {len(frames)} 帧"
+              f"（去基线 {rebased} 轨，起始帧 {frames[0]}）")
     animation = Animation(bone_names=[t[0] for t in tracks], frames=frames,
                           quats=quats, has_rotation=has_rotation,
                           translations=translations)
@@ -1604,7 +1623,7 @@ def _show_animation(store, anim: str, step: int, verbose: bool = True):
 
 def _show_camera_keys(store, sequence_asset: str, binding_name: str,
                       duration: float, fps: float, character_binding: str = "",
-                      cut_seconds: float = 0.0, track=None):
+                      cut_seconds: float = 0.0):
     """按固定帧率采样相机轨，并顺带取角色站位（角色相机的瞄准点）。
 
     binding_name 传 auto 时走"合成自动机位"：游戏的 AUTO CAM 是运行时导演蓝图
@@ -1632,8 +1651,7 @@ def _show_camera_keys(store, sequence_asset: str, binding_name: str,
 
     count = max(1, int(round(duration * fps)) + 1)
     if auto and character_target is not None:
-        keys = _auto_camera_keys(character_target, duration, fps, tick_fps,
-                                 cut_seconds, track)
+        keys = _auto_camera_keys(character_target, duration, fps, tick_fps, cut_seconds)
         return keys, tick_fps, "AUTO(合成机位)", character_target
 
     binding = next((b for b in info.bindings if b.name == binding_name), None)
@@ -1667,28 +1685,22 @@ AUTO_SHOTS = [
 
 
 def _auto_camera_keys(anchor, duration: float, fps: float, tick_fps: float,
-                      cut_seconds: float, track=None):
+                      cut_seconds: float):
     """按角色站位合成一组机位，每 cut_seconds 秒硬切一次。
 
-    track 是逐帧的角色根位移（相对第一帧），给了就跟着角色走，避免她走位后跑出画。
+    anchor 是角色在舞台上的固定落位。机位固定在舞台上、不跟拍角色——跟拍会让
+    角色在画面里一动不动，走位就白做了。
     """
     span = cut_seconds if cut_seconds > 0.0 else 4.0
     count = max(1, int(round(duration * fps)) + 1)
     keys = []
     previous = -1
-    rows = 0 if track is None else len(track)
     for i in range(count):
         seconds = i / fps
         shot = int(seconds // span) % len(AUTO_SHOTS)
         offset, aim, _name = AUTO_SHOTS[shot]
-        shift = (0.0, 0.0, 0.0)
-        if rows > 1:
-            row = min(rows - 1, int(round(seconds / duration * (rows - 1))))
-            shift = (float(track[row][0]), float(track[row][1]), float(track[row][2]))
-        eye = (anchor[0] + offset[0] + shift[0], anchor[1] + offset[1] + shift[1],
-               anchor[2] + offset[2] + shift[2])
-        target = (anchor[0] + aim[0] + shift[0], anchor[1] + aim[1] + shift[1],
-                  anchor[2] + aim[2] + shift[2])
+        eye = (anchor[0] + offset[0], anchor[1] + offset[1], anchor[2] + offset[2])
+        target = (anchor[0] + aim[0], anchor[1] + aim[1], anchor[2] + aim[2])
         frame = int(round(seconds * tick_fps))
         if shot != previous and keys:
             # 切镜：上一帧重复旧机位，下一帧直接换新机位，避免插值成运镜
@@ -1707,8 +1719,10 @@ def cmd_live_show(args) -> int:
 
         store = ContentStore(paks)
         anim_fps = float(args.anim_fps)
-        animation, num_frames = _show_animation(store, args.anim, args.anim_step)
-        duration = max(0.0, (num_frames - 1) / anim_fps)
+        animation, _num_frames = _show_animation(
+            store, args.anim, args.anim_step, fps=anim_fps,
+            offset_seconds=float(args.anim_offset))
+        duration = max(0.0, (animation.frames[-1] - animation.frames[0]) / anim_fps)
         library = ShowMaterialLibrary(store)
         stages = _show_stage_meshes(store, args.map, library)
         body_mesh = None if args.body.lower() == "priv" else args.body
@@ -1716,12 +1730,10 @@ def cmd_live_show(args) -> int:
         body = next((mesh for mesh in skins
                      if any(name == "SO_Foot_L" for name, _parent in mesh.bones)),
                     skins[0] if skins else None)
-        # 自动机位要跟着角色走：用贴地之前的根位移算水平轨迹（避免镜头跟着上下颠）
-        track = _root_offset_track(animation, body) if body is not None else None
         camera_keys, tick_fps, binding_name, character_target = _show_camera_keys(
             store, args.sequence, args.binding, duration, args.camera_fps,
-            args.character_binding, args.camera_cut, track)
-        # 动画只带关节角度，腿一抬整个人会飘起来；导出时按"最低的脚贴地"补根位移
+            args.character_binding, args.camera_cut)
+        # 动画只带关节角度，腿一抬整个人会飘起来；导出时补一次常量抬升让脚落到台面
         if not args.no_ground and body is not None:
             _ground_feet(animation, body, floor_z=float(args.character_z))
 
@@ -2050,11 +2062,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="角色跟拍相机绑定名（用它的瞄准点作为角色站位）")
     p_show.add_argument("--anim-fps", type=float, default=60.0, help="动画原始帧率")
     p_show.add_argument("--anim-step", type=int, default=2, help="动画采样步长（2 = 30fps）")
+    p_show.add_argument("--anim-offset", type=float, default=3.0,
+                        help="角色动画相对时间轴的起始偏移（秒）；本曲相机序列从 -3s 起播，"
+                             "角色动画晚 3 秒进入")
     p_show.add_argument("--camera-fps", type=float, default=30.0, help="相机采样帧率")
     p_show.add_argument("--character-z", type=float, default=0.0,
                         help="角色脚底的世界 Z（舞台主地面）")
     p_show.add_argument("--no-ground", action="store_true",
-                        help="不做\"最低的脚贴地\"补偿，保留动画原始根位移")
+                        help="不做贴地补偿，保留动画原始根位移")
     p_show.set_defaults(func=cmd_live_show)
 
     return parser
