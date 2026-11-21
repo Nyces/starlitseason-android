@@ -1531,9 +1531,9 @@ def _show_animation(store, anim: str, step: int, verbose: bool = True,
                     fps: float = 60.0, offset_seconds: float = 0.0):
     """逐帧采样动画，返回 (Animation, 原始总帧数, 帧率)。
 
-    offset_seconds 用来对齐时间轴：这段演出里角色动画比相机序列晚 3 秒进入
-    （相机序列的播放范围从 -3 秒开始），录像第 16 秒的画面与动画第 19 秒的
-    姿态一致就是这个偏移造成的。
+    offset_seconds 用来对齐时间轴。实测相机序列的 80 个切点与 AUTO CAM 录像
+    的镜头切换整段吻合：录像 = 序列 + 5.3s，序列从 -3s 起播，所以动画与录像
+    是 1:1（录像开头的 3 秒是黑场），默认偏移取 0。
     """
     import numpy as np
 
@@ -1571,7 +1571,12 @@ def _show_animation(store, anim: str, step: int, verbose: bool = True,
             rotation = keys
             if normalize:
                 rebased += 1
-        position = sequence.positions[t] if len(sequence.positions[t]) > 1 else None
+        # 位移轨只有根骨骼（AO_Position）是真正的走位；其余骨骼的位移块是
+        # 骨架自带的静止偏移（例如 AO_Spine 恒为 -95cm），当成运动量会直接把
+        # 上半身挪出身体，必须忽略。
+        position = (sequence.positions[t]
+                    if name == "AO_Position" and len(sequence.positions[t]) > 1
+                    else None)
         if rotation is None and position is None:
             continue
         seen.add(name)
@@ -2062,9 +2067,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="角色跟拍相机绑定名（用它的瞄准点作为角色站位）")
     p_show.add_argument("--anim-fps", type=float, default=60.0, help="动画原始帧率")
     p_show.add_argument("--anim-step", type=int, default=2, help="动画采样步长（2 = 30fps）")
-    p_show.add_argument("--anim-offset", type=float, default=3.0,
-                        help="角色动画相对时间轴的起始偏移（秒）；本曲相机序列从 -3s 起播，"
-                             "角色动画晚 3 秒进入")
+    p_show.add_argument("--anim-offset", type=float, default=0.0,
+                        help="角色动画相对时间轴的起始偏移（秒）。本曲相机序列从 -3s 起播，"
+                             "录像开头也有约 3 秒黑场，动画与时间轴是 1:1，默认 0")
     p_show.add_argument("--camera-fps", type=float, default=30.0, help="相机采样帧率")
     p_show.add_argument("--character-z", type=float, default=0.0,
                         help="角色脚底的世界 Z（舞台主地面）")

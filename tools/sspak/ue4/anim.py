@@ -10,15 +10,16 @@
     TArray<FTrackToSkeletonMap>：int32 数量 + 每项 int32 骨骼下标（主骨架）
     int32 0, int32 65536
     int32 NumFrames（同时也是整条轨的键数）
-    int32 组数，紧跟 组数 × 4 个 int32：每轨 [旋转键数, 旋转偏移, 位移键数, 位移偏移]
+    int32 组数，紧跟 组数 × 4 个 int32：每轨 [旋转键数, 旋转结束偏移, 位移键数, 位移结束偏移]
     键流：每个键 12 字节（3×float），偏移相对键流起点
 
-判据是「四元数必须落在单位球内」这条硬约束：按 [列0,列1] 解释时
-124 个块里 114 个 100% 满足，按 [列2,列3] 解释时 125 个块里 91 个不满足，
-因此列 0/1 是旋转、列 2/3 是位移（旧的实现正好取反了，所以姿势一团乱）。
+**偏移是「结束位置」而不是起点**：每轨的数据块是 [旋转键][位移键] 首尾相接，
+表里记的是各自通道的结束字节位置，所以键起点 = 结束偏移 - 键数×12。
+按这个规则，125 个块在整条键流里严丝合缝地铺满（0 处不连续），这是判定
+布局正确的硬证据；旧实现把偏移当起点再 +24，等于把每根骨头读成了「下一根
+骨头」的曲线——姿势还是人形，但舞蹈完全不是原版。
 
-单键通道（键数 1）表示「整段恒定」。其中少数轨道的偏移会指进别的轨的键块，
-读出来不是合法四元数，这类轨道一律丢弃、回退绑定姿势。
+单键通道（键数 1）表示「整段恒定」，读出来不是合法四元数时丢弃、回退绑定姿势。
 """
 
 from __future__ import annotations
@@ -34,11 +35,6 @@ from .properties import parse_properties
 CURVE_TAIL = b"/Engine/Animation/DefaultAnimCurveCompressionSettings"
 KEY_SIZE = 12
 QUAT_TOLERANCE = 1.001
-# 偏移表里记的位置比真正的键数据早 2 个键（24 字节）。实测依据：
-#   按 off 读，第 2 个键是 z=5.487 / y=6.51 这类非法四元数，块内非法键比例 1.1%；
-#   按 off+24 读，两个动画（91 帧待机 / 8393 帧 live）的所有满键块都恰好是
-#   连续 count 个合法四元数，非法键比例中位数 0.00%。
-KEY_PREAMBLE = 2
 
 
 class AnimSequenceError(RuntimeError):
@@ -176,8 +172,7 @@ def parse_animation(package: Package) -> AnimSequence:
                 valid_rot += 1
             else:
                 seq.dropped += 1
-        translation = _read_block(stream, pos_count,
-                                  pos_offset + KEY_PREAMBLE * KEY_SIZE, key_count)
+        translation = _read_block(stream, pos_count, pos_offset, key_count)
         if translation is None:
             translation = np.zeros((0, 3), np.float32)
         seq.positions.append(translation)
@@ -185,31 +180,22 @@ def parse_animation(package: Package) -> AnimSequence:
     return seq
 
 
-def _read_block(stream: bytes, count: int, offset: int, key_count: int) -> np.ndarray | None:
-    """读一条通道的键；数量/偏移不合法时返回 None。"""
+def _read_block(stream: bytes, count: int, end_offset: int, key_count: int) -> np.ndarray | None:
+    """读一条通道的键；偏移是结束位置，数量/偏移不合法时返回 None。"""
     if count <= 0 or count > key_count:
         return None
-    end = offset + count * KEY_SIZE
+    offset = end_offset - count * KEY_SIZE
+    end = end_offset
     if offset < 0 or end > len(stream):
         return None
     return np.frombuffer(stream, dtype="<f4", count=count * 3,
                          offset=offset).reshape(-1, 3)
 
 
-def _read_rotation_block(stream: bytes, count: int, offset: int,
+def _read_rotation_block(stream: bytes, count: int, end_offset: int,
                          key_count: int) -> np.ndarray | None:
-    """读旋转块。
-
-    UE3/UE4 的文档写明「n>1 的旋转轨，键数据前 24 字节是压缩头」；
-    单键轨没有压缩头，直接读偏移处。实测也一致：按 off 读单键会读到合法
-    四元数，按 off+24 会读到相邻块里不相干的数据。
-    """
-    if count == 1:
-        return _read_block(stream, count, offset, key_count)
-    shifted = offset + KEY_PREAMBLE * KEY_SIZE
-    if shifted + count * KEY_SIZE <= len(stream):
-        return _read_block(stream, count, shifted, key_count)
-    return _read_block(stream, count, offset, key_count)
+    """读旋转块：与位移块同样的「结束偏移」规则，没有额外压缩头。"""
+    return _read_block(stream, count, end_offset, key_count)
 
 
 def _repair_rotations(keys: np.ndarray) -> np.ndarray | None:
